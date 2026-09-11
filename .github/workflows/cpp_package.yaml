@@ -15,10 +15,14 @@ on:
 env:
     MACOSX_DEPLOYMENT_TARGET: "11.0"
     # Keep in sync with features in nightly_snapshot.yaml, slint_tool_binary.yaml, api/node/Cargo.toml, and api/python/slint/Cargo.toml
-    SLINT_BINARY_FEATURES: "-DSLINT_FEATURE_BACKEND_LINUXKMS_NOSEAT=ON -DSLINT_FEATURE_BACKEND_WINIT=ON -DSLINT_FEATURE_RENDERER_FEMTOVG=ON -DSLINT_FEATURE_RENDERER_SKIA=ON -DSLINT_FEATURE_RENDERER_SOFTWARE=ON"
+    SLINT_BINARY_FEATURES: "-DSLINT_FEATURE_BACKEND_LINUXKMS_LIBINPUT=ON -DSLINT_FEATURE_BACKEND_WINIT=ON -DSLINT_FEATURE_RENDERER_FEMTOVG=ON -DSLINT_FEATURE_RENDERER_SKIA=ON -DSLINT_FEATURE_RENDERER_SOFTWARE=ON -DSLINT_FEATURE_LIVE_PREVIEW=ON"
     SLINT_MCU_FEATURES: "-DSLINT_FEATURE_FREESTANDING=ON -DSLINT_FEATURE_RENDERER_SOFTWARE=ON"
     # env variable used by espup https://github.com/esp-rs/espup?tab=readme-ov-file#github-api
     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    # Use fat LTO for the distributed C++ packages: smaller shared library and better runtime perf.
+    # Workspace [profile.release] uses cargo defaults to keep dev release builds fast.
+    CARGO_PROFILE_RELEASE_LTO: "fat"
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
 
 jobs:
     cmake_package_desktop:
@@ -28,12 +32,10 @@ jobs:
             CARGO_INCREMENTAL: false
         strategy:
             matrix:
-                os: [ubuntu-22.04, macOS-13, macos-14, windows-2022]
+                os: [ubuntu-22.04, macos-14, windows-2022]
                 include:
                     - os: ubuntu-22.04
                       package_suffix: linux
-                    - os: macOS-13
-                      package_suffix: macos-x86_64
                     - os: macos-14
                       package_suffix: macos-aarch64
                     - os: windows-2022
@@ -45,10 +47,8 @@ jobs:
 
         runs-on: ${{ matrix.os }}
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/install-linux-dependencies
-              with:
-                  old-ubuntu: true
             - name: Install Qt (Ubuntu)
               uses: jurplel/install-qt-action@v4
               if: matrix.os == 'ubuntu-22.04'
@@ -56,10 +56,6 @@ jobs:
                   version: 6.2.2
                   cache: true
             - uses: ./.github/actions/setup-rust
-            - uses: baptiste0928/cargo-install@v3
-              with:
-                  crate: cargo-about
-                  version: "=0.6.6"
             - name: Prepare licenses
               run: bash -x ../../scripts/prepare_binary_package.sh ${{ runner.workspace }}/cppbuild
               working-directory: api/cpp/
@@ -84,7 +80,7 @@ jobs:
               working-directory: ${{ runner.workspace }}/cppbuild
               run: cmake --build . --config Release --target package
             - name: "Upload C++ packages"
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: cpp_bin-${{ matrix.package_suffix }}
                   path: ${{ runner.workspace }}/cppbuild/Slint-cpp-*
@@ -98,21 +94,13 @@ jobs:
 
         runs-on: ubuntu-22.04
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/install-linux-dependencies
-              with:
-                  old-ubuntu: true
             - uses: ./.github/actions/setup-rust
               with:
                   target: ${{ matrix.target }}
             - name: Install GNU Arm Embedded Toolchain
-              uses: carlosperate/arm-none-eabi-gcc-action@v1
-              with:
-                release: '13.3.Rel1'
-            - uses: baptiste0928/cargo-install@v3
-              with:
-                  crate: cargo-about
-                  version: "=0.6.6"
+              run: sudo timeout 600 apt-get update && sudo timeout 600 apt-get install gcc-arm-none-eabi
             - name: Prepare licenses
               run: bash -x ../../scripts/prepare_binary_package.sh ${{ runner.workspace }}/cppbuild
               working-directory: api/cpp/
@@ -128,7 +116,7 @@ jobs:
               working-directory: ${{ runner.workspace }}/cppbuild
               run: cpack -G TGZ
             - name: "Upload C++ packages"
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: cpp_mcu_bin-${{ matrix.target }}
                   path: ${{ runner.workspace }}/cppbuild/Slint-cpp-*
@@ -151,10 +139,8 @@ jobs:
 
         runs-on: ubuntu-22.04
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/install-linux-dependencies
-              with:
-                  old-ubuntu: true
             - uses: dtolnay/rust-toolchain@stable
             - uses: cargo-bins/cargo-binstall@main
             - name: install espup
@@ -167,10 +153,6 @@ jobs:
               run: |
                   source "$HOME/export-esp.sh"
                   echo "$PATH" >> "$GITHUB_PATH"
-            - uses: baptiste0928/cargo-install@v3
-              with:
-                  crate: cargo-about
-                  version: "=0.6.6"
             - name: Prepare licenses
               run: bash -x ../../scripts/prepare_binary_package.sh ${{ runner.workspace }}/cppbuild
               working-directory: api/cpp/
@@ -189,7 +171,7 @@ jobs:
               working-directory: ${{ runner.workspace }}/cppbuild
               run: cpack -G TGZ
             - name: "Upload C++ packages"
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: cpp_mcu_bin-${{ matrix.idf_target }}
                   path: ${{ runner.workspace }}/cppbuild/Slint-cpp-*
@@ -204,30 +186,30 @@ jobs:
                   - gcc_target: aarch64-linux-gnu
                     rust_target: aarch64-unknown-linux-gnu
                     cmake_system_processor: arm64
+                    gcc_suffix: ""
+                  # armv7 compiles Skia from source, which needs C++20 / GCC 10
+                  # (the default GCC 9 only knows -std=c++2a, not -std=c++20).
                   - gcc_target: arm-linux-gnueabihf
                     rust_target: armv7-unknown-linux-gnueabihf
                     cmake_system_processor: armhf
+                    gcc_suffix: "-10"
 
         runs-on: ubuntu-22.04
         container: ghcr.io/slint-ui/slint/${{ matrix.rust_target }}-cpp
         steps:
-            - uses: actions/checkout@v4
-            - uses: baptiste0928/cargo-install@v3
-              with:
-                  crate: cargo-about
-                  version: "=0.6.6"
+            - uses: actions/checkout@v7
             - name: Prepare licenses
               run: bash -x ../../scripts/prepare_binary_package.sh ../../build
               working-directory: api/cpp/
             - name: CMake configure
-              run: cmake -B build -S . -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.cmake_system_processor }} -DRust_CARGO_TARGET=${{ matrix.rust_target}} -DCMAKE_C_COMPILER=${{ matrix.gcc_target }}-gcc -DCMAKE_CXX_COMPILER=${{ matrix.gcc_target }}-g++  -DSLINT_COMPILER=download ${{ env.SLINT_BINARY_FEATURES }} ${{ inputs.extra_cmake_flags }}
+              run: cmake -B build -S . -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=${{ matrix.cmake_system_processor }} -DRust_CARGO_TARGET=${{ matrix.rust_target}} -DCMAKE_C_COMPILER=${{ matrix.gcc_target }}-gcc${{ matrix.gcc_suffix }} -DCMAKE_CXX_COMPILER=${{ matrix.gcc_target }}-g++${{ matrix.gcc_suffix }}  -DSLINT_COMPILER=download ${{ env.SLINT_BINARY_FEATURES }} ${{ inputs.extra_cmake_flags }}
             - name: CMake build
               run: cmake --build build --parallel
             - name: CMake package
               working-directory: build
               run: cpack -G TGZ
             - name: "Upload C++ packages"
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: cpp_bin-${{ matrix.rust_target }}
                   path: build/Slint-cpp-*
@@ -237,7 +219,7 @@ jobs:
             CARGO_INCREMENTAL: false
         strategy:
             matrix:
-                os: [ubuntu-22.04, macOS-13, macos-14, windows-2022]
+                os: [ubuntu-22.04, macos-14, windows-2022]
                 include:
                     - os: ubuntu-22.04
                       package_suffix: Linux-x86_64
@@ -245,27 +227,22 @@ jobs:
                     - os: ubuntu-22.04-arm
                       package_suffix: Linux-aarch64
                       cargo_target: aarch64-unknown-linux-gnu
-                    - os: macOS-13
-                      package_suffix: Darwin-x86_64
-                      cargo_target: x86_64-apple-darwin
                     - os: macos-14
                       package_suffix: Darwin-arm64
                       cargo_target: aarch64-apple-darwin
                     - os: windows-2022
                       package_suffix: Windows-AMD64
                       msvc_arch: x64
-                      cargo_target: x86_64-pc-windows-gnu
+                      cargo_target: x86_64-pc-windows-msvc
                     - os: windows-11-arm
                       package_suffix: Windows-ARM64
                       msvc_arch: arm64
-                      cargo_target: aarch64-pc-windows-gnu
+                      cargo_target: aarch64-pc-windows-msvc
 
         runs-on: ${{ matrix.os }}
         steps:
-            - uses: actions/checkout@v4
+            - uses: actions/checkout@v7
             - uses: ./.github/actions/install-linux-dependencies
-              with:
-                  old-ubuntu: true
             - uses: ./.github/actions/setup-rust
             - uses: ilammy/msvc-dev-cmd@v1
               with:
@@ -299,7 +276,7 @@ jobs:
                   cd Slint-cpp-*/bin
                   cmake -E tar czf ../../slint-compiler-${{ matrix.package_suffix }}.tar.gz slint-compiler*
             - name: "Upload Slint compiler package"
-              uses: actions/upload-artifact@v4
+              uses: actions/upload-artifact@v7
               with:
                   name: slint-compiler-bin-${{ matrix.package_suffix }}
                   path: ${{ runner.workspace }}/cppbuild/slint-compiler-*.tar.gz

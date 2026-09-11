@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore imgarray listviewitem
 /*!
 
 This module contains all the native Qt widget implementation that forwards to QStyle.
@@ -10,7 +11,7 @@ it needs to be kept in sync with different place.
 
  - It needs to be changed in this module
  - the Widget list in lib.rs
- - In the compiler: builtins.slint
+ - In the compiler: internal/compiler/builtin_elements.rs
  - For the C++ code (new item only): the build.rs to export the new item, and the `using` declaration in slint.h
  - Don't forget to update the documentation
 */
@@ -23,7 +24,7 @@ use core::pin::Pin;
 use cpp::{cpp, cpp_class};
 use i_slint_core::graphics::Color;
 use i_slint_core::input::{
-    FocusEvent, InputEventFilterResult, InputEventResult, KeyEvent, KeyEventResult, MouseEvent,
+    FocusEvent, InputEventFilterResult, InputEventResult, KeyEventResult, MouseEvent,
 };
 use i_slint_core::item_rendering::{CachedRenderingData, ItemRenderer};
 use i_slint_core::items::{Item, ItemConsts, ItemRc, ItemVTable, RenderingResult, VoidArg};
@@ -33,7 +34,7 @@ use i_slint_core::lengths::{LogicalLength, LogicalPoint, LogicalRect, LogicalSiz
 use i_slint_core::rtti::*;
 use i_slint_core::window::{WindowAdapter, WindowAdapterRc, WindowInner};
 use i_slint_core::{
-    declare_item_vtable, Callback, ItemVTable_static, Property, SharedString, SharedVector,
+    Callback, Coord, ItemVTable_static, Property, SharedString, SharedVector, declare_item_vtable,
 };
 use i_slint_core_macros::*;
 use std::ptr::NonNull;
@@ -59,7 +60,7 @@ macro_rules! fn_render {
     ($this:ident $dpr:ident $size:ident $painter:ident $widget:ident $initial_state:ident => $($tt:tt)*) => {
         fn render(self: Pin<&Self>, backend: &mut &mut dyn ItemRenderer, item_rc: &ItemRc, size: LogicalSize) -> RenderingResult {
             self.animation_tracker();
-            let $dpr: f32 = backend.scale_factor();
+            let $dpr: f32 = backend.scale_factor().get();
 
             let active: bool = backend.window().active();
             // This should include self.enabled() as well, but not every native widget
@@ -145,19 +146,21 @@ impl QImageWrapArray {
 }
 
 cpp! {{
+    // Note: Do not include <QtWidgets> to avoid inclusion of gl.h (see #10989).
     #include <QtWidgets/QApplication>
     #include <QtWidgets/QStyle>
     #include <QtWidgets/QStyleOption>
     #include <QtWidgets/QStyleFactory>
     #include <QtGui/QPainter>
     #include <QtGui/QClipboard>
+    #include <QtGui/QPaintEngine>
     #include <QtCore/QMimeData>
     #include <QtCore/QDebug>
     #include <QtCore/QScopeGuard>
 
     using QPainterPtr = std::unique_ptr<QPainter>;
 
-    static bool g_lastWindowClosed = false; // Wohoo, global to track window closure when using processEvents().
+    static bool g_lastWindowClosed = false; // global to track window closure when using processEvents().
 
     /// Make sure there is an instance of QApplication.
     /// The `from_qt_backend` argument specifies if we know that we are running

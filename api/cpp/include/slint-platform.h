@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore visualid
 #pragma once
 
 #include "slint.h"
@@ -602,7 +603,7 @@ public:
         auto rectangles() const
         {
             SharedVector<cbindgen_private::IntRect> rectangles;
-            slint_software_renderer_region_to_rects(&inner, &rectangles);
+            cbindgen_private::slint_software_renderer_region_to_rects(&inner, &rectangles);
 #    if __cpp_lib_ranges >= 202110L // DR20 P2415R2
             using std::ranges::owning_view;
 #    else
@@ -661,7 +662,7 @@ public:
     /// Representation of a texture to blend in the destination buffer.
     // (FIXME: this is currently opaque, but should be exposed)
     using DrawTextureArgs = cbindgen_private::DrawTextureArgs;
-    /// Arguments for draw_rectagle
+    /// Arguments for draw_rectangle
     using DrawRectangleArgs = cbindgen_private::DrawRectangleArgs;
 
     /// Abstract base class for a target pixel buffer where certain drawing operations can be
@@ -793,9 +794,11 @@ public:
     /// The first template parameter (PixelType) must be specified and can be either Rgb565Pixel or
     /// Rgb8Pixel.
     template<typename PixelType, typename Callback>
+#    if !defined(__clang__) || __clang_major__ >= 17
         requires requires(Callback callback) {
-            callback(size_t(0), size_t(0), size_t(0), [&callback](std::span<PixelType>) { });
+            callback(size_t(0), size_t(0), size_t(0), [&callback](std::span<PixelType>) {});
         }
+#    endif
     PhysicalRegion render_by_line(Callback process_line_callback) const
     {
         auto process_line_fn = [](void *process_line_callback_ptr, uintptr_t line,
@@ -816,9 +819,9 @@ public:
             return PhysicalRegion { cbindgen_private::slint_software_renderer_render_by_line_rgb8(
                     inner, process_line_fn, &process_line_callback) };
         } else {
-            static_assert(std::is_same_v<PixelType, Rgba8Pixel>
+            static_assert(std::is_same_v<PixelType, Rgb8Pixel>
                                   || std::is_same_v<PixelType, Rgb565Pixel>,
-                          "Unsupported PixelType. It must be either Rgba8Pixel or Rgb565Pixel");
+                          "Unsupported PixelType. It must be either Rgb8Pixel or Rgb565Pixel");
         }
     }
 
@@ -949,7 +952,7 @@ public:
     }
 
 #    endif
-#    if (!defined(__APPLE__) && (defined(_WIN32) || !defined(_WIN64))) || defined(DOXYGEN)
+#    if (!defined(__APPLE__) && (defined(_WIN32) || defined(_WIN64))) || defined(DOXYGEN)
 
     /// Creates a new NativeWindowHandle from the given HWND \a hwnd, and HINSTANCE \a hinstance.
     static NativeWindowHandle from_win32(void *hwnd, void *hinstance)

@@ -8,17 +8,73 @@ use wasm_bindgen::prelude::*;
 
 slint::include_modules!();
 
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn load_font_from_bytes(font_data: js_sys::Uint8Array, locale: &str) -> Result<(), JsValue> {
+    use slint::fontique_011::fontique;
+
+    let font_data = font_data.to_vec();
+    let blob = fontique::Blob::new(std::sync::Arc::new(font_data));
+    let mut collection = slint::fontique_011::shared_collection();
+    let fonts = collection.register_fonts(blob, None);
+
+    scripts_for_locale(locale, |script| {
+        collection
+            .append_fallbacks(fontique::FallbackKey::new(*script, None), fonts.iter().map(|x| x.0));
+    });
+
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn scripts_for_locale(
+    locale: &str,
+    mut callback: impl FnMut(&slint::fontique_011::fontique::Script),
+) {
+    use slint::fontique_011::fontique;
+
+    let Ok(locale) = icu_locale_core::Locale::try_from_str(locale) else {
+        return;
+    };
+
+    let scripts: &[fontique::Script] = match locale.id.language.as_str() {
+        "ja" => &[
+            fontique::Script::from_str_unchecked("Hira"),
+            fontique::Script::from_str_unchecked("Kana"),
+            fontique::Script::from_str_unchecked("Hani"),
+        ],
+        "ko" => &[
+            fontique::Script::from_str_unchecked("Hang"),
+            fontique::Script::from_str_unchecked("Hani"),
+        ],
+        "zh" => &[fontique::Script::from_str_unchecked("Hani")],
+        _ => {
+            if let Some(script) = locale.id.script {
+                &[fontique::Script::from_bytes(script.into_raw())]
+            } else {
+                &[]
+            }
+        }
+    };
+
+    for script in scripts {
+        callback(script);
+    }
+}
+
 use std::rc::Rc;
 
 use slint::{Model, ModelExt, ModelRc, SharedString, StandardListViewItem, VecModel};
 
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 pub fn main() {
     // This provides better error messages in debug mode.
     // It's disabled in release mode so it doesn't bloat up the file size.
     #[cfg(all(debug_assertions, target_arch = "wasm32"))]
     console_error_panic_hook::set_once();
 
+    // For native builds, initialize gettext translations
+    #[cfg(not(target_arch = "wasm32"))]
     slint::init_translations!(concat!(env!("CARGO_MANIFEST_DIR"), "/lang/"));
 
     let app = App::new().unwrap();
@@ -65,11 +121,7 @@ fn filter_sort_model(
             let c_a = r_a.row_data(sort_index as usize).unwrap();
             let c_b = r_b.row_data(sort_index as usize).unwrap();
 
-            if sort_ascending {
-                c_a.text.cmp(&c_b.text)
-            } else {
-                c_b.text.cmp(&c_a.text)
-            }
+            if sort_ascending { c_a.text.cmp(&c_b.text) } else { c_b.text.cmp(&c_a.text) }
         }))
         .into();
     }

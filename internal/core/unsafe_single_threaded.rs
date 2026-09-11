@@ -9,9 +9,9 @@
 macro_rules! SLINT__thread_local_inner {
     ($(#[$($meta:tt)*])* $vis:vis $ident:ident $ty:ty $block:block) => {
         $(#[$($meta)*])*
-        $vis static $ident: crate::unsafe_single_threaded::FakeThreadStorage<$ty> = {
+        $vis static $ident: $crate::unsafe_single_threaded::FakeThreadStorage<$ty> = {
             fn init() -> $ty $block
-            crate::unsafe_single_threaded::FakeThreadStorage::new(init)
+            $crate::unsafe_single_threaded::FakeThreadStorage::new(init)
         };
     };
 }
@@ -54,8 +54,9 @@ impl<T> FakeThreadStorage<T> {
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         f(self.0.get_or_init(self.1))
     }
+    #[allow(clippy::result_unit_err)]
     pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Result<R, ()> {
-        Ok(f(self.0.get().ok_or(())?))
+        Ok(self.with(f))
     }
 }
 // Safety: the unsafe_single_threaded feature means we will only be called from a single thread
@@ -65,6 +66,11 @@ unsafe impl<T, F> Sync for FakeThreadStorage<T, F> {}
 pub use thread_local_ as thread_local;
 
 pub struct OnceCell<T>(once_cell::unsync::OnceCell<T>);
+impl<T> Default for OnceCell<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl<T> OnceCell<T> {
     pub const fn new() -> Self {
         Self(once_cell::unsync::OnceCell::new())

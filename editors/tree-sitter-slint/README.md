@@ -1,4 +1,3 @@
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0 -->
 
 # tree-sitter support for SLint
 
@@ -9,6 +8,11 @@
                                                 (taken from tree-sitter page)
 
 Use with vim/helix/... other editors.
+
+## Rust crate
+
+This directory also contains a standalone Cargo package that exposes the generated
+tree-sitter language as `i_tree_sitter_slint::LANGUAGE`.
 
 ## Inject into Rust
 

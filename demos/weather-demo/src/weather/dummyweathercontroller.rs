@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: MIT
 
+// cSpell: ignore dummyweather
 use chrono::{Duration, Utc};
 
 use crate::weather::utils::*;
@@ -14,7 +15,7 @@ pub struct DummyWeatherController {
 
 impl DummyWeatherController {
     pub fn new() -> Self {
-        Self { city_weather_data: vec![] }
+        Self { city_weather_data: Vec::new() }
     }
 
     fn generate_dummy_data() -> Vec<CityWeatherData> {
@@ -43,7 +44,7 @@ impl DummyWeatherController {
             }
         }
 
-        vec![]
+        Vec::new()
     }
 }
 

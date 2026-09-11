@@ -27,6 +27,7 @@ export { Secret-Struct as Public-Struct }
 export enum TestEnum {
     Variant1,
     Variant2,
+    Variant-three,
 }
 
 export component App inherits Window {
@@ -49,6 +50,16 @@ export component App inherits Window {
     public function plus-one(value: int) {
         return value + 1;
     }
+    callback invoke-call-void();
+    invoke-call-void => {
+        call-void();
+    }
+    callback call-void();
+    callback invoke-call-void2();
+    invoke-call-void2 => {
+        call_void2();
+    }
+    callback call_void2();
 
     in-out property <TestEnum> enum-property: TestEnum.Variant2;
     in-out property <[TestEnum]> model-with-enums: [TestEnum.Variant2, TestEnum.Variant1];
@@ -56,6 +67,8 @@ export component App inherits Window {
     Rectangle {
         color: red;
     }
+
+    in-out property <string> translated: @tr("Yes");
 }
 
 component Diag inherits Window { }

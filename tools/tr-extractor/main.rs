@@ -1,18 +1,20 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell:ignore poedit nctx nplurals xgettext
+
 use clap::Parser;
 use i_slint_compiler::diagnostics::{BuildDiagnostics, Spanned};
-use i_slint_compiler::parser::{syntax_nodes, SyntaxKind, SyntaxNode};
+use i_slint_compiler::parser::{SyntaxKind, SyntaxNode, syntax_nodes};
+use rspolib::Save;
 use smol_str::SmolStr;
-use std::fmt::Write;
 
-type Messages = polib::catalog::Catalog;
+type Messages = rspolib::POFile;
 
-#[derive(clap::Parser)]
+#[derive(clap::Parser, Default)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-    #[arg(name = "path to .slint file(s)", action)]
+    #[arg(name = "path to .slint file(s)", action, required = true)]
     paths: Vec<std::path::PathBuf>,
 
     #[arg(long = "default-domain", short = 'd')]
@@ -45,6 +47,12 @@ struct Cli {
     #[arg(long = "join-existing", short = 'j')]
     /// Join messages with existing file
     join_existing: bool,
+
+    #[arg(
+        long = "no-default-translation-context",
+        help = "Do not set the default context (component name) if none is specified. The Slint compiler need to be configured similarly"
+    )]
+    no_default_translation_context: bool,
 }
 
 fn main() -> std::io::Result<()> {
@@ -52,126 +60,152 @@ fn main() -> std::io::Result<()> {
 
     let output = args
         .output
+        .clone()
         .unwrap_or_else(|| format!("{}.po", args.domain.as_deref().unwrap_or("messages")).into());
 
     let mut messages = if args.join_existing {
-        polib::po_file::parse(&output)
-            .map_err(|x| std::io::Error::new(std::io::ErrorKind::Other, x))?
+        rspolib::pofile(&*output).map_err(std::io::Error::other)?
     } else {
         let package = args.package_name.as_ref().map(|x| x.as_ref()).unwrap_or("PACKAGE");
         let version = args.package_version.as_ref().map(|x| x.as_ref()).unwrap_or("VERSION");
-        let metadata = polib::metadata::CatalogMetadata {
-            project_id_version: format!("{package} {version}",),
-            pot_creation_date: chrono::Utc::now().format("%Y-%m-%d %H:%M%z").to_string(),
-            po_revision_date: "YEAR-MO-DA HO:MI+ZONE".into(),
-            last_translator: "FULL NAME <EMAIL@ADDRESS>".into(),
-            language_team: "LANGUAGE <LL@li.org>".into(),
-            mime_version: "1.0".into(),
-            content_type: "text/plain; charset=UTF-8".into(),
-            content_transfer_encoding: "8bit".into(),
-            language: String::new(),
-            plural_rules: Default::default(),
-            // "Report-Msgid-Bugs-To: {address}" address = output_details.bugs_address
-        };
 
-        Messages::new(metadata)
+        let mut file = rspolib::POFile::new(Default::default());
+        file.metadata.insert("Project-Id-Version".into(), format!("{package} {version}"));
+        file.metadata.insert(
+            "POT-Creation-Date".into(),
+            chrono::Utc::now().format("%Y-%m-%d %H:%M%z").to_string(),
+        );
+        file.metadata.insert("PO-Revision-Date".into(), "YEAR-MO-DA HO:MI+ZONE".into());
+        file.metadata.insert("Last-Translator".into(), "FULL NAME <EMAIL@ADDRESS>".into());
+        file.metadata.insert("Language-Team".into(), "LANGUAGE <LL@li.org>".into());
+        file.metadata.insert("MIME-Version".into(), "1.0".into());
+        file.metadata.insert("Content-Type".into(), "text/plain; charset=UTF-8".into());
+        file.metadata.insert("Content-Transfer-Encoding".into(), "8bit".into());
+        file.metadata.insert("Language".into(), String::new());
+        file.metadata.insert("Plural-Forms".into(), "nplurals=1; plural=0;".into());
+
+        file
     };
 
-    for path in args.paths {
-        process_file(path, &mut messages)?
+    for path in &args.paths {
+        process_file(path, &mut messages, &args)?
     }
 
-    polib::po_file::write(&messages, &output)?;
+    messages.save(&output.to_string_lossy());
     Ok(())
 }
 
-fn process_file(path: std::path::PathBuf, messages: &mut Messages) -> std::io::Result<()> {
+fn process_file(
+    path: &std::path::Path,
+    messages: &mut Messages,
+    args: &Cli,
+) -> std::io::Result<()> {
     let mut diag = BuildDiagnostics::default();
-    let syntax_node = i_slint_compiler::parser::parse_file(path, &mut diag).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::Other, diag.to_string_vec().join(", "))
-    })?;
-    visit_node(syntax_node, messages, None);
+    let syntax_node = i_slint_compiler::parser::parse_file(path, &mut diag)
+        .ok_or_else(|| std::io::Error::other(diag.to_string_vec().join(", ")))?;
+    visit_node(syntax_node, messages, None, args);
 
     Ok(())
 }
 
-fn visit_node(node: SyntaxNode, results: &mut Messages, current_context: Option<SmolStr>) {
+fn visit_node(
+    node: SyntaxNode,
+    results: &mut Messages,
+    current_context: Option<SmolStr>,
+    args: &Cli,
+) {
     for n in node.children() {
-        if n.kind() == SyntaxKind::AtTr {
-            if let Some(msgid) = n
+        if n.kind() == SyntaxKind::AtTr
+            && let Some(msgid) = n
                 .child_text(SyntaxKind::StringLiteral)
                 .and_then(|s| i_slint_compiler::literals::unescape_string(&s))
-            {
-                let tr = syntax_nodes::AtTr::from(n.clone());
-                let msgctxt = tr
-                    .TrContext()
-                    .and_then(|n| n.child_text(SyntaxKind::StringLiteral))
-                    .and_then(|s| i_slint_compiler::literals::unescape_string(&s))
-                    .or_else(|| current_context.clone());
-                let plural = tr
-                    .TrPlural()
-                    .and_then(|n| n.child_text(SyntaxKind::StringLiteral))
-                    .and_then(|s| i_slint_compiler::literals::unescape_string(&s));
+        {
+            let tr = syntax_nodes::AtTr::from(n.clone());
+            let msgctxt = tr
+                .TrContext()
+                .and_then(|n| n.child_text(SyntaxKind::StringLiteral))
+                .and_then(|s| i_slint_compiler::literals::unescape_string(&s))
+                .or_else(|| current_context.clone());
+            let plural = tr
+                .TrPlural()
+                .and_then(|n| n.child_text(SyntaxKind::StringLiteral))
+                .and_then(|s| i_slint_compiler::literals::unescape_string(&s));
 
-                let update = |msg: &mut dyn polib::message::MessageMutView| {
-                    let span = node.span();
-                    if span.is_valid() {
-                        let (line, _) = node.source_file.line_column(span.offset);
-                        if line > 0 {
-                            let source = msg.source_mut();
-                            let path = node.source_file.path().to_string_lossy();
-                            if source.is_empty() {
-                                *source = format!("{path}:{line}");
-                            } else {
-                                write!(source, " {path}:{line}").unwrap();
-                            }
+            let update = |msg: &mut rspolib::POEntry| {
+                let span = node.span();
+                if span.is_valid() {
+                    let (line, _) = node
+                        .source_file
+                        .line_column(span.offset, i_slint_compiler::diagnostics::ByteFormat::Utf8);
+                    if line > 0 {
+                        let path = node.source_file.path().to_string_lossy().into_owned();
+                        let lineno = line.to_string();
+                        if !msg.occurrences.iter().any(|(p, l)| p == &path && l == &lineno) {
+                            msg.occurrences.push((path, lineno));
                         }
                     }
+                }
 
-                    let comment = msg.comments_mut();
-                    if comment.is_empty() {
-                        if let Some(c) = tr
-                            .child_token(SyntaxKind::StringLiteral)
-                            .and_then(get_comments_before_line)
-                            .or_else(|| tr.first_token().and_then(get_comments_before_line))
-                        {
-                            *comment = c;
-                        }
-                    }
-                };
-
-                if let Some(mut x) =
-                    results.find_message_mut(msgctxt.as_deref(), &msgid, plural.as_deref())
+                if msg.comment.as_deref().unwrap_or("").is_empty()
+                    && let Some(c) = tr
+                        .child_token(SyntaxKind::StringLiteral)
+                        .and_then(get_comments_before_line)
+                        .or_else(|| tr.first_token().and_then(get_comments_before_line))
                 {
-                    update(&mut x)
-                } else {
-                    let mut builder = if let Some(plural) = plural {
-                        let mut builder = polib::message::Message::build_plural();
-                        builder.with_msgid_plural(plural.into());
-                        // Workaround for #4238 : poedit doesn't add the plural by default.
-                        builder.with_msgstr_plural(vec![String::new(), String::new()]);
-                        builder
+                    msg.comment = Some(c);
+                }
+            };
+
+            // Try to find an existing entry in the PO file
+            let existing = results.entries.iter_mut().find(|e| {
+                e.msgid == msgid
+                    && e.msgctxt.as_deref() == msgctxt.as_deref()
+                    && if let Some(ref p) = plural {
+                        e.msgid_plural.as_deref() == Some(p.as_str())
                     } else {
-                        polib::message::Message::build_singular()
-                    };
-                    builder.with_msgid(msgid.into());
-                    if let Some(msgctxt) = msgctxt {
-                        builder.with_msgctxt(msgctxt.into());
+                        e.msgid_plural.is_none()
                     }
-                    let mut msg = builder.done();
-                    update(&mut msg);
-                    results.append_or_update(msg);
+            });
+
+            if let Some(x) = existing {
+                update(x);
+            } else {
+                let mut msg = rspolib::POEntry { msgid: msgid.into(), ..Default::default() };
+                if let Some(ref p) = plural {
+                    msg.msgid_plural = Some(p.to_string());
+                    // Workaround for #4238 : poedit doesn't add the plural by default.
+                    msg.msgstr_plural = vec![String::new(), String::new()];
+                } else {
+                    msg.msgstr = Some(String::new());
+                }
+                if let Some(msgctxt) = msgctxt {
+                    msg.msgctxt = Some(msgctxt.into());
+                }
+                update(&mut msg);
+                // Append or replace
+                if let Some(pos) = results
+                    .entries
+                    .iter()
+                    .position(|e| e.msgid == msg.msgid && e.msgctxt == msg.msgctxt)
+                {
+                    results.entries[pos] = msg;
+                } else {
+                    results.entries.push(msg);
                 }
             }
         }
-        let current_context = syntax_nodes::Component::new(n.clone())
-            .and_then(|x| {
-                x.DeclaredIdentifier()
-                    .child_text(SyntaxKind::Identifier)
-                    .map(|t| i_slint_compiler::parser::normalize_identifier(&t))
-            })
-            .or_else(|| current_context.clone());
-        visit_node(n, results, current_context);
+        let current_context = if !args.no_default_translation_context {
+            syntax_nodes::Component::new(n.clone())
+                .and_then(|x| {
+                    x.DeclaredIdentifier()
+                        .child_text(SyntaxKind::Identifier)
+                        .map(|t| i_slint_compiler::parser::normalize_identifier(&t))
+                })
+                .or_else(|| current_context.clone())
+        } else {
+            None
+        };
+        visit_node(n, results, current_context, args);
     }
 }
 
@@ -288,20 +322,21 @@ fn extract_messages() {
         &mut diag,
     );
 
-    let mut messages = polib::catalog::Catalog::new(Default::default());
-    visit_node(syntax_node, &mut messages, None);
+    let mut messages = rspolib::POFile::new(Default::default());
+    visit_node(syntax_node, &mut messages, None, &Cli::default());
 
-    for (a, b) in r.iter().zip(messages.messages()) {
+    for (a, b) in r.iter().zip(messages.entries.iter()) {
+        let locations = b.occurrences.iter().map(|(p, l)| format!("{p}:{l}")).join(" ");
         assert_eq!(
             *a,
             M {
-                msgid: b.msgid(),
-                msgctx: b.msgctxt(),
-                plural: b.msgid_plural().unwrap_or_default(),
-                comments: b.comments(),
-                locations: b.source().into()
+                msgid: b.msgid.as_str(),
+                msgctx: b.msgctxt.as_deref().unwrap_or_default(),
+                plural: b.msgid_plural.as_deref().unwrap_or_default(),
+                comments: b.comment.as_deref().unwrap_or_default(),
+                locations,
             }
         );
     }
-    assert_eq!(r.len(), messages.count());
+    assert_eq!(r.len(), messages.entries.len());
 }

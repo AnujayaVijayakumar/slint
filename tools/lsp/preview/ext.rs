@@ -4,36 +4,34 @@
 use i_slint_compiler::layout;
 use i_slint_core::lengths::{LogicalPoint, LogicalRect};
 
-use crate::common;
+use crate::editor_preview;
 use crate::preview::ui;
 
 use slint_interpreter::ComponentInstance;
+use slint_interpreter::highlight::HighlightedRect;
 
 pub trait ElementRcNodeExt {
     fn layout_kind(&self) -> crate::preview::ui::LayoutKind;
 
     /// Find all geometries for the given `ElementRcNode`
-    fn geometries(
-        &self,
-        component_instance: &ComponentInstance,
-    ) -> Vec<i_slint_core::lengths::LogicalRect>;
+    fn geometries(&self, component_instance: &ComponentInstance) -> Vec<HighlightedRect>;
 
     /// Find the first geometry of `ElementRcNode` that includes the point `x`, `y`
     fn geometry_at(
         &self,
         component_instance: &ComponentInstance,
         position: LogicalPoint,
-    ) -> Option<i_slint_core::lengths::LogicalRect>;
+    ) -> Option<HighlightedRect>;
 
     /// Find the first geometry of ElementRcNode in `rect`
     fn geometry_in(
         &self,
         component_instance: &ComponentInstance,
         rect: &LogicalRect,
-    ) -> Option<i_slint_core::lengths::LogicalRect>;
+    ) -> Option<HighlightedRect>;
 }
 
-impl ElementRcNodeExt for common::ElementRcNode {
+impl ElementRcNodeExt for editor_preview::ElementRcNode {
     fn layout_kind(&self) -> crate::preview::ui::LayoutKind {
         self.with_element_debug(|di| match &di.layout {
             Some(layout::Layout::GridLayout(_)) => ui::LayoutKind::Grid,
@@ -49,10 +47,7 @@ impl ElementRcNodeExt for common::ElementRcNode {
         })
     }
 
-    fn geometries(
-        &self,
-        component_instance: &ComponentInstance,
-    ) -> Vec<i_slint_core::lengths::LogicalRect> {
+    fn geometries(&self, component_instance: &ComponentInstance) -> Vec<HighlightedRect> {
         component_instance.element_positions(self.as_element())
     }
 
@@ -60,15 +55,15 @@ impl ElementRcNodeExt for common::ElementRcNode {
         &self,
         component_instance: &ComponentInstance,
         position: LogicalPoint,
-    ) -> Option<i_slint_core::lengths::LogicalRect> {
-        self.geometries(component_instance).iter().find(|g| g.contains(position)).cloned()
+    ) -> Option<HighlightedRect> {
+        self.geometries(component_instance).iter().find(|g| g.rect.contains(position)).cloned()
     }
 
     fn geometry_in(
         &self,
         component_instance: &ComponentInstance,
         rect: &LogicalRect,
-    ) -> Option<i_slint_core::lengths::LogicalRect> {
-        self.geometries(component_instance).iter().find(|g| rect.contains_rect(g)).cloned()
+    ) -> Option<HighlightedRect> {
+        self.geometries(component_instance).iter().find(|g| rect.contains_rect(&g.rect)).cloned()
     }
 }

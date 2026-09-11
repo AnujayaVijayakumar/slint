@@ -1,18 +1,27 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore androidwindowadapter javahelper
 #![doc = include_str!("README.md")]
 #![doc(html_logo_url = "https://slint.dev/logo/slint-logo-square-light.svg")]
 #![cfg_attr(not(target_os = "android"), allow(rustdoc::broken_intra_doc_links))]
 #![cfg(target_os = "android")]
+#![cfg_attr(slint_nightly_test, feature(non_exhaustive_omitted_patterns_lint))]
+#![cfg_attr(slint_nightly_test, warn(non_exhaustive_omitted_patterns))]
 
 mod androidwindowadapter;
 mod javahelper;
+mod vsync;
 
 #[cfg(all(not(feature = "aa-06"), feature = "aa-05"))]
 pub use android_activity_05 as android_activity;
 #[cfg(feature = "aa-06")]
 pub use android_activity_06 as android_activity;
+
+#[cfg(all(not(feature = "aa-06"), feature = "aa-05"))]
+use ndk_08 as ndk;
+#[cfg(feature = "aa-06")]
+use ndk_09 as ndk;
 
 pub use android_activity::AndroidApp;
 use android_activity::PollEvent;
@@ -34,6 +43,7 @@ pub struct AndroidPlatform {
     app: AndroidApp,
     window: Rc<AndroidWindowAdapter>,
     event_listener: Option<Box<dyn Fn(&PollEvent<'_>)>>,
+    context: core::cell::OnceCell<i_slint_core::SlintContextWeak>,
 }
 
 impl AndroidPlatform {
@@ -56,7 +66,7 @@ impl AndroidPlatform {
     pub fn new(app: AndroidApp) -> Self {
         let window = AndroidWindowAdapter::new(app.clone());
         CURRENT_WINDOW.set(Rc::downgrade(&window));
-        Self { app, window, event_listener: None }
+        Self { app, window, event_listener: None, context: Default::default() }
     }
 
     /// Instantiate a new Android backend given the [`android_activity::AndroidApp`]
@@ -97,19 +107,32 @@ impl i_slint_core::platform::Platform for AndroidPlatform {
         Ok(self.window.clone())
     }
     fn run_event_loop(&self) -> Result<(), PlatformError> {
+        let ctx = self
+            .context
+            .get()
+            .and_then(|ctx| ctx.upgrade())
+            .expect("the event loop runs inside the context that owns this platform");
+        let vsync = vsync::VsyncDriver::new(self.app.create_waker());
         loop {
-            let mut timeout = i_slint_core::platform::duration_until_next_timer_update();
-            if self.window.window.has_active_animations() {
-                // FIXME: we should not hardcode a value here
+            let mut timeout = ctx.duration_until_next_timer_update();
+            // While animating, the vsync thread wakes this loop at each display refresh
+            // so rendering tracks the refresh rate instead of a fixed poll timeout.
+            let animating = self.window.window.has_active_animations();
+            vsync.set_animating(animating);
+            if animating && !vsync.is_driving() {
+                // The vsync thread is not driving frames (still starting, or unavailable);
+                // fall back to a periodic wakeup so animations still advance.
                 let frame_duration = Duration::from_millis(10);
-                timeout = Some(match timeout {
-                    Some(x) => x.min(frame_duration),
-                    None => frame_duration,
-                })
+                timeout = Some(timeout.map_or(frame_duration, |x| x.min(frame_duration)));
+            }
+            // `request_redraw()` only raises the flag, so a request issued outside the
+            // poll would otherwise wait here for an unrelated wakeup.
+            if self.window.pending_redraw.get() {
+                timeout = Some(Duration::ZERO);
             }
             let mut r = Ok(ControlFlow::Continue(()));
             self.app.poll_events(timeout, |e| {
-                i_slint_core::platform::update_timers_and_animations();
+                ctx.update_timers_and_animations();
                 r = self.window.process_event(&e);
                 if let Some(event_listener) = &self.event_listener {
                     event_listener(&e)
@@ -154,6 +177,30 @@ impl i_slint_core::platform::Platform for AndroidPlatform {
         }
     }
 
+    fn bind_context(&self, ctx: i_slint_core::SlintContextWeak, _: i_slint_core::InternalToken) {
+        let _ = self.context.set(ctx.clone());
+        let ctx = ctx.upgrade().expect("bind_context called while the SlintContext is still alive");
+        let color_scheme = match self
+            .window
+            .java_helper
+            .color_scheme()
+            .unwrap_or_else(|e| javahelper::print_jni_error(&self.app, e))
+        {
+            0x10 => i_slint_core::items::ColorScheme::Light, // UI_MODE_NIGHT_NO
+            0x20 => i_slint_core::items::ColorScheme::Dark,  // UI_MODE_NIGHT_YES
+            _ => i_slint_core::items::ColorScheme::Unknown,
+        };
+        ctx.set_color_scheme(color_scheme);
+        if let Ok(accent) = self.window.java_helper.accent_color() {
+            ctx.set_accent_color(accent);
+        }
+        if let Ok(scale) = self.window.java_helper.font_scale()
+            && let Some(size) = javahelper::font_scale_to_logical_length(scale)
+        {
+            ctx.set_platform_default_font_size(Some(size));
+        }
+    }
+
     fn long_press_interval(&self, _: i_slint_core::InternalToken) -> Duration {
         self.window.java_helper.long_press_timeout().unwrap_or(Duration::from_millis(500))
     }
@@ -186,4 +233,14 @@ impl i_slint_core::platform::EventLoopProxy for AndroidEventLoopProxy {
         self.waker.wake();
         Ok(())
     }
+}
+
+pub fn set_requested_graphics_api(
+    requested_graphics_api: Option<i_slint_core::graphics::RequestedGraphicsAPI>,
+) -> Result<(), PlatformError> {
+    let Some(adapter) = CURRENT_WINDOW.with_borrow(|x| x.upgrade()) else {
+        return Err(format!("On Android a graphics API for Slint can only be requested after calling slint::android::init()").into());
+    };
+    adapter.set_requested_graphics_api(requested_graphics_api);
+    Ok(())
 }

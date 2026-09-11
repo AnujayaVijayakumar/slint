@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore SCANOUT
 use drm::control::Device;
 use gbm::AsRaw;
 use i_slint_core::platform::PlatformError;
@@ -64,7 +65,7 @@ impl GbmDisplay {
         match &config {
             glutin::config::Config::Egl(egl_config) => {
                 drm::buffer::DrmFourcc::try_from(egl_config.native_visual())
-                    .map_or(false, |egl_config_fourcc| egl_config_fourcc == self.surface_format)
+                    == Ok(self.surface_format)
             }
             _ => false,
         }

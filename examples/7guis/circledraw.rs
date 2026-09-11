@@ -1,6 +1,8 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: MIT
 
+// cSpell: ignore undoable
+
 use slint::Model;
 use slint::VecModel;
 use std::cell::RefCell;
@@ -8,6 +10,7 @@ use std::rc::Rc;
 
 slint::slint!(export { MainWindow } from "circledraw.slint";);
 
+#[allow(clippy::enum_variant_names)]
 enum Change {
     CircleAdded { row: usize },
     CircleRemoved { row: usize, circle: Circle },
@@ -97,7 +100,7 @@ pub fn main() {
             let mut undo_stack = undo_stack.borrow_mut();
             let main_window = window_weak.unwrap();
 
-            model.push(Circle { x: x as f32, y: y as f32, d: 30.0 });
+            model.push(Circle { x, y, d: 30.0 });
             undo_stack.push(Change::CircleAdded { row: model.row_count() - 1 });
 
             main_window.set_undoable(undo_stack.undoable());

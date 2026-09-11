@@ -1,16 +1,17 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: MIT
 
+// cSpell: ignore resampler
 use std::pin::Pin;
 
 use bytemuck::Pod;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SizedSample;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
-use futures::future::OptionFuture;
 use futures::FutureExt;
-use ringbuf::ring_buffer::{RbRef, RbWrite};
+use futures::future::OptionFuture;
 use ringbuf::HeapRb;
+use ringbuf::ring_buffer::{RbRef, RbWrite};
 use std::future::Future;
 
 use super::ControlCommand;
@@ -65,7 +66,7 @@ impl AudioPlaybackThread {
                             ),
                             output_channel_layout,
                         ),
-                        format @ _ => todo!("unsupported cpal output format {:#?}", format),
+                        format => todo!("unsupported cpal output format {:#?}", format),
                     };
 
                     let packet_receiver_impl =
@@ -105,8 +106,8 @@ impl AudioPlaybackThread {
 
     pub async fn receive_packet(&self, packet: ffmpeg_next::codec::packet::packet::Packet) -> bool {
         match self.packet_sender.send(packet).await {
-            Ok(_) => return true,
-            Err(smol::channel::SendError(_)) => return false,
+            Ok(_) => true,
+            Err(smol::channel::SendError(_)) => false,
         }
     }
 

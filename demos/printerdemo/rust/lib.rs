@@ -44,7 +44,7 @@ pub fn main() {
     console_error_panic_hook::set_once();
 
     let main_window = MainWindow::new().unwrap();
-    main_window.set_ink_levels(
+    main_window.global::<PrinterState>().set_ink_levels(
         [
             InkLevel { color: slint::Color::from_rgb_u8(0, 255, 255), level: 0.40 },
             InkLevel { color: slint::Color::from_rgb_u8(255, 0, 255), level: 0.20 },
@@ -111,7 +111,12 @@ pub fn main() {
                 1 => "fr",
                 _ => return,
             };
-            std::env::set_var("LANGUAGE", lang);
+            // Safety: WARNING, this is not thread safe if there are other threads
+            // set_var is marked as unsafe since Rust edition 2024
+            // TODO: look into a different mechanism to change the language at runtime
+            unsafe {
+                std::env::set_var("LANGUAGE", lang);
+            }
             slint::init_translations!(concat!(env!("CARGO_MANIFEST_DIR"), "/../lang/"));
         })
     }

@@ -1,4 +1,3 @@
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0 -->
 
 **NOTE**: This library is an **internal** crate of the [Slint project](https://slint.dev).
 This crate should **not be used directly** by applications using Slint.
@@ -113,9 +112,10 @@ export component App {
 #         // ...
 #     }
 # }
-# }
+# } /*
 #[test]
 fn test_basic_user_interface()
+# */
 {
     i_slint_backend_testing::init_no_event_loop();
     let app = App::new().unwrap();
@@ -147,7 +147,7 @@ useful to simulate touch or mouse input. For example a mouse click on a button i
 3. In real life, a certain amount of time would elapse now.
 4. Finally, the user lifts the finger again from the mouse and a mouse release event is triggered.
 
-To simulate this behaviour, [`ElementHandle`] provides functions such as [`ElementHandle::single_click()`] and [`ElementHandle::double_click()`].
+To simulate this behavior, [`ElementHandle`] provides functions such as [`ElementHandle::single_click()`] and [`ElementHandle::double_click()`].
 Since these functions simulate a sequence of events with a period of idle time between the events, these functions are [async](https://doc.rust-lang.org/std/keyword.async.html)
 and return a [`std::future::Future`], which resolves when the last event in the sequence was sent.
 
@@ -158,9 +158,13 @@ example wraps the core functions for testing in an async closure:
 ```rust
 
 use slint::platform::PointerEventButton;
+use i_slint_backend_testing::ElementHandle;
 
+# /*
 #[test]
-fn test_click() {
+fn test_click()
+# */
+{
     i_slint_backend_testing::init_integration_test_with_system_time();
 
     slint::spawn_local(async move {
@@ -197,3 +201,94 @@ the event loop is started, and that will start polling the async closure passed 
 In this closure we can now call `.await` on the future [`ElementHandle::single_click()`] returns, which
 will keep running the event loop until the click is complete, and then continue with the test function.
 
+## Embedded MCP Server
+
+The testing backend includes an embedded [MCP (Model Context Protocol)](https://modelcontextprotocol.io/)
+server that allows AI agents to inspect and interact with a running Slint application in real time.
+The server provides tools for exploring the UI tree, taking screenshots, clicking elements, dragging,
+typing, and more. Agents discover the available tools and usage instructions automatically via the
+MCP protocol — no additional configuration is needed beyond enabling the server.
+
+### Enabling the MCP Server
+
+Set the following environment variables when running your application, and pass
+`--features slint/mcp` to enable the server:
+
+```sh
+SLINT_EMIT_DEBUG_INFO=1 SLINT_MCP_PORT=8080 cargo run -p my-slint-app --features slint/mcp
+```
+
+`SLINT_EMIT_DEBUG_INFO=1` is required for element introspection to work (it embeds element
+metadata into the compiled UI). `SLINT_MCP_PORT` controls which port the MCP server listens on.
+If `SLINT_MCP_PORT` is not set, no server is started and there is no runtime overhead.
+Do not add `mcp` to the `[features]` section of your `Cargo.toml` — use the `--features`
+flag on the command line instead.
+
+### Running Without a Display
+
+On a machine with no display server (CI, container, agent sandbox) the regular
+backend can't open a window, so `take_screenshot` and the other tools won't
+work. Set `SLINT_BACKEND=headless` to run the app under a windowless,
+software-rasterized backend instead:
+
+```sh
+SLINT_EMIT_DEBUG_INFO=1 SLINT_MCP_PORT=8080 SLINT_BACKEND=headless \
+    cargo run -p my-slint-app --features slint/mcp
+```
+
+The headless backend uses Skia's software rasterizer when `slint/renderer-skia`
+is enabled, otherwise the built-in software renderer. Suffix the value
+(`headless-software`, `headless-skia`) to force a specific rasterizer. If
+`SLINT_BACKEND` is unset and the configured graphical backend fails to
+initialize (for example because no display is available), Slint falls back to
+the headless backend automatically.
+
+This is an unstable, MCP-oriented entry point — the exact value of
+`SLINT_BACKEND` may change between Slint releases. Use it from automation, not
+from production code.
+
+### Usage with AI Agents
+
+The simplest approach is to tell the agent to run the application with both environment variables
+set and then interact with it. For example, in Claude Code:
+
+> "Run `SLINT_EMIT_DEBUG_INFO=1 SLINT_MCP_PORT=8080 cargo run -p my-app --features slint/mcp` in the background. The
+> app includes a built-in MCP server. Connect to it and toggle the dark mode switch."
+
+The agent will discover the MCP endpoint, connect, and use the tools to accomplish the task.
+
+When scripting or testing from the command line, use `curl` to call tools directly — it is
+the most reliable way to send JSON-RPC requests to the server:
+
+```sh
+# Initialize (confirms the server is up and prints available tools)
+curl -s -X POST http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}'
+
+# List windows
+curl -s -X POST http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_windows","arguments":{}}}'
+
+# Take a screenshot (response contains a base64-encoded PNG in the "data" field)
+curl -s -X POST http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"take_screenshot","arguments":{"windowHandle":{"index":"1","generation":"1"}}}}'
+```
+
+You can also register the server in your MCP client's configuration if you prefer:
+
+```json
+{
+  "mcpServers": {
+    "my-slint-app": {
+      "type": "streamable-http",
+      "url": "http://localhost:8080/mcp"
+    }
+  }
+}
+```
+
+For architecture and internals, see
+[docs/development/mcp-server.md](../../../docs/development/mcp-server.md).

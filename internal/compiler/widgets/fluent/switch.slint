@@ -23,7 +23,7 @@ export component Switch {
         root.toggled();
     }
 
-    min-width: 40px;
+    min-width: max(40px, layout.min-width);
     min-height: max(20px, layout.min-height);
     vertical-stretch: 0;
     horizontal-stretch: 0;
@@ -33,8 +33,10 @@ export component Switch {
     accessible-checked <=> root.checked;
     accessible-role: switch;
     accessible-action-default => {
-        root.checked = !root.checked;
-        root.toggled();
+        if(root.enabled) {
+            root.checked = !root.checked;
+            root.toggled();
+        }
     }
     forward-focus: focus-scope;
 
@@ -47,7 +49,7 @@ export component Switch {
             thumb.background: root.checked ? FluentPalette.text-accent-foreground-disabled : FluentPalette.text-secondary;
         }
         pressed when touch-area.pressed : {
-            rail.background: root.checked ? FluentPalette.tertiary-accent-background : FluentPalette.control-alt-quartiary;
+            rail.background: root.checked ? FluentPalette.tertiary-accent-background : FluentPalette.control-alt-quaternary;
             thumb.width: 17px;
             thumb.height: 14px;
             thumb.border-width: root.checked ? 1px : 0;
@@ -106,10 +108,9 @@ export component Switch {
         if (root.text != "") : Text {
             text: root.text;
             color: root.text-color;
-            font-size: FluentFontSettings.body.font-size;
-            font-weight: FluentFontSettings.body.font-weight;
             vertical-alignment: center;
             horizontal-alignment: left;
+            accessible-role: none;
         }
     }
 

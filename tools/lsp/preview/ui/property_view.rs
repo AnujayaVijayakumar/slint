@@ -9,13 +9,13 @@ use smol_str::SmolStr;
 
 use i_slint_compiler::{
     expression_tree, langtype, literals, object_tree,
-    parser::{syntax_nodes, SyntaxKind, TextRange},
+    parser::{SyntaxKind, TextRange, syntax_nodes},
 };
 
-use slint::{SharedString, VecModel};
+use slint::{Model as _, SharedString, VecModel};
 
 use crate::{
-    common,
+    editor_preview,
     preview::{properties, ui},
 };
 
@@ -48,7 +48,7 @@ fn is_complex(expression: Option<syntax_nodes::Expression>, ty: &langtype::Type)
 }
 
 fn map_property_to_ui(
-    document_cache: &common::DocumentCache,
+    document_cache: &editor_preview::DocumentCache,
     element: &object_tree::ElementRc,
     property_info: &properties::PropertyInformation,
     window_adapter: Option<&Rc<dyn slint::platform::WindowAdapter>>,
@@ -81,17 +81,18 @@ fn map_property_to_ui(
 
         fn extract_value_with_unit(
             expression: &syntax_nodes::Expression,
-            units: &[expression_tree::Unit],
+            units: &[expression_tree::WrittenUnit],
             value: &mut ui::PropertyValue,
         ) {
             fn extract_value_with_unit_impl(
                 expression: &syntax_nodes::Expression,
-                units: &[i_slint_compiler::expression_tree::Unit],
+                units: &[i_slint_compiler::expression_tree::WrittenUnit],
             ) -> Option<(ui::PropertyValueKind, f32, i32, String)> {
                 let (value, unit) = convert_number_literal(expression)?;
 
                 let index = units.iter().position(|u| u == &unit).or_else(|| {
-                    (units.is_empty() && unit == i_slint_compiler::expression_tree::Unit::None)
+                    (units.is_empty()
+                        && unit == i_slint_compiler::expression_tree::WrittenUnit::None)
                         .then_some(0_usize)
                 })?;
 
@@ -146,32 +147,44 @@ fn map_property_to_ui(
                 value.code = SharedString::from(tr_node.text().to_string());
             }
         }
-        if value.value_kind == ui::PropertyValueKind::String {
-            if let Some(tr) = &expression.AtTr() {
-                extract_tr_data(tr, &mut value);
-            }
+        if value.value_kind == ui::PropertyValueKind::String
+            && let Some(tr) = &expression.AtTr()
+        {
+            extract_tr_data(tr, &mut value);
         }
 
         if value.value_kind == ui::PropertyValueKind::Float {
-            use expression_tree::Unit;
+            use expression_tree::WrittenUnit;
             use langtype::Type;
 
             match &property_info.ty {
                 Type::Float32 => extract_value_with_unit(expression, &[], &mut value),
-                Type::Duration => {
-                    extract_value_with_unit(expression, &[Unit::S, Unit::Ms], &mut value)
-                }
+                Type::Duration => extract_value_with_unit(
+                    expression,
+                    &[WrittenUnit::S, WrittenUnit::Ms],
+                    &mut value,
+                ),
                 Type::PhysicalLength | Type::LogicalLength | Type::Rem => extract_value_with_unit(
                     expression,
-                    &[Unit::Px, Unit::Cm, Unit::Mm, Unit::In, Unit::Pt, Unit::Phx, Unit::Rem],
+                    &[
+                        WrittenUnit::Px,
+                        WrittenUnit::Cm,
+                        WrittenUnit::Mm,
+                        WrittenUnit::In,
+                        WrittenUnit::Pt,
+                        WrittenUnit::Phx,
+                        WrittenUnit::Rem,
+                    ],
                     &mut value,
                 ),
                 Type::Angle => extract_value_with_unit(
                     expression,
-                    &[Unit::Deg, Unit::Grad, Unit::Turn, Unit::Rad],
+                    &[WrittenUnit::Deg, WrittenUnit::Grad, WrittenUnit::Turn, WrittenUnit::Rad],
                     &mut value,
                 ),
-                Type::Percent => extract_value_with_unit(expression, &[Unit::Percent], &mut value),
+                Type::Percent => {
+                    extract_value_with_unit(expression, &[WrittenUnit::Percent], &mut value)
+                }
                 _ => {}
             }
         }
@@ -201,13 +214,13 @@ fn map_property_to_ui(
 }
 
 pub fn map_properties_to_ui(
-    document_cache: &common::DocumentCache,
+    document_cache: &editor_preview::DocumentCache,
     properties: Option<properties::QueryPropertyResponse>,
     window_adapter: &Rc<dyn slint::platform::WindowAdapter>,
 ) -> Option<(
     ui::ElementInformation,
     HashMap<SmolStr, ui::PropertyDeclaration>,
-    ui::PropertyGroupModel,
+    Rc<ui::search_model::SearchModel<ui::PropertyGroup>>,
 )> {
     use std::cmp::Ordering;
 
@@ -265,38 +278,62 @@ pub fn map_properties_to_ui(
         .cloned()
         .collect::<Vec<_>>();
 
+    type InnerGroupModel = ui::search_model::SearchModel<ui::PropertyInformation>;
+
     Some((
         ui::ElementInformation {
             id: element.id.as_str().into(),
+            component_name: element.component_name.as_str().into(),
             type_name: element.type_name.as_str().into(),
             source_uri,
             source_version,
-            range: ui::to_ui_range(element.range)?,
+            offset: u32::from(element.offset) as i32,
         },
         declarations,
-        Rc::new(VecModel::from(
-            keys.iter()
-                .map(|k| ui::PropertyGroup {
-                    group_name: k.0.as_str().into(),
-                    properties: Rc::new(VecModel::from({
-                        let mut v = property_groups.remove(k).unwrap();
-                        v.sort_by(|a, b| match a.display_priority.cmp(&b.display_priority) {
-                            Ordering::Less => Ordering::Less,
-                            Ordering::Equal => a.name.cmp(&b.name),
-                            Ordering::Greater => Ordering::Greater,
-                        });
-                        v
-                    }))
-                    .into(),
-                })
-                .collect::<Vec<_>>(),
-        ))
-        .into(),
+        Rc::new(ui::search_model::SearchModel::new(
+            VecModel::from(
+                keys.iter()
+                    .map(|k| ui::PropertyGroup {
+                        group_name: k.0.as_str().into(),
+                        properties: Rc::new(InnerGroupModel::new(
+                            VecModel::from({
+                                let mut v = property_groups.remove(k).unwrap();
+                                v.sort_by(|a, b| {
+                                    match a.display_priority.cmp(&b.display_priority) {
+                                        Ordering::Less => Ordering::Less,
+                                        Ordering::Equal => a.name.cmp(&b.name),
+                                        Ordering::Greater => Ordering::Greater,
+                                    }
+                                });
+                                v
+                            }),
+                            |i, search_str| ui::search_model::contains(&i.name, search_str),
+                        ))
+                        .into(),
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            |group, search_str| {
+                let yes = search_str.is_empty()
+                    || ui::search_model::contains(&group.group_name, search_str);
+                if let Some(sub_filter) =
+                    group.properties.as_any().downcast_ref::<InnerGroupModel>()
+                {
+                    if yes {
+                        sub_filter.set_search_text(Default::default());
+                    } else {
+                        sub_filter.set_search_text(search_str.clone());
+                        return sub_filter.row_count() > 0;
+                    }
+                }
+                yes
+            },
+        )),
     ))
 }
 
 fn map_property_declaration(
-    document_cache: &common::DocumentCache,
+    document_cache: &editor_preview::DocumentCache,
     declared_at: &Option<properties::DeclarationInformation>,
     defined_at: ui::PropertyDefinition,
 ) -> Option<ui::PropertyDeclaration> {
@@ -327,7 +364,7 @@ fn map_property_definition(
 
 fn convert_number_literal(
     node: &syntax_nodes::Expression,
-) -> Option<(f64, i_slint_compiler::expression_tree::Unit)> {
+) -> Option<(f64, i_slint_compiler::expression_tree::WrittenUnit)> {
     if let Some(unary) = &node.UnaryOpExpression() {
         let factor = match unary.first_token().unwrap().text() {
             "-" => -1.0,
@@ -337,14 +374,7 @@ fn convert_number_literal(
         convert_number_literal(&unary.Expression()).map(|(v, u)| (factor * v, u))
     } else {
         let literal = node.child_text(SyntaxKind::NumberLiteral)?;
-        let expr = literals::parse_number_literal(literal).ok()?;
-
-        match expr {
-            i_slint_compiler::expression_tree::Expression::NumberLiteral(value, unit) => {
-                Some((value, unit))
-            }
-            _ => None,
-        }
+        literals::parse_number_literal(literal).ok()
     }
 }
 
@@ -353,7 +383,7 @@ mod tests {
     use slint::{Model, SharedString};
 
     use crate::{
-        common,
+        editor_preview,
         preview::{properties, ui},
         test::loaded_document_cache,
     };
@@ -363,9 +393,9 @@ mod tests {
         line: u32,
         character: u32,
     ) -> Option<(
-        common::ElementRcNode,
+        editor_preview::ElementRcNode,
         Vec<properties::PropertyInformation>,
-        common::DocumentCache,
+        editor_preview::DocumentCache,
         lsp_types::Url,
     )> {
         let (dc, url, diag) = loaded_document_cache(source.to_string());
@@ -373,9 +403,9 @@ mod tests {
             if diag.is_empty() {
                 continue;
             }
-            eprintln!("Diags for {u}");
+            tracing::debug!("Diags for {u}");
             for d in diag {
-                eprintln!("{d:#?}");
+                tracing::debug!("{d:#?}");
             }
         }
         if let Some((e, p)) =
@@ -388,7 +418,7 @@ mod tests {
     }
 
     fn property_conversion_test(contents: &str, property_line: u32) -> ui::PropertyValue {
-        eprintln!("\n\n\n{contents}:");
+        tracing::debug!("\n\n\n{contents}:");
         let (e, pi, dc, _) = properties_at_position(contents, property_line, 30).unwrap();
         let test1 = pi.iter().find(|pi| pi.name == "test1").unwrap();
         super::map_property_to_ui(&dc, &e.element, test1, None).0
@@ -946,6 +976,7 @@ export component Test { in property <Foobar> test1; }"#,
 
     #[test]
     fn test_property_brush() {
+        use crate::preview::ui::GradientStop;
         let result =
             property_conversion_test(r#"export component Test { in property <brush> test1; }"#, 0);
         assert_eq!(result.value_kind, ui::PropertyValueKind::Brush);
@@ -1036,6 +1067,37 @@ export component Test { in property <Foobar> test1; }"#,
         assert_eq!(result.value_kind, ui::PropertyValueKind::Brush);
         assert_eq!(result.kind, ui::PropertyValueKind::Code);
         assert!(matches!(result.brush_kind, ui::BrushKind::Radial));
+
+        let result = property_conversion_test(
+            r#"export component Test { in property <brush> test1: @conic-gradient(white 36deg, #239 126deg, red 306deg); }"#,
+            1,
+        );
+        assert_eq!(result.value_kind, ui::PropertyValueKind::Brush);
+        assert_eq!(result.kind, ui::PropertyValueKind::Brush);
+        assert_eq!(result.brush_kind, ui::BrushKind::Conic);
+        assert_eq!(
+            result.gradient_stops.iter().collect::<Vec<_>>(),
+            [
+                GradientStop { color: slint::Color::from_rgb_u8(0xff, 0xff, 0xff,), position: 0.0 },
+                GradientStop {
+                    color: slint::Color::from_rgb_u8(0xff, 0xff, 0xff,),
+                    position: 36.0 / 360.0
+                },
+                GradientStop {
+                    color: slint::Color::from_rgb_u8(0x22, 0x33, 0x99),
+                    position: 126.0 / 360.0
+                },
+                GradientStop {
+                    color: slint::Color::from_rgb_u8(0xff, 0x00, 0x00),
+                    position: 306.0 / 360.0
+                },
+                GradientStop {
+                    color: slint::Color::from_rgb_u8(0xff, 0x00, 0x00),
+                    position: 360.0 / 360.0
+                },
+            ]
+        );
+        assert_eq!(result.code, "@conic-gradient(white 36deg, #239 126deg, red 306deg)");
     }
 
     #[test]

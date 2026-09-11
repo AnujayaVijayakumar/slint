@@ -2,24 +2,30 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 use crate::diagnostics::{BuildDiagnostics, SourceLocation, Spanned};
-use crate::langtype::{BuiltinElement, EnumerationValue, Function, Struct, Type};
+use crate::langtype::{
+    BuiltinElement, BuiltinStruct, EnumerationValue, Function, Keys, PropertyLookupMode, Struct,
+    Type,
+};
 use crate::layout::Orientation;
 use crate::lookup::LookupCtx;
 use crate::object_tree::*;
 use crate::parser::{NodeOrToken, SyntaxNode};
+use crate::symbol_counters::SymbolCounters;
 use crate::typeregister;
 use core::cell::RefCell;
-use smol_str::{format_smolstr, SmolStr};
+use smol_str::{SmolStr, format_smolstr};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 
 // FIXME remove the pub
 pub use crate::namedreference::NamedReference;
 pub use crate::passes::resolving;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-/// A function built into the run-time
+#[derive(Debug, Clone, PartialEq, Eq, strum::EnumString)]
+/// A function built into the run-time.
+/// Member functions of builtin elements bind to a variant with `#[slint(builtin_function(..))]`.
 pub enum BuiltinFunction {
     GetWindowScaleFactor,
     GetWindowDefaultFontSize,
@@ -44,17 +50,22 @@ pub enum BuiltinFunction {
     Exp,
     ToFixed,
     ToPrecision,
+    ToStringUnlocalized,
     SetFocusItem,
     ClearFocusItem,
     ShowPopupWindow,
     ClosePopupWindow,
     /// Show a context popup menu.
-    /// Arguments are `(parent, entries, position)`
+    /// Arguments are `(parent, menu_tree, position)`
     ///
-    /// The first argument (parent) is a reference to the `ContectMenu` native item
-    /// The second argument (entries) can either be of type Array of MenuEntry, or a reference to a MenuItem tree.
-    /// When it is a menu item tree, it is a ElementReference to the root of the tree, and in the LLR, a NumberLiteral to an index in  [`crate::llr::SubComponent::menu_item_trees`]
+    /// The first argument (parent) is a reference to the `ContextMenu` native item
+    /// The second argument (menu_tree) is a ElementReference to the root of the tree,
+    /// and in the LLR, a NumberLiteral to an index in  [`crate::llr::SubComponent::menu_item_trees`]
     ShowPopupMenu,
+    /// Show a context popup menu from a list of entries.
+    /// Arguments are `(parent, entries, position)`
+    /// The entries argument is an array of MenuEntry
+    ShowPopupMenuInternal,
     SetSelectionOffsets,
     ItemFontMetrics,
     /// the "42".to_float()
@@ -67,8 +78,13 @@ pub enum BuiltinFunction {
     StringCharacterCount,
     StringToLowercase,
     StringToUppercase,
+    StringStartsWith,
+    StringEndsWith,
+    StringReplaceAll,
+    KeysToString,
     ColorRgbaStruct,
     ColorHsvaStruct,
+    ColorOklchStruct,
     ColorBrighter,
     ColorDarker,
     ColorTransparentize,
@@ -76,17 +92,30 @@ pub enum BuiltinFunction {
     ColorWithAlpha,
     ImageSize,
     ArrayLength,
+    ArrayPush,
+    ArrayRemove,
+    ArrayInsert,
+    ArrayAny,
+    ArrayAll,
+    ArrayFindIndex,
     Rgb,
     Hsv,
+    Oklch,
     ColorScheme,
+    AccentColor,
     SupportsNativeMenuBar,
-    /// Setup the native menu bar, or the item-tree based menu bar
-    /// arguments are: `(ref entries, ref sub-menu, ref activated, item_tree_root?, no_native_menu_bar?)`
-    /// The two last arguments are only set if the menu is an item tree, in which case, `item_tree_root` is a reference
-    /// to the MenuItem tree root (just like the entries in the [`Self::ShowPopupMenu`] call), and `native_menu_bar` is
-    /// is a boolean literal that is true when we shouldn't try to setup the native menu bar.
-    /// If we have an item_tree_root, the code will assign the callback handler and properties on the non-native menubar as well
-    SetupNativeMenuBar,
+    /// Setup the menu bar
+    ///
+    /// arguments are: `(ref entries, ref sub-menu, ref activated, item_tree_root, no_native_menu_bar, <condition>)`
+    /// `item_tree_root` is a reference to the MenuItem tree root (just like in the [`Self::ShowPopupMenu`] call).
+    /// `no_native_menu_bar` is a boolean literal that is true when we shouldn't try to setup the native menu bar.
+    /// `condition` is an optional expression that is the expression to `if condition : MenuBar { ... }` for optional menu
+    SetupMenuBar,
+    /// Setup the menu of a `SystemTrayIcon`.
+    ///
+    /// Arguments are `(system_tray_ref, menu_tree_root)` where `menu_tree_root` is an ElementReference to the root of
+    /// the MenuItem tree, lowered to a NumberLiteral index into [`crate::llr::SubComponent::menu_item_trees`] in the LLR.
+    SetupSystemTrayIcon,
     Use24HourFormat,
     MonthDayCount,
     MonthOffset,
@@ -96,6 +125,7 @@ pub enum BuiltinFunction {
     ParseDate,
     TextInputFocused,
     SetTextInputFocused,
+    #[strum(disabled)]
     ImplicitLayoutInfo(Orientation),
     ItemAbsolutePosition,
     RegisterCustomFontByPath,
@@ -104,6 +134,23 @@ pub enum BuiltinFunction {
     Translate,
     UpdateTimers,
     DetectOperatingSystem,
+    StartTimer,
+    StopTimer,
+    RestartTimer,
+    OpenUrl,
+    MacosBringAllWindowsToFront,
+    ParseMarkdown,
+    StringToStyledText,
+    /// Converts a color to a hex string wrapped in StyledText.
+    /// Used for `<font color='\{expr}'>` interpolation in `@markdown`,
+    /// because `parse_interpolated` takes `StyledText` arguments.
+    ColorToStyledText,
+    DecimalSeparator,
+    /// The window title when the application doesn't set one, see
+    /// `i_slint_core::window::default_window_title`
+    DefaultWindowTitle,
+    PathPointAt,
+    PathAngleAt,
 }
 
 #[derive(Debug, Clone)]
@@ -123,33 +170,43 @@ pub enum BuiltinMacroFunction {
     Mod,
     /// Add the right conversion operations so that the return type is the same as the argument type
     Abs,
+    /// Equivalent to `x < 0 ? -1 : 1`
+    Sign,
     CubicBezier,
     /// The argument can be r,g,b,a or r,g,b and they can be percentages or integer.
     /// transform the argument so it is always rgb(r, g, b, a) with r, g, b between 0 and 255.
     Rgb,
     Hsv,
+    Oklch,
     /// transform `debug(a, b, c)` into debug `a + " " + b + " " + c`
     Debug,
+    ArrayPush,
+    ArrayRemove,
+    ArrayInsert,
+    /// Transforms `array.index-of(value)` into `array.find-index((x) => x == value)`
+    ArrayIndexOf,
+    CustomMouseCursor,
+    Spring,
 }
 
 macro_rules! declare_builtin_function_types {
     ($( $Name:ident $(($Pattern:tt))? : ($( $Arg:expr ),*) -> $ReturnType:expr $(,)? )*) => {
         #[allow(non_snake_case)]
         pub struct BuiltinFunctionTypes {
-            $(pub $Name : Rc<Function>),*
+            $(pub $Name : Arc<Function>),*
         }
         impl BuiltinFunctionTypes {
             pub fn new() -> Self {
                 Self {
-                    $($Name : Rc::new(Function{
+                    $($Name : Arc::new(Function{
                         args: vec![$($Arg),*],
                         return_type: $ReturnType,
-                        arg_names: vec![],
+                        arg_names: Vec::new(),
                     })),*
                 }
             }
 
-            pub fn ty(&self, function: &BuiltinFunction) -> Rc<Function> {
+            pub fn ty(&self, function: &BuiltinFunction) -> Arc<Function> {
                 match function {
                     $(BuiltinFunction::$Name $(($Pattern))? => self.$Name.clone()),*
                 }
@@ -176,17 +233,21 @@ declare_builtin_function_types!(
     ASin: (Type::Float32) -> Type::Angle,
     ATan: (Type::Float32) -> Type::Angle,
     ATan2: (Type::Float32, Type::Float32) -> Type::Angle,
+    DecimalSeparator: () -> Type::String,
+    DefaultWindowTitle: () -> Type::String,
     Log: (Type::Float32, Type::Float32) -> Type::Float32,
     Ln: (Type::Float32) -> Type::Float32,
     Pow: (Type::Float32, Type::Float32) -> Type::Float32,
     Exp: (Type::Float32) -> Type::Float32,
     ToFixed: (Type::Float32, Type::Int32) -> Type::String,
     ToPrecision: (Type::Float32, Type::Int32) -> Type::String,
+    ToStringUnlocalized: (Type::Float32) -> Type::String,
     SetFocusItem: (Type::ElementReference) -> Type::Void,
     ClearFocusItem: (Type::ElementReference) -> Type::Void,
     ShowPopupWindow: (Type::ElementReference) -> Type::Void,
     ClosePopupWindow: (Type::ElementReference) -> Type::Void,
-    ShowPopupMenu: (Type::ElementReference, Type::Model, typeregister::logical_point_type()) -> Type::Void,
+    ShowPopupMenu: (Type::ElementReference, Type::ElementReference, typeregister::logical_point_type().into()) -> Type::Void,
+    ShowPopupMenuInternal: (Type::ElementReference, Type::Model, typeregister::logical_point_type().into()) -> Type::Void,
     SetSelectionOffsets: (Type::ElementReference, Type::Int32, Type::Int32) -> Type::Void,
     ItemFontMetrics: (Type::ElementReference) -> typeregister::font_metrics_type(),
     StringToFloat: (Type::String) -> Type::Float32,
@@ -195,64 +256,71 @@ declare_builtin_function_types!(
     StringCharacterCount: (Type::String) -> Type::Int32,
     StringToLowercase: (Type::String) -> Type::String,
     StringToUppercase: (Type::String) -> Type::String,
-    ImplicitLayoutInfo(..): (Type::ElementReference) -> Type::Struct(typeregister::layout_info_type()),
-    ColorRgbaStruct: (Type::Color) -> Type::Struct(Rc::new(Struct {
-        fields: IntoIterator::into_iter([
+    StringStartsWith: (Type::String, Type::String) -> Type::Bool,
+    StringEndsWith: (Type::String, Type::String) -> Type::Bool,
+    StringReplaceAll: (Type::String, Type::String, Type::String) -> Type::String,
+    KeysToString: (Type::Keys) -> Type::String,
+    ImplicitLayoutInfo(..): (Type::ElementReference, Type::Float32) -> typeregister::layout_info_type().into(),
+    ColorRgbaStruct: (Type::Color) -> Type::Struct(Arc::new(Struct::new(IntoIterator::into_iter([
             (SmolStr::new_static("red"), Type::Int32),
             (SmolStr::new_static("green"), Type::Int32),
             (SmolStr::new_static("blue"), Type::Int32),
             (SmolStr::new_static("alpha"), Type::Int32),
         ])
-        .collect(),
-        name: Some("Color".into()),
-        node: None,
-        rust_attributes: None,
-    })),
-    ColorHsvaStruct: (Type::Color) -> Type::Struct(Rc::new(Struct {
-        fields: IntoIterator::into_iter([
+        .collect(), BuiltinStruct::Color))),
+    ColorHsvaStruct: (Type::Color) -> Type::Struct(Arc::new(Struct::new(IntoIterator::into_iter([
             (SmolStr::new_static("hue"), Type::Float32),
             (SmolStr::new_static("saturation"), Type::Float32),
             (SmolStr::new_static("value"), Type::Float32),
             (SmolStr::new_static("alpha"), Type::Float32),
         ])
-        .collect(),
-        name: Some("Color".into()),
-        node: None,
-        rust_attributes: None,
-    })),
+        .collect(), BuiltinStruct::Color))),
+    ColorOklchStruct: (Type::Color) -> Type::Struct(Arc::new(Struct::new(IntoIterator::into_iter([
+            (SmolStr::new_static("lightness"), Type::Float32),
+            (SmolStr::new_static("chroma"), Type::Float32),
+            (SmolStr::new_static("hue"), Type::Float32),
+            (SmolStr::new_static("alpha"), Type::Float32),
+        ])
+        .collect(), BuiltinStruct::Color))),
     ColorBrighter: (Type::Brush, Type::Float32) -> Type::Brush,
     ColorDarker: (Type::Brush, Type::Float32) -> Type::Brush,
     ColorTransparentize: (Type::Brush, Type::Float32) -> Type::Brush,
     ColorWithAlpha: (Type::Brush, Type::Float32) -> Type::Brush,
     ColorMix: (Type::Color, Type::Color, Type::Float32) -> Type::Color,
-    ImageSize: (Type::Image) -> Type::Struct(Rc::new(Struct {
-        fields: IntoIterator::into_iter([
+    ImageSize: (Type::Image) -> Type::Struct(Arc::new(Struct::new(IntoIterator::into_iter([
             (SmolStr::new_static("width"), Type::Int32),
             (SmolStr::new_static("height"), Type::Int32),
         ])
-        .collect(),
-        name: Some("Size".into()),
-        node: None,
-        rust_attributes: None,
-    })),
+        .collect(), crate::langtype::BuiltinStruct::Size))),
     ArrayLength: (Type::Model) -> Type::Int32,
+    // Using Type::InferredProperty as there is currently no valid type for the data argument.
+    ArrayPush: (Type::Model, Type::InferredProperty) -> Type::Void,
+    ArrayRemove: (Type::Model, Type::Int32) -> Type::Void,
+    ArrayInsert: (Type::Model, Type::Int32, Type::InferredProperty) -> Type::Void,
+    ArrayAny: (Type::Model, Type::Closure) -> Type::Bool,
+    ArrayAll: (Type::Model, Type::Closure) -> Type::Bool,
+    ArrayFindIndex: (Type::Model, Type::Closure) -> Type::Int32,
     Rgb: (Type::Int32, Type::Int32, Type::Int32, Type::Float32) -> Type::Color,
     Hsv: (Type::Float32, Type::Float32, Type::Float32, Type::Float32) -> Type::Color,
+    Oklch: (Type::Float32, Type::Float32, Type::Float32, Type::Float32) -> Type::Color,
     ColorScheme: () -> Type::Enumeration(
-        typeregister::BUILTIN.with(|e| e.enums.ColorScheme.clone()),
+        typeregister::BUILTIN.enums.ColorScheme.clone(),
     ),
+    AccentColor: () -> Type::Color,
     SupportsNativeMenuBar: () -> Type::Bool,
     // entries, sub-menu, activate. But the types here are not accurate.
-    SetupNativeMenuBar: (Type::Model, typeregister::noarg_callback_type(), typeregister::noarg_callback_type()) -> Type::Void,
+    SetupMenuBar: (Type::Model, typeregister::noarg_callback_type(), typeregister::noarg_callback_type()) -> Type::Void,
+    // (system_tray_ref, menu_tree_ref) — types not accurate (menu_tree becomes an index in LLR)
+    SetupSystemTrayIcon: (Type::ElementReference, Type::ElementReference) -> Type::Void,
     MonthDayCount: (Type::Int32, Type::Int32) -> Type::Int32,
     MonthOffset: (Type::Int32, Type::Int32) -> Type::Int32,
     FormatDate: (Type::String, Type::Int32, Type::Int32, Type::Int32) -> Type::String,
     TextInputFocused: () -> Type::Bool,
-    DateNow: () -> Type::Array(Rc::new(Type::Int32)),
+    DateNow: () -> Type::Array(Arc::new(Type::Int32)),
     ValidDate: (Type::String, Type::String) -> Type::Bool,
-    ParseDate: (Type::String, Type::String) -> Type::Array(Rc::new(Type::Int32)),
+    ParseDate: (Type::String, Type::String) -> Type::Array(Arc::new(Type::Int32)),
     SetTextInputFocused: (Type::Bool) -> Type::Void,
-    ItemAbsolutePosition: (Type::ElementReference) -> typeregister::logical_point_type(),
+    ItemAbsolutePosition: (Type::ElementReference) -> typeregister::logical_point_type().into(),
     RegisterCustomFontByPath: (Type::String) -> Type::Void,
     RegisterCustomFontByMemory: (Type::Int32) -> Type::Void,
     RegisterBitmapFont: (Type::Int32) -> Type::Void,
@@ -261,33 +329,56 @@ declare_builtin_function_types!(
     Use24HourFormat: () -> Type::Bool,
     UpdateTimers: () -> Type::Void,
     DetectOperatingSystem: () -> Type::Enumeration(
-        typeregister::BUILTIN.with(|e| e.enums.OperatingSystemType.clone()),
+        typeregister::BUILTIN.enums.OperatingSystemType.clone(),
     ),
+    StartTimer: (Type::ElementReference) -> Type::Void,
+    StopTimer: (Type::ElementReference) -> Type::Void,
+    RestartTimer: (Type::ElementReference) -> Type::Void,
+    ParseMarkdown: (Type::String, Type::Array(Type::StyledText.into())) -> Type::StyledText,
+    StringToStyledText: (Type::String) -> Type::StyledText,
+    ColorToStyledText: (Type::Color) -> Type::StyledText
+    OpenUrl: (Type::String) -> Type::Bool,
+    MacosBringAllWindowsToFront: () -> Type::Void,
+    PathPointAt: (Type::ElementReference, Type::Float32) -> typeregister::logical_point_type().into(),
+    PathAngleAt: (Type::ElementReference, Type::Float32) -> Type::Angle,
 );
 
+impl Default for BuiltinFunctionTypes {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BuiltinFunction {
-    pub fn ty(&self) -> Rc<Function> {
-        thread_local! {
-            static TYPES: BuiltinFunctionTypes = BuiltinFunctionTypes::new();
-        }
-        TYPES.with(|types| types.ty(self))
+    pub fn ty(&self) -> Arc<Function> {
+        static TYPES: std::sync::LazyLock<BuiltinFunctionTypes> =
+            std::sync::LazyLock::new(BuiltinFunctionTypes::new);
+        TYPES.ty(self)
     }
 
     /// It is const if the return value only depends on its argument and has no side effect
-    fn is_const(&self) -> bool {
+    fn is_const(&self, global_analysis: Option<&crate::passes::GlobalAnalysis>) -> bool {
         match self {
-            BuiltinFunction::GetWindowScaleFactor => false,
-            BuiltinFunction::GetWindowDefaultFontSize => false,
+            BuiltinFunction::GetWindowScaleFactor => {
+                global_analysis.is_some_and(|x| x.const_scale_factor.is_some())
+            }
+            BuiltinFunction::GetWindowDefaultFontSize => {
+                global_analysis.is_some_and(|x| x.default_font_size.is_const())
+            }
             BuiltinFunction::AnimationTick => false,
             BuiltinFunction::ColorScheme => false,
+            BuiltinFunction::AccentColor => false,
             BuiltinFunction::SupportsNativeMenuBar => false,
-            BuiltinFunction::SetupNativeMenuBar => false,
+            BuiltinFunction::SetupMenuBar => false,
+            BuiltinFunction::SetupSystemTrayIcon => false,
             BuiltinFunction::MonthDayCount => false,
             BuiltinFunction::MonthOffset => false,
             BuiltinFunction::FormatDate => false,
             BuiltinFunction::DateNow => false,
             BuiltinFunction::ValidDate => false,
             BuiltinFunction::ParseDate => false,
+            BuiltinFunction::DecimalSeparator => false,
+            BuiltinFunction::DefaultWindowTitle => false,
             // Even if it is not pure, we optimize it away anyway
             BuiltinFunction::Debug => true,
             BuiltinFunction::Mod
@@ -307,38 +398,48 @@ impl BuiltinFunction {
             | BuiltinFunction::Exp
             | BuiltinFunction::ATan
             | BuiltinFunction::ATan2
-            | BuiltinFunction::ToFixed
-            | BuiltinFunction::ToPrecision => true,
+            | BuiltinFunction::ToStringUnlocalized => true,
+            // The result depends on the locale's decimal separator, like DecimalSeparator.
+            // The constant propagation folds the locale-independent cases and promotes
+            // their binding back to constant.
+            BuiltinFunction::ToFixed
+            | BuiltinFunction::ToPrecision
+            | BuiltinFunction::StringToFloat
+            | BuiltinFunction::StringIsFloat => false,
             BuiltinFunction::SetFocusItem | BuiltinFunction::ClearFocusItem => false,
             BuiltinFunction::ShowPopupWindow
             | BuiltinFunction::ClosePopupWindow
-            | BuiltinFunction::ShowPopupMenu => false,
+            | BuiltinFunction::ShowPopupMenu
+            | BuiltinFunction::ShowPopupMenuInternal => false,
             BuiltinFunction::SetSelectionOffsets => false,
             BuiltinFunction::ItemFontMetrics => false, // depends also on Window's font properties
-            BuiltinFunction::StringToFloat
-            | BuiltinFunction::StringIsFloat
-            | BuiltinFunction::StringIsEmpty
+            BuiltinFunction::StringIsEmpty
             | BuiltinFunction::StringCharacterCount
             | BuiltinFunction::StringToLowercase
-            | BuiltinFunction::StringToUppercase => true,
+            | BuiltinFunction::StringToUppercase
+            | BuiltinFunction::StringStartsWith
+            | BuiltinFunction::StringEndsWith
+            | BuiltinFunction::StringReplaceAll
+            | BuiltinFunction::KeysToString => true,
             BuiltinFunction::ColorRgbaStruct
             | BuiltinFunction::ColorHsvaStruct
+            | BuiltinFunction::ColorOklchStruct
             | BuiltinFunction::ColorBrighter
             | BuiltinFunction::ColorDarker
             | BuiltinFunction::ColorTransparentize
             | BuiltinFunction::ColorMix
             | BuiltinFunction::ColorWithAlpha => true,
-            // ImageSize is pure, except when loading images via the network. Then the initial size will be 0/0 and
-            // we need to make sure that calls to this function stay within a binding, so that the property
-            // notification when updating kicks in. Only SlintPad (wasm-interpreter) loads images via the network,
-            // which is when this code is targeting wasm.
-            #[cfg(not(target_arch = "wasm32"))]
-            BuiltinFunction::ImageSize => true,
-            #[cfg(target_arch = "wasm32")]
-            BuiltinFunction::ImageSize => false,
+            // On the web, the browser loads images asynchronously, so the size is initially 0/0
+            // and updates once the image is loaded. Calls to this function must stay within a
+            // binding so that the property notification kicks in when the code may run on the web.
+            BuiltinFunction::ImageSize => global_analysis.is_some_and(|x| x.const_image_sizes),
             BuiltinFunction::ArrayLength => true,
+            BuiltinFunction::ArrayPush
+            | BuiltinFunction::ArrayRemove
+            | BuiltinFunction::ArrayInsert => false,
             BuiltinFunction::Rgb => true,
             BuiltinFunction::Hsv => true,
+            BuiltinFunction::Oklch => true,
             BuiltinFunction::SetTextInputFocused => false,
             BuiltinFunction::TextInputFocused => false,
             BuiltinFunction::ImplicitLayoutInfo(_) => false,
@@ -350,6 +451,19 @@ impl BuiltinFunction {
             BuiltinFunction::Use24HourFormat => false,
             BuiltinFunction::UpdateTimers => false,
             BuiltinFunction::DetectOperatingSystem => true,
+            BuiltinFunction::StartTimer => false,
+            BuiltinFunction::StopTimer => false,
+            BuiltinFunction::RestartTimer => false,
+            BuiltinFunction::ParseMarkdown => false,
+            BuiltinFunction::StringToStyledText => true,
+            BuiltinFunction::ColorToStyledText => true,
+            BuiltinFunction::OpenUrl => false,
+            BuiltinFunction::MacosBringAllWindowsToFront => false,
+            BuiltinFunction::PathPointAt => true,
+            BuiltinFunction::PathAngleAt => true,
+            BuiltinFunction::ArrayAny
+            | BuiltinFunction::ArrayAll
+            | BuiltinFunction::ArrayFindIndex => true,
         }
     }
 
@@ -360,14 +474,18 @@ impl BuiltinFunction {
             BuiltinFunction::GetWindowDefaultFontSize => true,
             BuiltinFunction::AnimationTick => true,
             BuiltinFunction::ColorScheme => true,
+            BuiltinFunction::AccentColor => true,
             BuiltinFunction::SupportsNativeMenuBar => true,
-            BuiltinFunction::SetupNativeMenuBar => false,
+            BuiltinFunction::SetupMenuBar => false,
+            BuiltinFunction::SetupSystemTrayIcon => false,
             BuiltinFunction::MonthDayCount => true,
             BuiltinFunction::MonthOffset => true,
             BuiltinFunction::FormatDate => true,
             BuiltinFunction::DateNow => true,
             BuiltinFunction::ValidDate => true,
             BuiltinFunction::ParseDate => true,
+            BuiltinFunction::DecimalSeparator => true,
+            BuiltinFunction::DefaultWindowTitle => true,
             // Even if it has technically side effect, we still consider it as pure for our purpose
             BuiltinFunction::Debug => true,
             BuiltinFunction::Mod
@@ -388,11 +506,13 @@ impl BuiltinFunction {
             | BuiltinFunction::ATan
             | BuiltinFunction::ATan2
             | BuiltinFunction::ToFixed
-            | BuiltinFunction::ToPrecision => true,
+            | BuiltinFunction::ToPrecision
+            | BuiltinFunction::ToStringUnlocalized => true,
             BuiltinFunction::SetFocusItem | BuiltinFunction::ClearFocusItem => false,
             BuiltinFunction::ShowPopupWindow
             | BuiltinFunction::ClosePopupWindow
-            | BuiltinFunction::ShowPopupMenu => false,
+            | BuiltinFunction::ShowPopupMenu
+            | BuiltinFunction::ShowPopupMenuInternal => false,
             BuiltinFunction::SetSelectionOffsets => false,
             BuiltinFunction::ItemFontMetrics => true,
             BuiltinFunction::StringToFloat
@@ -400,9 +520,14 @@ impl BuiltinFunction {
             | BuiltinFunction::StringIsEmpty
             | BuiltinFunction::StringCharacterCount
             | BuiltinFunction::StringToLowercase
-            | BuiltinFunction::StringToUppercase => true,
+            | BuiltinFunction::StringToUppercase
+            | BuiltinFunction::StringStartsWith
+            | BuiltinFunction::StringEndsWith
+            | BuiltinFunction::StringReplaceAll
+            | BuiltinFunction::KeysToString => true,
             BuiltinFunction::ColorRgbaStruct
             | BuiltinFunction::ColorHsvaStruct
+            | BuiltinFunction::ColorOklchStruct
             | BuiltinFunction::ColorBrighter
             | BuiltinFunction::ColorDarker
             | BuiltinFunction::ColorTransparentize
@@ -410,8 +535,12 @@ impl BuiltinFunction {
             | BuiltinFunction::ColorWithAlpha => true,
             BuiltinFunction::ImageSize => true,
             BuiltinFunction::ArrayLength => true,
+            BuiltinFunction::ArrayPush
+            | BuiltinFunction::ArrayRemove
+            | BuiltinFunction::ArrayInsert => false,
             BuiltinFunction::Rgb => true,
             BuiltinFunction::Hsv => true,
+            BuiltinFunction::Oklch => true,
             BuiltinFunction::ImplicitLayoutInfo(_) => true,
             BuiltinFunction::ItemAbsolutePosition => true,
             BuiltinFunction::SetTextInputFocused => false,
@@ -423,6 +552,19 @@ impl BuiltinFunction {
             BuiltinFunction::Use24HourFormat => true,
             BuiltinFunction::UpdateTimers => false,
             BuiltinFunction::DetectOperatingSystem => true,
+            BuiltinFunction::StartTimer => false,
+            BuiltinFunction::StopTimer => false,
+            BuiltinFunction::RestartTimer => false,
+            BuiltinFunction::ParseMarkdown => true,
+            BuiltinFunction::StringToStyledText => true,
+            BuiltinFunction::ColorToStyledText => true,
+            BuiltinFunction::OpenUrl => false,
+            BuiltinFunction::MacosBringAllWindowsToFront => false,
+            BuiltinFunction::PathPointAt => true,
+            BuiltinFunction::PathAngleAt => true,
+            BuiltinFunction::ArrayAny
+            | BuiltinFunction::ArrayAll
+            | BuiltinFunction::ArrayFindIndex => true,
         }
     }
 }
@@ -467,14 +609,24 @@ pub fn operator_class(op: char) -> OperatorClass {
 }
 
 macro_rules! declare_units {
-    ($( $(#[$m:meta])* $ident:ident = $string:literal -> $ty:ident $(* $factor:expr)? ,)*) => {
-        /// The units that can be used after numbers in the language
+    // A unit written without a conversion is already its type's canonical unit.
+    (@normalize $value:ident, $ident:ident) => { ($value, Unit::$ident) };
+    // Otherwise scale by the factor and switch to the named canonical unit.
+    (@normalize $value:ident, $ident:ident, $canon:ident, $factor:expr) => {
+        ($value * ($factor as f64), Unit::$canon)
+    };
+    ($( $(#[$m:meta])* $ident:ident = $string:literal $(-> $canon:ident * $factor:expr)? ,)*) => {
+        /// A unit as written after a number in the source (`px`, `cm`, `grad`, ...).
+        ///
+        /// These are all the units a user can type. A literal is normalized to the
+        /// canonical [`Unit`] of its type the moment it enters the expression tree, so
+        /// only the parser and tooling ever handle a `WrittenUnit`.
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, strum::EnumIter)]
-        pub enum Unit {
+        pub enum WrittenUnit {
             $($(#[$m])* $ident,)*
         }
 
-        impl std::fmt::Display for Unit {
+        impl std::fmt::Display for WrittenUnit {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 match self {
                     $(Self::$ident => write!(f, $string), )*
@@ -482,7 +634,7 @@ macro_rules! declare_units {
             }
         }
 
-        impl std::str::FromStr for Unit {
+        impl std::str::FromStr for WrittenUnit {
             type Err = ();
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 match s {
@@ -492,68 +644,110 @@ macro_rules! declare_units {
             }
         }
 
-        impl Unit {
-            pub fn ty(self) -> Type {
+        impl WrittenUnit {
+            /// Scale `value`, written in this surface unit, to the value and canonical
+            /// [`Unit`] a `NumberLiteral` stores. The scale and the unit come out
+            /// together so they can't drift apart.
+            pub fn normalize(self, value: f64) -> (f64, Unit) {
                 match self {
-                    $(Self::$ident => Type::$ty, )*
+                    $(Self::$ident => declare_units!(@normalize value, $ident $(, $canon, $factor)?), )*
                 }
             }
-
-            pub fn normalize(self, x: f64) -> f64 {
-                match self {
-                    $(Self::$ident => x $(* $factor as f64)?, )*
-                }
-            }
-
         }
     };
 }
 
 declare_units! {
     /// No unit was given
-    None = "" -> Float32,
+    None = "",
     /// Percent value
-    Percent = "%" -> Percent,
+    Percent = "%",
 
     // Lengths or Coord
 
     /// Physical pixels
-    Phx = "phx" -> PhysicalLength,
+    Phx = "phx",
     /// Logical pixels
-    Px = "px" -> LogicalLength,
+    Px = "px",
     /// Centimeters
-    Cm = "cm" -> LogicalLength * 37.8,
+    Cm = "cm" -> Px * 37.8,
     /// Millimeters
-    Mm = "mm" -> LogicalLength * 3.78,
+    Mm = "mm" -> Px * 3.78,
     /// inches
-    In = "in" -> LogicalLength * 96,
+    In = "in" -> Px * 96,
     /// Points
-    Pt = "pt" -> LogicalLength * 96./72.,
+    Pt = "pt" -> Px * 96./72.,
     /// Logical pixels multiplied with the window's default-font-size
-    Rem = "rem" -> Rem,
+    Rem = "rem",
 
     // durations
 
     /// Seconds
-    S = "s" -> Duration * 1000,
+    S = "s" -> Ms * 1000,
     /// Milliseconds
-    Ms = "ms" -> Duration,
+    Ms = "ms",
 
     // angles
 
     /// Degree
-    Deg = "deg" -> Angle,
+    Deg = "deg",
     /// Gradians
-    Grad = "grad" -> Angle * 360./180.,
+    Grad = "grad" -> Deg * 360./180.,
     /// Turns
-    Turn = "turn" -> Angle * 360.,
+    Turn = "turn" -> Deg * 360.,
     /// Radians
-    Rad = "rad" -> Angle * 360./std::f32::consts::TAU,
+    Rad = "rad" -> Deg * 360./std::f32::consts::TAU,
 }
 
-impl Default for Unit {
-    fn default() -> Self {
-        Self::None
+/// The unit a [`Expression::NumberLiteral`] carries: always the canonical unit of
+/// its type, so the stored value is already scaled and needs no further
+/// conversion. The units a user can type (`cm`, `pt`, `grad`, ...) are
+/// [`WrittenUnit`] and are normalized to one of these on the way in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum Unit {
+    /// Dimension-less (`float`, `int`)
+    #[default]
+    None,
+    /// Percent
+    Percent,
+    /// Physical pixels
+    Phx,
+    /// Logical pixels
+    Px,
+    /// Logical pixels multiplied with the window's default-font-size
+    Rem,
+    /// Milliseconds
+    Ms,
+    /// Degrees
+    Deg,
+}
+
+impl Unit {
+    pub fn ty(self) -> Type {
+        match self {
+            Unit::None => Type::Float32,
+            Unit::Percent => Type::Percent,
+            Unit::Px => Type::LogicalLength,
+            Unit::Phx => Type::PhysicalLength,
+            Unit::Rem => Type::Rem,
+            Unit::Ms => Type::Duration,
+            Unit::Deg => Type::Angle,
+        }
+    }
+}
+
+impl std::fmt::Display for Unit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Unit::None => "",
+            Unit::Percent => "%",
+            Unit::Px => "px",
+            Unit::Phx => "phx",
+            Unit::Rem => "rem",
+            Unit::Ms => "ms",
+            Unit::Deg => "deg",
+        };
+        write!(f, "{s}")
     }
 }
 
@@ -563,7 +757,7 @@ pub enum MinMaxOp {
     Max,
 }
 
-/// The Expression is hold by properties, so it should not hold any strong references to node from the object_tree
+/// The Expression is held by properties, so it should not hold any strong references to node from the object_tree
 #[derive(Debug, Clone, Default)]
 pub enum Expression {
     /// Something went wrong (and an error will be reported)
@@ -665,6 +859,8 @@ pub enum Expression {
         rhs: Box<Expression>,
         /// '+', '-', '/', '*', '=', '!', '<', '>', '≤', '≥', '&', '|'
         op: char,
+        /// The operator token, when written in the source.
+        source_location: Option<SourceLocation>,
     },
 
     UnaryOp {
@@ -683,6 +879,8 @@ pub enum Expression {
         condition: Box<Expression>,
         true_expr: Box<Expression>,
         false_expr: Box<Expression>,
+        /// The `?` token, when written in the source.
+        source_location: Option<SourceLocation>,
     },
 
     Array {
@@ -690,13 +888,17 @@ pub enum Expression {
         values: Vec<Expression>,
     },
     Struct {
-        ty: Rc<Struct>,
-        values: HashMap<SmolStr, Expression>,
+        ty: Arc<Struct>,
+        values: BTreeMap<SmolStr, Expression>,
     },
 
     PathData(Path),
 
     EasingCurve(EasingCurve),
+
+    EmptyDataTransfer,
+
+    MouseCursor(MouseCursorInner),
 
     LinearGradient {
         angle: Box<Expression>,
@@ -705,25 +907,102 @@ pub enum Expression {
     },
 
     RadialGradient {
+        /// Explicit gradient center in the element's local coordinate space (`at <x> <y>`).
+        /// `None` means use the element's bbox centre.
+        center: Option<(Box<Expression>, Box<Expression>)>,
+        /// Explicit radius in the element's local coordinate space (`circle <r>`).
+        /// `None` means use the element's bbox half-diagonal.
+        radius: Option<Box<Expression>>,
         /// First expression in the tuple is a color, second expression is the stop position
+        stops: Vec<(Expression, Expression)>,
+    },
+
+    ConicGradient {
+        /// The starting angle (rotation) of the gradient, corresponding to CSS `from <angle>`
+        from_angle: Box<Expression>,
+        /// Explicit gradient center in the element's local coordinate space (`at <x> <y>`).
+        /// `None` means use the element's bbox centre.
+        center: Option<(Box<Expression>, Box<Expression>)>,
+        /// First expression in the tuple is a color, second expression is the stop angle
         stops: Vec<(Expression, Expression)>,
     },
 
     EnumerationValue(EnumerationValue),
 
+    Keys(Keys),
+
     ReturnStatement(Option<Box<Expression>>),
 
+    /// Standard cache access (see docs/development/layout-system.md)
     LayoutCacheAccess {
+        /// This property holds an array of entries
         layout_cache_prop: NamedReference,
+        /// The index into that array. If repeater_index is None, then the code will be `layout_cache_prop[index]`
         index: usize,
         /// When set, this is the index within a repeater, and the index is then the location of another offset.
-        /// So this looks like `layout_cache_prop[layout_cache_prop[index] + repeater_index]`
+        /// The code will be `layout_cache_prop[layout_cache_prop[index] + repeater_index * entries_per_item]`
+        /// Not used by GridLayout (see GridRepeaterCacheAccess)
         repeater_index: Option<Box<Expression>>,
+        /// The number of entries to skip per repeater iteration:
+        /// 2 for pos+size, 4 for flex x+y+w+, 4 for grid organized data
+        /// This is only used when repeater_index is set
+        entries_per_item: usize,
     },
-    /// Compute the LayoutInfo for the given layout.
-    /// The orientation is the orientation of the cache, not the orientation of the layout
-    ComputeLayoutInfo(crate::layout::Layout, crate::layout::Orientation),
-    SolveLayout(crate::layout::Layout, crate::layout::Orientation),
+
+    /// Two-level indirection for grid layouts with repeaters (see docs/development/layout-system.md).
+    GridRepeaterCacheAccess {
+        /// This property holds an array of entries
+        layout_cache_prop: NamedReference,
+        /// The index of the jump cell
+        index: usize,
+        /// The outer repeater index.
+        repeater_index: Box<Expression>,
+        /// Total cache entries per outer row (= step * entries_per_item).
+        /// A compile-time literal for static rows; a runtime cache read for rows
+        /// that contain inner repeaters (see lower_layout.rs for construction details).
+        stride: Box<Expression>,
+        /// Offset within a row's data block (e.g. k*2 for pos, k*2+1 for size).
+        child_offset: usize,
+        /// For nested repeaters: the inner repeater index.
+        inner_repeater_index: Option<Box<Expression>>,
+        /// For nested repeaters: stride per inner repeater iteration (2 for coordinate cache, 4 for organized data).
+        entries_per_item: usize,
+    },
+
+    /// Organize a grid layout, i.e. decide what goes where
+    OrganizeGridLayout(crate::layout::GridLayout),
+
+    /// Compute the LayoutInfo for the given box layout.
+    /// The orientation is the orientation of the cache, not the orientation of the layout.
+    ComputeBoxLayoutInfo {
+        layout: crate::layout::BoxLayout,
+        orientation: crate::layout::Orientation,
+        /// only set in `layoutinfo-v-with-constraint`
+        cross_axis_size: Option<Box<Expression>>,
+    },
+    ComputeGridLayoutInfo {
+        layout_organized_data_prop: NamedReference,
+        layout: crate::layout::GridLayout,
+        orientation: crate::layout::Orientation,
+        /// only set in `layoutinfo-v-with-constraint`
+        cross_axis_size: Option<Box<Expression>>,
+    },
+    /// Determine the coordinates of the items in the given orientation.
+    SolveBoxLayout(crate::layout::BoxLayout, crate::layout::Orientation),
+    SolveGridLayout {
+        layout_organized_data_prop: NamedReference,
+        layout: crate::layout::GridLayout,
+        orientation: crate::layout::Orientation,
+    },
+    /// Solve a FlexboxLayout - returns positions for all items (x, y, width, height per item)
+    SolveFlexboxLayout(crate::layout::FlexboxLayout),
+    /// Compute the LayoutInfo for the given FlexboxLayout.
+    ComputeFlexboxLayoutInfo {
+        layout: crate::layout::FlexboxLayout,
+        orientation: crate::layout::Orientation,
+        /// only set in `layoutinfo-v-with-constraint`
+        cross_axis_size: Option<Box<Expression>>,
+    },
 
     MinMax {
         ty: Type,
@@ -735,9 +1014,17 @@ pub enum Expression {
     DebugHook {
         expression: Box<Expression>,
         id: SmolStr,
+        /// True if this hook was materialized for a property that had no binding in the source.
+        /// Passes should treat a synthetic hook as "no binding" — the same as `Expression::Invalid`.
+        synthetic: bool,
     },
 
     EmptyComponentFactory,
+
+    Closure {
+        arg_name: SmolStr,
+        expression: Box<Expression>,
+    },
 }
 
 impl Expression {
@@ -776,7 +1063,7 @@ impl Expression {
             },
             Expression::SelfAssignment { .. } => Type::Void,
             Expression::ImageReference { .. } => Type::Image,
-            Expression::Condition { condition: _, true_expr, false_expr } => {
+            Expression::Condition { condition: _, true_expr, false_expr, .. } => {
                 let true_type = true_expr.ty();
                 let false_type = false_expr.ty();
                 if true_type == false_type {
@@ -789,16 +1076,12 @@ impl Expression {
                     Type::Void
                 }
             }
-            Expression::BinaryExpression { op, lhs, rhs } => {
+            Expression::BinaryExpression { op, lhs, rhs, .. } => {
                 if operator_class(*op) != OperatorClass::ArithmeticOp {
                     Type::Bool
                 } else if *op == '+' || *op == '-' {
                     let (rhs_ty, lhs_ty) = (rhs.ty(), lhs.ty());
-                    if rhs_ty == lhs_ty {
-                        rhs_ty
-                    } else {
-                        Type::Invalid
-                    }
+                    if rhs_ty == lhs_ty { rhs_ty } else { Type::Invalid }
                 } else {
                     debug_assert!(*op == '*' || *op == '/');
                     let unit_vec = |ty| {
@@ -807,7 +1090,7 @@ impl Expression {
                         } else if let Some(u) = ty.default_unit() {
                             vec![(u, 1)]
                         } else {
-                            vec![]
+                            Vec::new()
                         }
                     };
                     let mut l_units = unit_vec(lhs.ty());
@@ -842,28 +1125,43 @@ impl Expression {
                 }
             }
             Expression::UnaryOp { sub, .. } => sub.ty(),
-            Expression::Array { element_ty, .. } => Type::Array(Rc::new(element_ty.clone())),
+            Expression::Array { element_ty, .. } => Type::Array(Arc::new(element_ty.clone())),
             Expression::Struct { ty, .. } => ty.clone().into(),
             Expression::PathData { .. } => Type::PathData,
+            Expression::EmptyDataTransfer => Type::DataTransfer,
             Expression::StoreLocalVariable { .. } => Type::Void,
             Expression::ReadLocalVariable { ty, .. } => ty.clone(),
             Expression::EasingCurve(_) => Type::Easing,
+            Expression::MouseCursor(_) => Type::MouseCursor,
             Expression::LinearGradient { .. } => Type::Brush,
             Expression::RadialGradient { .. } => Type::Brush,
+            Expression::ConicGradient { .. } => Type::Brush,
             Expression::EnumerationValue(value) => Type::Enumeration(value.enumeration.clone()),
+            Expression::Keys(_) => Type::Keys,
             // invalid because the expression is unreachable
             Expression::ReturnStatement(_) => Type::Invalid,
             Expression::LayoutCacheAccess { .. } => Type::LogicalLength,
-            Expression::ComputeLayoutInfo(..) => typeregister::layout_info_type().into(),
-            Expression::SolveLayout(..) => Type::LayoutCache,
+            Expression::GridRepeaterCacheAccess { .. } => Type::LogicalLength,
+            Expression::OrganizeGridLayout(..) => Type::ArrayOfU16,
+            Expression::ComputeBoxLayoutInfo { .. } => typeregister::layout_info_type().into(),
+            Expression::ComputeGridLayoutInfo { .. } => typeregister::layout_info_type().into(),
+            Expression::SolveBoxLayout(..) => Type::LayoutCache,
+            Expression::SolveGridLayout { .. } => Type::LayoutCache,
+            Expression::SolveFlexboxLayout(..) => Type::LayoutCache,
+            Expression::ComputeFlexboxLayoutInfo { .. } => typeregister::layout_info_type().into(),
             Expression::MinMax { ty, .. } => ty.clone(),
             Expression::EmptyComponentFactory => Type::ComponentFactory,
             Expression::DebugHook { expression, .. } => expression.ty(),
+            Expression::Closure { .. } => Type::Closure,
         }
     }
 
     /// Call the visitor for each sub-expression.  (note: this function does not recurse)
     pub fn visit(&self, mut visitor: impl FnMut(&Self)) {
+        self.visit_dyn(&mut visitor)
+    }
+
+    fn visit_dyn(&self, visitor: &mut dyn FnMut(&Self)) {
         match self {
             Expression::Invalid => {}
             Expression::Uncompiled(_) => {}
@@ -892,7 +1190,7 @@ impl Expression {
                 visitor(rhs);
             }
             Expression::ImageReference { .. } => {}
-            Expression::Condition { condition, true_expr, false_expr } => {
+            Expression::Condition { condition, true_expr, false_expr, .. } => {
                 visitor(condition);
                 visitor(true_expr);
                 visitor(false_expr);
@@ -923,9 +1221,18 @@ impl Expression {
                 }
                 Path::Commands(commands) => visitor(commands),
             },
+            Expression::EmptyDataTransfer => {}
             Expression::StoreLocalVariable { value, .. } => visitor(value),
             Expression::ReadLocalVariable { .. } => {}
             Expression::EasingCurve(_) => {}
+            Expression::MouseCursor(cursor) => match cursor {
+                MouseCursorInner::CustomMouseCursor { image, hotspot_x, hotspot_y } => {
+                    visitor(image);
+                    visitor(hotspot_x);
+                    visitor(hotspot_y);
+                }
+                MouseCursorInner::BuiltIn(e) => visitor(e),
+            },
             Expression::LinearGradient { angle, stops } => {
                 visitor(angle);
                 for (c, s) in stops {
@@ -933,31 +1240,74 @@ impl Expression {
                     visitor(s);
                 }
             }
-            Expression::RadialGradient { stops } => {
+            Expression::RadialGradient { center, radius, stops } => {
+                if let Some((cx, cy)) = center {
+                    visitor(cx);
+                    visitor(cy);
+                }
+                if let Some(r) = radius {
+                    visitor(r);
+                }
+                for (c, s) in stops {
+                    visitor(c);
+                    visitor(s);
+                }
+            }
+            Expression::ConicGradient { from_angle, center, stops } => {
+                visitor(from_angle);
+                if let Some((cx, cy)) = center {
+                    visitor(cx);
+                    visitor(cy);
+                }
                 for (c, s) in stops {
                     visitor(c);
                     visitor(s);
                 }
             }
             Expression::EnumerationValue(_) => {}
+            Expression::Keys(_) => {}
             Expression::ReturnStatement(expr) => {
                 expr.as_deref().map(visitor);
             }
             Expression::LayoutCacheAccess { repeater_index, .. } => {
                 repeater_index.as_deref().map(visitor);
             }
-            Expression::ComputeLayoutInfo(..) => {}
-            Expression::SolveLayout(..) => {}
+            Expression::GridRepeaterCacheAccess {
+                repeater_index,
+                stride,
+                inner_repeater_index,
+                ..
+            } => {
+                visitor(repeater_index);
+                visitor(stride);
+                inner_repeater_index.as_deref().map(visitor);
+            }
+            Expression::OrganizeGridLayout(..) => {}
+            Expression::ComputeBoxLayoutInfo { cross_axis_size, .. }
+            | Expression::ComputeGridLayoutInfo { cross_axis_size, .. }
+            | Expression::ComputeFlexboxLayoutInfo { cross_axis_size, .. } => {
+                if let Some(cas) = cross_axis_size {
+                    visitor(cas);
+                }
+            }
+            Expression::SolveBoxLayout(..) => {}
+            Expression::SolveGridLayout { .. } => {}
+            Expression::SolveFlexboxLayout(..) => {}
             Expression::MinMax { lhs, rhs, .. } => {
                 visitor(lhs);
                 visitor(rhs);
             }
             Expression::EmptyComponentFactory => {}
             Expression::DebugHook { expression, .. } => visitor(expression),
+            Expression::Closure { expression, .. } => visitor(expression),
         }
     }
 
     pub fn visit_mut(&mut self, mut visitor: impl FnMut(&mut Self)) {
+        self.visit_mut_dyn(&mut visitor)
+    }
+
+    fn visit_mut_dyn(&mut self, visitor: &mut dyn FnMut(&mut Self)) {
         match self {
             Expression::Invalid => {}
             Expression::Uncompiled(_) => {}
@@ -986,7 +1336,7 @@ impl Expression {
                 visitor(rhs);
             }
             Expression::ImageReference { .. } => {}
-            Expression::Condition { condition, true_expr, false_expr } => {
+            Expression::Condition { condition, true_expr, false_expr, .. } => {
                 visitor(condition);
                 visitor(true_expr);
                 visitor(false_expr);
@@ -1020,9 +1370,18 @@ impl Expression {
                 }
                 Path::Commands(commands) => visitor(commands),
             },
+            Expression::EmptyDataTransfer => {}
             Expression::StoreLocalVariable { value, .. } => visitor(value),
             Expression::ReadLocalVariable { .. } => {}
             Expression::EasingCurve(_) => {}
+            Expression::MouseCursor(cursor) => match cursor {
+                MouseCursorInner::CustomMouseCursor { image, hotspot_x, hotspot_y } => {
+                    visitor(image);
+                    visitor(hotspot_x);
+                    visitor(hotspot_y);
+                }
+                MouseCursorInner::BuiltIn(e) => visitor(e),
+            },
             Expression::LinearGradient { angle, stops } => {
                 visitor(angle);
                 for (c, s) in stops {
@@ -1030,27 +1389,66 @@ impl Expression {
                     visitor(s);
                 }
             }
-            Expression::RadialGradient { stops } => {
+            Expression::RadialGradient { center, radius, stops } => {
+                if let Some((cx, cy)) = center {
+                    visitor(cx);
+                    visitor(cy);
+                }
+                if let Some(r) = radius {
+                    visitor(r);
+                }
+                for (c, s) in stops {
+                    visitor(c);
+                    visitor(s);
+                }
+            }
+            Expression::ConicGradient { from_angle, center, stops } => {
+                visitor(from_angle);
+                if let Some((cx, cy)) = center {
+                    visitor(cx);
+                    visitor(cy);
+                }
                 for (c, s) in stops {
                     visitor(c);
                     visitor(s);
                 }
             }
             Expression::EnumerationValue(_) => {}
+            Expression::Keys(_) => {}
             Expression::ReturnStatement(expr) => {
                 expr.as_deref_mut().map(visitor);
             }
             Expression::LayoutCacheAccess { repeater_index, .. } => {
                 repeater_index.as_deref_mut().map(visitor);
             }
-            Expression::ComputeLayoutInfo(..) => {}
-            Expression::SolveLayout(..) => {}
+            Expression::GridRepeaterCacheAccess {
+                repeater_index,
+                stride,
+                inner_repeater_index,
+                ..
+            } => {
+                visitor(repeater_index);
+                visitor(stride);
+                inner_repeater_index.as_deref_mut().map(visitor);
+            }
+            Expression::OrganizeGridLayout(..) => {}
+            Expression::ComputeBoxLayoutInfo { cross_axis_size, .. }
+            | Expression::ComputeGridLayoutInfo { cross_axis_size, .. }
+            | Expression::ComputeFlexboxLayoutInfo { cross_axis_size, .. } => {
+                if let Some(cas) = cross_axis_size {
+                    visitor(cas);
+                }
+            }
+            Expression::SolveBoxLayout(..) => {}
+            Expression::SolveGridLayout { .. } => {}
+            Expression::SolveFlexboxLayout(..) => {}
             Expression::MinMax { lhs, rhs, .. } => {
                 visitor(lhs);
                 visitor(rhs);
             }
             Expression::EmptyComponentFactory => {}
             Expression::DebugHook { expression, .. } => visitor(expression),
+            Expression::Closure { expression, .. } => visitor(expression),
         }
     }
 
@@ -1066,7 +1464,7 @@ impl Expression {
         self.visit_mut(|e| e.visit_recursive_mut(visitor));
     }
 
-    pub fn is_constant(&self) -> bool {
+    pub fn is_constant(&self, ga: Option<&crate::passes::GlobalAnalysis>) -> bool {
         match self {
             Expression::Invalid => true,
             Expression::Uncompiled(_) => false,
@@ -1079,60 +1477,102 @@ impl Expression {
             Expression::RepeaterModelReference { .. } => false,
             // Allow functions to be marked as const
             Expression::FunctionParameterReference { .. } => true,
-            Expression::StructFieldAccess { base, .. } => base.is_constant(),
-            Expression::ArrayIndex { array, index } => array.is_constant() && index.is_constant(),
-            Expression::Cast { from, .. } => from.is_constant(),
+            Expression::StructFieldAccess { base, .. } => base.is_constant(ga),
+            Expression::ArrayIndex { array, index } => {
+                array.is_constant(ga) && index.is_constant(ga)
+            }
+            Expression::Cast { from, to } => {
+                // Converting a float to string depends on the locale's decimal separator,
+                // unless the result contains none, like for integer literals.
+                // The constant propagation folds the remaining constant cases and
+                // promotes their binding back to constant.
+                if *to == Type::String
+                    && from.ty() == Type::Float32
+                    && !matches!(&**from, Expression::NumberLiteral(n, Unit::None)
+                        if locale_independent_number_to_string(*n).is_some())
+                {
+                    return false;
+                }
+                from.is_constant(ga)
+            }
             // This is conservative: the return value is the last expression in the block, but
             // we kind of mean "pure" here too, so ensure the whole body is OK.
-            Expression::CodeBlock(sub) => sub.iter().all(|s| s.is_constant()),
+            Expression::CodeBlock(sub) => sub.iter().all(|s| s.is_constant(ga)),
             Expression::FunctionCall { function, arguments, .. } => {
                 let is_const = match function {
-                    Callable::Builtin(b) => b.is_const(),
+                    Callable::Builtin(b) => b.is_const(ga),
                     Callable::Function(nr) => nr.is_constant(),
                     Callable::Callback(..) => false,
                 };
-                is_const && arguments.iter().all(|a| a.is_constant())
+                is_const && arguments.iter().all(|a| a.is_constant(ga))
             }
             Expression::SelfAssignment { .. } => false,
             Expression::ImageReference { .. } => true,
-            Expression::Condition { condition, false_expr, true_expr } => {
-                condition.is_constant() && false_expr.is_constant() && true_expr.is_constant()
+            Expression::Condition { condition, false_expr, true_expr, .. } => {
+                condition.is_constant(ga) && false_expr.is_constant(ga) && true_expr.is_constant(ga)
             }
-            Expression::BinaryExpression { lhs, rhs, .. } => lhs.is_constant() && rhs.is_constant(),
-            Expression::UnaryOp { sub, .. } => sub.is_constant(),
+            Expression::BinaryExpression { lhs, rhs, .. } => {
+                lhs.is_constant(ga) && rhs.is_constant(ga)
+            }
+            Expression::UnaryOp { sub, .. } => sub.is_constant(ga),
             // Array will turn into model, and they can't be considered as constant if the model
             // is used and the model is changed. CF issue #5249
             //Expression::Array { values, .. } => values.iter().all(Expression::is_constant),
             Expression::Array { .. } => false,
-            Expression::Struct { values, .. } => values.iter().all(|(_, v)| v.is_constant()),
+            Expression::Struct { values, .. } => values.iter().all(|(_, v)| v.is_constant(ga)),
             Expression::PathData(data) => match data {
                 Path::Elements(elements) => elements
                     .iter()
-                    .all(|element| element.bindings.values().all(|v| v.borrow().is_constant())),
+                    .all(|element| element.bindings.values().all(|v| v.borrow().is_constant(ga))),
                 Path::Events(_, _) => true,
                 Path::Commands(_) => false,
             },
-            Expression::StoreLocalVariable { value, .. } => value.is_constant(),
-            // We only load what we store, and stores are alredy checked
+            Expression::EmptyDataTransfer => true,
+            Expression::StoreLocalVariable { value, .. } => value.is_constant(ga),
+            // We only load what we store, and stores are already checked
             Expression::ReadLocalVariable { .. } => true,
             Expression::EasingCurve(_) => true,
+            Expression::MouseCursor(cursor) => match cursor {
+                MouseCursorInner::BuiltIn(cursor) => cursor.is_constant(ga),
+                MouseCursorInner::CustomMouseCursor { image, hotspot_x, hotspot_y } => {
+                    image.is_constant(ga) && hotspot_x.is_constant(ga) && hotspot_y.is_constant(ga)
+                }
+            },
             Expression::LinearGradient { angle, stops } => {
-                angle.is_constant() && stops.iter().all(|(c, s)| c.is_constant() && s.is_constant())
+                angle.is_constant(ga)
+                    && stops.iter().all(|(c, s)| c.is_constant(ga) && s.is_constant(ga))
             }
-            Expression::RadialGradient { stops } => {
-                stops.iter().all(|(c, s)| c.is_constant() && s.is_constant())
+            Expression::RadialGradient { center, radius, stops } => {
+                center.as_ref().is_none_or(|(cx, cy)| cx.is_constant(ga) && cy.is_constant(ga))
+                    && radius.as_ref().is_none_or(|r| r.is_constant(ga))
+                    && stops.iter().all(|(c, s)| c.is_constant(ga) && s.is_constant(ga))
+            }
+            Expression::ConicGradient { from_angle, center, stops } => {
+                from_angle.is_constant(ga)
+                    && center
+                        .as_ref()
+                        .is_none_or(|(cx, cy)| cx.is_constant(ga) && cy.is_constant(ga))
+                    && stops.iter().all(|(c, s)| c.is_constant(ga) && s.is_constant(ga))
             }
             Expression::EnumerationValue(_) => true,
+            Expression::Keys(_) => true,
             Expression::ReturnStatement(expr) => {
-                expr.as_ref().map_or(true, |expr| expr.is_constant())
+                expr.as_ref().is_none_or(|expr| expr.is_constant(ga))
             }
             // TODO:  detect constant property within layouts
             Expression::LayoutCacheAccess { .. } => false,
-            Expression::ComputeLayoutInfo(..) => false,
-            Expression::SolveLayout(..) => false,
-            Expression::MinMax { lhs, rhs, .. } => lhs.is_constant() && rhs.is_constant(),
+            Expression::GridRepeaterCacheAccess { .. } => false,
+            Expression::OrganizeGridLayout { .. } => false,
+            Expression::ComputeBoxLayoutInfo { .. } => false,
+            Expression::ComputeGridLayoutInfo { .. } => false,
+            Expression::SolveBoxLayout(..) => false,
+            Expression::SolveGridLayout { .. } => false,
+            Expression::SolveFlexboxLayout(..) => false,
+            Expression::ComputeFlexboxLayoutInfo { .. } => false,
+            Expression::MinMax { lhs, rhs, .. } => lhs.is_constant(ga) && rhs.is_constant(ga),
             Expression::EmptyComponentFactory => true,
             Expression::DebugHook { .. } => false,
+            Expression::Closure { expression, .. } => expression.is_constant(ga),
         }
     }
 
@@ -1143,9 +1583,17 @@ impl Expression {
         target_type: Type,
         node: &dyn Spanned,
         diag: &mut BuildDiagnostics,
+        symbol_counters: &SymbolCounters,
     ) -> Expression {
         let ty = self.ty();
-        if ty == target_type
+
+        if let Expression::Condition { .. } = self
+            && ty == Type::Void
+        {
+            // The true and false expressions do not return the same type. So at least one does not match
+            // with expected and an error was already added so we don't have to add an additional error here
+            self
+        } else if ty == target_type
             || target_type == Type::Void
             || target_type == Type::Invalid
             || ty == Type::Invalid
@@ -1154,8 +1602,14 @@ impl Expression {
         } else if ty.can_convert(&target_type) {
             let from = match (ty, &target_type) {
                 (Type::Brush, Type::Color) => match self {
-                    Expression::LinearGradient { .. } | Expression::RadialGradient { .. } => {
-                        let message = format!("Narrowing conversion from {0} to {1}. This can lead to unexpected behavior because the {0} is a gradient", Type::Brush, Type::Color);
+                    Expression::LinearGradient { .. }
+                    | Expression::RadialGradient { .. }
+                    | Expression::ConicGradient { .. } => {
+                        let message = format!(
+                            "Narrowing conversion from {0} to {1}. This can lead to unexpected behavior because the {0} is a gradient",
+                            Type::Brush,
+                            Type::Color
+                        );
                         diag.push_warning(message, node);
                         self
                     }
@@ -1165,28 +1619,68 @@ impl Expression {
                     lhs: Box::new(self),
                     rhs: Box::new(Expression::NumberLiteral(0.01, Unit::None)),
                     op: '*',
+                    source_location: None,
                 },
                 (ref from_ty @ Type::Struct(ref left), Type::Struct(right))
                     if left.fields != right.fields =>
                 {
+                    // Slint SC converts a struct only when the source names
+                    // exactly the target's fields: no defaulting of an omitted
+                    // field and no dropping of an extra member.
+                    #[cfg(feature = "slint-sc")]
+                    if diag.slint_sc {
+                        for f in left.fields.keys() {
+                            if !right.fields.contains_key(f) {
+                                diag.slint_sc_error(
+                                    &format!("Providing the extra struct member '{f}' is"),
+                                    node,
+                                );
+                            }
+                        }
+                        for f in right.fields.keys() {
+                            if !left.fields.contains_key(f) {
+                                diag.slint_sc_error(
+                                    &format!("Omitting the struct field '{f}' is"),
+                                    node,
+                                );
+                            }
+                        }
+                    }
+                    if !diag.is_slint_sc() {
+                        let extra = left
+                            .fields
+                            .keys()
+                            .filter(|f| !right.fields.contains_key(*f))
+                            .map(|f| format!("'{f}'"))
+                            .collect::<Vec<_>>();
+                        if let Some((last, rest)) = extra.split_last() {
+                            let (noun, list) = match rest {
+                                [] => ("field", last.clone()),
+                                _ => ("fields", format!("{} and {last}", rest.join(", "))),
+                            };
+                            diag.push_warning(
+                                format!(
+                                    "Conversion to {target_type} ignores the extra {noun} {list}"
+                                ),
+                                node,
+                            );
+                        }
+                    }
                     if let Expression::Struct { mut values, .. } = self {
-                        let mut new_values = HashMap::new();
+                        let mut new_values = BTreeMap::new();
                         for (key, ty) in &right.fields {
                             let (key, expression) = values.remove_entry(key).map_or_else(
-                                || (key.clone(), Expression::default_value_for_type(ty)),
-                                |(k, e)| (k, e.maybe_convert_to(ty.clone(), node, diag)),
+                                || (key.clone(), right.default_value_for_field(key)),
+                                |(k, e)| {
+                                    (k, e.maybe_convert_to(ty.clone(), node, diag, symbol_counters))
+                                },
                             );
                             new_values.insert(key, expression);
                         }
                         return Expression::Struct { values: new_values, ty: right.clone() };
                     }
-                    static COUNT: std::sync::atomic::AtomicUsize =
-                        std::sync::atomic::AtomicUsize::new(0);
-                    let var_name = format_smolstr!(
-                        "tmpobj_conv_{}",
-                        COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    );
-                    let mut new_values = HashMap::new();
+                    let var_name = symbol_counters.generate_name("tmpobj_conv_");
+                    let mut new_values = BTreeMap::new();
                     for (key, ty) in &right.fields {
                         let expression = if left.fields.contains_key(key) {
                             Expression::StructFieldAccess {
@@ -1196,9 +1690,14 @@ impl Expression {
                                 }),
                                 name: key.clone(),
                             }
-                            .maybe_convert_to(ty.clone(), node, diag)
+                            .maybe_convert_to(
+                                ty.clone(),
+                                node,
+                                diag,
+                                symbol_counters,
+                            )
                         } else {
-                            Expression::default_value_for_type(ty)
+                            right.default_value_for_field(key)
                         };
                         new_values.insert(key.clone(), expression);
                     }
@@ -1217,10 +1716,11 @@ impl Expression {
                                     let op = if power < 0 { '*' } else { '/' };
                                     for _ in 0..power.abs() {
                                         result = Expression::BinaryExpression {
+                                            source_location: None,
                                             lhs: Box::new(result),
                                             rhs: Box::new(Expression::FunctionCall {
                                                 function: Callable::Builtin(builtin_fn.clone()),
-                                                arguments: vec![],
+                                                arguments: Vec::new(),
                                                 source_location: Some(node.to_source_location()),
                                             }),
                                             op,
@@ -1264,31 +1764,81 @@ impl Expression {
                 (Expression::Array { values, .. }, Type::Array(target_type)) => Expression::Array {
                     values: values
                         .into_iter()
-                        .map(|e| e.maybe_convert_to((*target_type).clone(), node, diag))
+                        .map(|e| {
+                            e.maybe_convert_to((*target_type).clone(), node, diag, symbol_counters)
+                        })
                         .take_while(|e| !matches!(e, Expression::Invalid))
                         .collect(),
                     element_ty: (*target_type).clone(),
                 },
                 _ => unreachable!(),
             }
-        } else if let (Type::Struct(struct_type), Expression::Struct { values, .. }) =
+        } else if let (Type::Struct(target_struct_type), Expression::Struct { values, .. }) =
             (&target_type, &self)
         {
             // Also special case struct literal in case they contain array literal
-            let mut fields = struct_type.fields.clone();
-            let mut new_values = HashMap::new();
+            let mut target_fields = target_struct_type.fields.clone();
+            let mut new_values = BTreeMap::new();
             for (f, v) in values {
-                if let Some(t) = fields.remove(f) {
-                    new_values.insert(f.clone(), v.clone().maybe_convert_to(t, node, diag));
+                if let Some(t) = target_fields.remove(f) {
+                    new_values.insert(
+                        f.clone(),
+                        v.clone().maybe_convert_to(t, node, diag, symbol_counters),
+                    );
                 } else {
-                    diag.push_error(format!("Cannot convert {ty} to {target_type}"), node);
+                    let available_fields_message = if target_struct_type.name.slint_name().is_some()
+                    {
+                        let available_fields = target_struct_type
+                            .fields
+                            .keys()
+                            .map(SmolStr::as_str)
+                            .collect::<Vec<_>>()
+                            .join("', '");
+                        format!(". Available fields: '{available_fields}'")
+                    } else {
+                        String::new()
+                    };
+                    diag.push_error(
+                        format!("Cannot convert {ty} to {target_type}: Field '{f}' not found{available_fields_message}"),
+                        node,
+                    );
                     return self;
                 }
             }
-            for (f, t) in fields {
-                new_values.insert(f, Expression::default_value_for_type(&t));
+            for f in target_fields.into_keys() {
+                let default_value = target_struct_type.default_value_for_field(&f);
+                new_values.insert(f, default_value);
             }
-            Expression::Struct { ty: struct_type.clone(), values: new_values }
+            Expression::Struct { ty: target_struct_type.clone(), values: new_values }
+        } else if let Expression::Condition { condition, true_expr, false_expr, source_location } =
+            self
+        {
+            // Recursive try to convert the conditional expressions to the target_type
+            // true_expr and false_expr are equal this is handled with the condition at the beginning
+            // of this function so if one fails to convert, we should not try to convert the false case
+            // as well
+            let true_expr_converted = true_expr.clone().maybe_convert_to(
+                target_type.clone(),
+                node,
+                diag,
+                symbol_counters,
+            );
+            if true_expr_converted.ty() != target_type.clone() {
+                // Failed to convert so we don't have to try to convert the false expr as well
+                Expression::Condition { condition, true_expr, false_expr, source_location }
+            } else {
+                Expression::Condition {
+                    condition,
+                    source_location,
+                    true_expr: Box::new(true_expr_converted),
+                    false_expr: Box::new(false_expr.maybe_convert_to(
+                        target_type,
+                        node,
+                        diag,
+                        symbol_counters,
+                    )),
+                }
+            }
         } else {
             let mut message = format!("Cannot convert {ty} to {target_type}");
             // Explicit error message for unit conversion
@@ -1297,18 +1847,22 @@ impl Expression {
                     message =
                         format!("{message}. Divide by 1{from_unit} to convert to a plain number");
                 }
-            } else if let Some(to_unit) = target_type.default_unit() {
-                if matches!(ty, Type::Int32 | Type::Float32) {
-                    if let Expression::NumberLiteral(value, Unit::None) = self {
-                        if value == 0. {
-                            // Allow conversion from literal 0 to any unit
-                            return Expression::NumberLiteral(0., to_unit);
-                        }
-                    }
-                    message = format!(
-                        "{message}. Use an unit, or multiply by 1{to_unit} to convert explicitly"
-                    );
+            } else if matches!(target_type, Type::StyledText) && ty.can_convert(&Type::String) {
+                message = format!(
+                    "{message}. Wrap the expression in `@markdown(\"\\{{...}}\")` to convert it explicitly"
+                );
+            } else if let Some(to_unit) = target_type.default_unit()
+                && matches!(ty, Type::Int32 | Type::Float32)
+            {
+                if let Expression::NumberLiteral(value, Unit::None) = self
+                    && value == 0.
+                {
+                    // Allow conversion from literal 0 to any unit
+                    return Expression::NumberLiteral(0., to_unit);
                 }
+                message = format!(
+                    "{message}. Use an unit, or multiply by 1{to_unit} to convert explicitly"
+                );
             }
             diag.push_error(message, node);
             self
@@ -1324,8 +1878,10 @@ impl Expression {
             | Type::InferredProperty
             | Type::InferredCallback
             | Type::ElementReference
-            | Type::LayoutCache => Expression::Invalid,
-            Type::Void => Expression::CodeBlock(vec![]),
+            | Type::LayoutCache
+            | Type::ArrayOfU16 => Expression::Invalid,
+            Type::Void => Expression::CodeBlock(Vec::new()),
+            Type::DataTransfer => Expression::EmptyDataTransfer,
             Type::Float32 => Expression::NumberLiteral(0., Unit::None),
             Type::String => Expression::StringLiteral(SmolStr::default()),
             Type::Int32 | Type::Color | Type::UnitProduct(_) => Expression::Cast {
@@ -1345,19 +1901,25 @@ impl Expression {
             },
             Type::Bool => Expression::BoolLiteral(false),
             Type::Model => Expression::Invalid,
-            Type::PathData => Expression::PathData(Path::Elements(vec![])),
+            Type::PathData => Expression::PathData(Path::Elements(Vec::new())),
             Type::Array(element_ty) => {
-                Expression::Array { element_ty: (**element_ty).clone(), values: vec![] }
+                Expression::Array { element_ty: (**element_ty).clone(), values: Vec::new() }
             }
             Type::Struct(s) => Expression::Struct {
                 ty: s.clone(),
                 values: s
                     .fields
-                    .iter()
-                    .map(|(k, v)| (k.clone(), Expression::default_value_for_type(v)))
+                    .keys()
+                    .map(|k| (k.clone(), s.default_value_for_field(k)))
                     .collect(),
             },
             Type::Easing => Expression::EasingCurve(EasingCurve::default()),
+            Type::MouseCursor => {
+                let e = crate::typeregister::BUILTIN.enums.BuiltInMouseCursor.clone();
+                Expression::MouseCursor(MouseCursorInner::BuiltIn(Box::new(
+                    Expression::EnumerationValue(e.default_value()),
+                )))
+            }
             Type::Brush => Expression::Cast {
                 from: Box::new(Expression::default_value_for_type(&Type::Color)),
                 to: Type::Brush,
@@ -1365,7 +1927,14 @@ impl Expression {
             Type::Enumeration(enumeration) => {
                 Expression::EnumerationValue(enumeration.clone().default_value())
             }
+            Type::Keys => Expression::Keys(Keys::default()),
             Type::ComponentFactory => Expression::EmptyComponentFactory,
+            Type::StyledText => Expression::FunctionCall {
+                function: Callable::Builtin(BuiltinFunction::StringToStyledText),
+                arguments: vec![Self::default_value_for_type(&Type::String)],
+                source_location: None,
+            },
+            Type::Closure => Expression::Invalid,
         }
     }
 
@@ -1381,7 +1950,10 @@ impl Expression {
         match self {
             Expression::PropertyReference(nr) => {
                 nr.mark_as_set();
-                let mut lookup = nr.element().borrow().lookup_property(nr.name());
+                let mut lookup = nr
+                    .element()
+                    .borrow()
+                    .lookup_property(nr.name(), PropertyLookupMode::InternalName);
                 lookup.is_local_to_component &= ctx.is_local_element(&nr.element());
                 if lookup.property_visibility == PropertyVisibility::Constexpr {
                     ctx.diag.push_error(
@@ -1414,12 +1986,17 @@ impl Expression {
                 } else if ctx.is_legacy_component()
                     && lookup.property_visibility == PropertyVisibility::Output
                 {
-                    ctx.diag
-                        .push_warning(format!("{what} on an output property is deprecated"), node);
+                    ctx.diag.push_warning(
+                        format!(
+                            "{what} on an '{}' property is deprecated",
+                            PropertyVisibility::Output
+                        ),
+                        node,
+                    );
                     true
                 } else {
                     ctx.diag.push_error(
-                        format!("{what} on a {} property", lookup.property_visibility),
+                        format!("{what} on an '{}' property", lookup.property_visibility),
                         node,
                     );
                     false
@@ -1442,6 +2019,19 @@ impl Expression {
             _ => self,
         }
     }
+
+    pub fn ignore_debug_hooks_mut(&mut self) -> &mut Expression {
+        match self {
+            Expression::DebugHook { expression, .. } => expression.as_mut(),
+            _ => self,
+        }
+    }
+
+    /// Returns true if this is a synthetic debug hook — i.e. a hook materialized for a property
+    /// that had no binding in the source. Passes should treat this like `Expression::Invalid`.
+    pub fn is_synthetic_debug_hook(&self) -> bool {
+        matches!(self, Expression::DebugHook { synthetic: true, .. })
+    }
 }
 
 fn model_inner_type(model: &Expression) -> Type {
@@ -1456,6 +2046,71 @@ fn model_inner_type(model: &Expression) -> Type {
     }
 }
 
+/// Converts a float to a string when the result contains no decimal separator,
+/// and is therefore the same in every locale.
+pub fn locale_independent_number_to_string(n: f64) -> Option<SmolStr> {
+    let string = format_smolstr!("{}", i_slint_common::FormattedNumber(n));
+    (!string.contains('.')).then_some(string)
+}
+
+/// The right hand side of a two way binding
+#[derive(Clone, Debug)]
+pub enum TwoWayBinding {
+    Property {
+        /// The property being linked
+        property: NamedReference,
+        /// If property is a struct, this is the fields.
+        /// So if you have `foo <=> element.property.baz.xyz`, then `field_access` is `vec!["baz", "xyz"]`
+        field_access: Vec<SmolStr>,
+    },
+    ModelData {
+        /// The model being linked
+        repeated_element: ElementWeak,
+        /// same as `Self::Property::field_access`
+        field_access: Vec<SmolStr>,
+    },
+}
+impl TwoWayBinding {
+    pub fn ty(&self) -> Type {
+        let (mut ty, field_access) = match self {
+            Self::Property { property, field_access } => (property.ty(), field_access),
+            Self::ModelData { repeated_element, field_access } => {
+                let ty =
+                    Expression::RepeaterModelReference { element: repeated_element.clone() }.ty();
+                (ty, field_access)
+            }
+        };
+        for x in field_access {
+            ty = match ty {
+                Type::InferredProperty | Type::InferredCallback => return ty,
+                Type::Struct(s) => s.fields.get(x).cloned().unwrap_or_default(),
+                _ => return Type::Invalid,
+            };
+        }
+        ty
+    }
+
+    pub fn is_constant(&self) -> bool {
+        match self {
+            Self::Property { property, .. } => property.is_constant(),
+            Self::ModelData { .. } => false,
+        }
+    }
+
+    pub fn property(&self) -> Option<&NamedReference> {
+        match self {
+            Self::Property { property, .. } => Some(property),
+            Self::ModelData { .. } => None,
+        }
+    }
+}
+
+impl From<NamedReference> for TwoWayBinding {
+    fn from(nr: NamedReference) -> Self {
+        Self::Property { property: nr, field_access: Vec::new() }
+    }
+}
+
 /// The expression in the Element::binding hash table
 #[derive(Debug, Clone, derive_more::Deref, derive_more::DerefMut)]
 pub struct BindingExpression {
@@ -1464,8 +2119,8 @@ pub struct BindingExpression {
     pub expression: Expression,
     /// The location of this expression in the source code
     pub span: Option<SourceLocation>,
-    /// How deep is this binding declared in the hierarchy. When two binding are conflicting
-    /// for the same priority (because of two way binding), the lower priority wins.
+    /// How deep is this binding declared in the hierarchy. When two bindings are conflicting
+    /// for the same priority (because of a two way binding), the lower priority wins.
     /// The priority starts at 1, and each level of inlining adds one to the priority.
     /// 0 means the expression was added by some passes and it is not explicit in the source code
     pub priority: i32,
@@ -1476,7 +2131,7 @@ pub struct BindingExpression {
     pub analysis: Option<BindingAnalysis>,
 
     /// The properties this expression is aliased with using two way bindings
-    pub two_way_bindings: Vec<NamedReference>,
+    pub two_way_bindings: Vec<TwoWayBinding>,
 }
 
 impl std::convert::From<Expression> for BindingExpression {
@@ -1515,7 +2170,7 @@ impl BindingExpression {
     }
 
     /// Create an expression binding that simply is a two way binding to the other
-    pub fn new_two_way(other: NamedReference) -> Self {
+    pub fn new_two_way(other: TwoWayBinding) -> Self {
         Self {
             expression: Expression::Invalid,
             span: None,
@@ -1527,7 +2182,8 @@ impl BindingExpression {
     }
 
     /// Merge the other into this one. Normally, &self is kept intact (has priority)
-    /// unless the expression is invalid, in which case the other one is taken.
+    /// unless the expression is invalid or a synthetic debug hook, in which case the
+    /// other one is taken.
     ///
     /// Also the animation is taken if the other don't have one, and the two ways binding
     /// are taken into account.
@@ -1539,18 +2195,67 @@ impl BindingExpression {
         }
         let has_binding = self.has_binding();
         self.two_way_bindings.extend_from_slice(&other.two_way_bindings);
-        if !has_binding {
-            self.priority = other.priority;
-            self.expression = other.expression.clone();
-            true
-        } else {
-            false
+        if has_binding {
+            return false;
         }
+        // A synthetic debug hook is equivalent to "no binding", but the hook wrapper (and
+        // its id) must survive the merge so the property stays live-editable on this
+        // element: upgrade the hook in place with the other side's real expression.
+        if let Expression::DebugHook { expression, synthetic, .. } = &mut self.expression {
+            debug_assert!(*synthetic, "has_binding() returned false for a non-synthetic hook");
+            if !matches!(other.expression, Expression::Invalid)
+                && !other.expression.is_synthetic_debug_hook()
+            {
+                **expression = other.expression.clone();
+                *synthetic = false;
+                self.priority = other.priority;
+                return true;
+            }
+            if self.two_way_bindings.is_empty() {
+                // Nothing real to adopt from the other side: keep the synthetic placeholder.
+                return false;
+            }
+            // Two-way bindings now drive this property. The synthetic default must not
+            // become the two-way's initial value, so the hook is dropped (the property is
+            // then edited through the two-way target instead).
+            self.expression = Expression::Invalid;
+            self.priority = other.priority;
+            return true;
+        }
+        self.priority = other.priority;
+        self.expression = other.expression.clone();
+        true
     }
 
     /// returns false if there is no expression or two way binding
+    ///
+    /// A synthetic debug hook (a materialized placeholder for an unbound property) counts
+    /// as "no expression".
     pub fn has_binding(&self) -> bool {
-        !matches!(self.expression, Expression::Invalid) || !self.two_way_bindings.is_empty()
+        (!matches!(self.expression, Expression::Invalid)
+            && !self.expression.is_synthetic_debug_hook())
+            || !self.two_way_bindings.is_empty()
+    }
+
+    /// The bound expression with any debug-hook wrapper removed.
+    /// Use before matching on the expression variant.
+    pub fn value_expression(&self) -> &Expression {
+        self.expression.ignore_debug_hooks()
+    }
+
+    /// Replace the bound value, leaving priority, animation and two-way bindings untouched.
+    ///
+    /// A synthetic debug hook is upgraded in place — its wrapper and id are kept and it becomes
+    /// real — so the property stays live-editable. Any other expression (including a real,
+    /// non-synthetic hook) is replaced wholesale.
+    pub fn set_value_expression(&mut self, expr: Expression) {
+        match &mut self.expression {
+            Expression::DebugHook { expression, synthetic, .. } if *synthetic => {
+                **expression = expr;
+                *synthetic = false;
+            }
+            expression => *expression = expr,
+        }
     }
 }
 
@@ -1600,18 +2305,78 @@ pub enum EasingCurve {
     EaseInBounce,
     EaseOutBounce,
     EaseInOutBounce,
+    Spring(f32),
     // CubicBezierNonConst([Box<Expression>; 4]),
     // Custom(Box<dyn Fn(f32)->f32>),
 }
 
-// The compiler generates ResourceReference::AbsolutePath for all references like @image-url("foo.png")
-// and the resource lowering path may change this to EmbeddedData if configured.
+/// The compiled `mouse-cursor` value: either a built-in cursor or a custom one built from an
+/// image. Generic over the expression type so both the tree and the LLR reuse the same shape.
+#[derive(Clone, Debug)]
+pub enum MouseCursorInner<E = Expression> {
+    BuiltIn(Box<E>),
+    CustomMouseCursor { image: Box<E>, hotspot_x: Box<E>, hotspot_y: Box<E> },
+}
+
+impl<E: Default> Default for MouseCursorInner<E> {
+    fn default() -> Self {
+        Self::BuiltIn(Box::default())
+    }
+}
+
+// The compiler resolves every `@image-url("foo.png")` into a `Path`, `Url`, or
+// `DataUri` reference; the resource lowering pass may then replace it with
+// `EmbeddedData`/`EmbeddedTexture` if configured.
 #[derive(Clone, Debug)]
 pub enum ImageReference {
     None,
-    AbsolutePath(SmolStr),
-    EmbeddedData { resource_id: usize, extension: String },
-    EmbeddedTexture { resource_id: usize },
+    /// An absolute path to a local image file on disk.
+    Path(SmolStr),
+    /// A non-`data:` URL, e.g. `builtin:/`, `http(s):`, or `user://`.
+    Url(url::Url),
+    /// An inline `data:` URI carrying the image content.
+    DataUri(SmolStr),
+    EmbeddedData {
+        resource_id: crate::embedded_resources::EmbeddedResourcesIdx,
+        extension: String,
+    },
+    EmbeddedTexture {
+        resource_id: crate::embedded_resources::EmbeddedResourcesIdx,
+    },
+}
+
+impl ImageReference {
+    /// Classify a resolved `@image-url` string (an absolute path, a URL, or a
+    /// `data:` URI) into the matching reference kind.
+    pub fn from_resolved(reference: SmolStr) -> Self {
+        if reference.starts_with("data:") {
+            return Self::DataUri(reference);
+        }
+        // A single-character scheme is a Windows drive letter (`c:\...`), i.e. a
+        // path rather than a URL.
+        match url::Url::parse(&reference) {
+            Ok(url) if url.scheme().len() > 1 => Self::Url(url),
+            _ => Self::Path(reference),
+        }
+    }
+
+    /// Classify a URL returned by the resource mapper. It is already a URL, so
+    /// the only distinction is a `data:` URI (kept as a string, see
+    /// [`Self::DataUri`]) from any other URL.
+    pub fn from_mapped_url(url: url::Url) -> Self {
+        if url.scheme() == "data" { Self::DataUri(url.as_str().into()) } else { Self::Url(url) }
+    }
+
+    /// The image source loaded at run-time for a non-embedded reference: the
+    /// path, the URL, or the `data:` URI, as the string handed to
+    /// `Image::load_from_path`. `None` for embedded references.
+    pub fn source(&self) -> Option<&str> {
+        match self {
+            Self::Path(source) | Self::DataUri(source) => Some(source),
+            Self::Url(url) => Some(url.as_str()),
+            Self::None | Self::EmbeddedData { .. } | Self::EmbeddedTexture { .. } => None,
+        }
+    }
 }
 
 /// Print the expression as a .slint code (not necessarily valid .slint)
@@ -1677,7 +2442,7 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             write!(f, " {}= ", if *op == '=' { ' ' } else { *op })?;
             pretty_print(f, rhs)
         }
-        Expression::BinaryExpression { lhs, rhs, op } => {
+        Expression::BinaryExpression { lhs, rhs, op, .. } => {
             write!(f, "(")?;
             pretty_print(f, lhs)?;
             match *op {
@@ -1692,7 +2457,7 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             pretty_print(f, sub)
         }
         Expression::ImageReference { resource_ref, .. } => write!(f, "{resource_ref:?}"),
-        Expression::Condition { condition, true_expr, false_expr } => {
+        Expression::Condition { condition, true_expr, false_expr, .. } => {
             write!(f, "if (")?;
             pretty_print(f, condition)?;
             write!(f, ") {{ ")?;
@@ -1719,7 +2484,9 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             write!(f, " }}")
         }
         Expression::PathData(data) => write!(f, "{data:?}"),
+        Expression::EmptyDataTransfer => write!(f, "{{ }}"),
         Expression::EasingCurve(e) => write!(f, "{e:?}"),
+        Expression::MouseCursor(m) => write!(f, "{m:?}"),
         Expression::LinearGradient { angle, stops } => {
             write!(f, "@linear-gradient(")?;
             pretty_print(f, angle)?;
@@ -1731,8 +2498,18 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             }
             write!(f, ")")
         }
-        Expression::RadialGradient { stops } => {
+        Expression::RadialGradient { center, radius, stops } => {
             write!(f, "@radial-gradient(circle")?;
+            if let Some(r) = radius {
+                write!(f, " ")?;
+                pretty_print(f, r)?;
+            }
+            if let Some((cx, cy)) = center {
+                write!(f, " at ")?;
+                pretty_print(f, cx)?;
+                write!(f, " ")?;
+                pretty_print(f, cy)?;
+            }
             for (c, s) in stops {
                 write!(f, ", ")?;
                 pretty_print(f, c)?;
@@ -1741,25 +2518,80 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             }
             write!(f, ")")
         }
+        Expression::ConicGradient { from_angle, center, stops } => {
+            write!(f, "@conic-gradient(from ")?;
+            pretty_print(f, from_angle)?;
+            if let Some((cx, cy)) = center {
+                write!(f, " at ")?;
+                pretty_print(f, cx)?;
+                write!(f, " ")?;
+                pretty_print(f, cy)?;
+            }
+            for (c, s) in stops {
+                write!(f, ", ")?;
+                pretty_print(f, c)?;
+                write!(f, " ")?;
+                pretty_print(f, s)?;
+            }
+            write!(f, ")")
+        }
         Expression::EnumerationValue(e) => match e.enumeration.values.get(e.value) {
             Some(val) => write!(f, "{}.{}", e.enumeration.name, val),
             None => write!(f, "{}.{}", e.enumeration.name, e.value),
         },
+        Expression::Keys(keys) => {
+            write!(f, "@keys({keys})")
+        }
         Expression::ReturnStatement(e) => {
             write!(f, "return ")?;
             e.as_ref().map(|e| pretty_print(f, e)).unwrap_or(Ok(()))
         }
-        Expression::LayoutCacheAccess { layout_cache_prop, index, repeater_index } => {
-            write!(
-                f,
-                "{:?}[{}{}]",
-                layout_cache_prop,
-                index,
-                if repeater_index.is_some() { " + $index" } else { "" }
-            )
+        Expression::LayoutCacheAccess {
+            layout_cache_prop,
+            index,
+            repeater_index,
+            entries_per_item,
+        } => {
+            if repeater_index.is_some() {
+                write!(
+                    f,
+                    "{:?}[{:?}[{}] + $repeater_index * {}]",
+                    layout_cache_prop, layout_cache_prop, index, entries_per_item
+                )
+            } else {
+                write!(f, "{:?}[{}]", layout_cache_prop, index)
+            }
         }
-        Expression::ComputeLayoutInfo(..) => write!(f, "layout_info(..)"),
-        Expression::SolveLayout(..) => write!(f, "solve_layout(..)"),
+        Expression::GridRepeaterCacheAccess {
+            layout_cache_prop,
+            index,
+            repeater_index: _,
+            stride: _,
+            child_offset,
+            inner_repeater_index,
+            entries_per_item,
+        } => {
+            if inner_repeater_index.is_some() {
+                write!(
+                    f,
+                    "{0:?}[{0:?}[{1}] + $repeater_index * $stride + {2} + $inner_repeater_index * {3}]",
+                    layout_cache_prop, index, child_offset, entries_per_item
+                )
+            } else {
+                write!(
+                    f,
+                    "{0:?}[{0:?}[{1}] + $repeater_index * $stride + {2}]",
+                    layout_cache_prop, index, child_offset
+                )
+            }
+        }
+        Expression::OrganizeGridLayout(..) => write!(f, "organize_grid_layout(..)"),
+        Expression::ComputeBoxLayoutInfo { .. } => write!(f, "layout_info(..)"),
+        Expression::ComputeGridLayoutInfo { .. } => write!(f, "grid_layout_info(..)"),
+        Expression::SolveBoxLayout(..) => write!(f, "solve_box_layout(..)"),
+        Expression::SolveGridLayout { .. } => write!(f, "solve_grid_layout(..)"),
+        Expression::SolveFlexboxLayout(..) => write!(f, "solve_flexbox_layout(..)"),
+        Expression::ComputeFlexboxLayoutInfo { .. } => write!(f, "flexbox_layout_info(..)"),
         Expression::MinMax { ty: _, op, lhs, rhs } => {
             match op {
                 MinMaxOp::Min => write!(f, "min(")?,
@@ -1771,10 +2603,18 @@ pub fn pretty_print(f: &mut dyn std::fmt::Write, expression: &Expression) -> std
             write!(f, ")")
         }
         Expression::EmptyComponentFactory => write!(f, "<empty-component-factory>"),
-        Expression::DebugHook { expression, id } => {
+        Expression::DebugHook { expression, id, synthetic } => {
             write!(f, "debug-hook(")?;
             pretty_print(f, expression)?;
+            if *synthetic {
+                write!(f, " SYNTHETIC")?;
+            }
             write!(f, "\"{id}\")")
+        }
+        Expression::Closure { arg_name, expression } => {
+            let display_name = arg_name.strip_prefix("local_").unwrap_or(arg_name);
+            write!(f, "({display_name}) => ")?;
+            pretty_print(f, expression)
         }
     }
 }

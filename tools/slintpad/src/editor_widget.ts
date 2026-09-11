@@ -43,7 +43,7 @@ export function initialize(): Promise<void> {
         try {
             registerCustomProvider("slintpad", FILESYSTEM_PROVIDER);
 
-            initializeMonacoServices(
+            return initializeMonacoServices(
                 {
                     ...getConfigurationServiceOverride(),
                     ...getEditorServiceOverride(
@@ -66,115 +66,117 @@ export function initialize(): Promise<void> {
                         open: (_) => Promise.resolve(false),
                     },
                 },
-            ).then(() => {
-                monaco.languages.register({
-                    id: "slint",
-                    extensions: [".slint"],
-                    aliases: ["Slint", "slint"],
-                    mimetypes: ["application/slint"],
-                });
-                monaco.languages.setLanguageConfiguration("slint", {
-                    comments: {
-                        lineComment: "//",
-                        blockComment: ["/*", "*/"],
-                    },
-                    brackets: [
-                        ["{", "}"],
-                        ["[", "]"],
-                        ["(", ")"],
-                    ],
-                    autoClosingPairs: [
-                        {
-                            open: "{",
-                            close: "}",
+            )
+                .then(() => {
+                    monaco.languages.register({
+                        id: "slint",
+                        extensions: [".slint"],
+                        aliases: ["Slint", "slint"],
+                        mimetypes: ["application/slint"],
+                    });
+                    monaco.languages.setLanguageConfiguration("slint", {
+                        comments: {
+                            lineComment: "//",
+                            blockComment: ["/*", "*/"],
                         },
-                        {
-                            open: "[",
-                            close: "]",
+                        brackets: [
+                            ["{", "}"],
+                            ["[", "]"],
+                            ["(", ")"],
+                        ],
+                        autoClosingPairs: [
+                            {
+                                open: "{",
+                                close: "}",
+                            },
+                            {
+                                open: "[",
+                                close: "]",
+                            },
+                            {
+                                open: "(",
+                                close: ")",
+                            },
+                            {
+                                open: "'",
+                                close: "'",
+                                notIn: ["string", "comment"],
+                            },
+                            {
+                                open: '"',
+                                close: '"',
+                                notIn: ["string"],
+                            },
+                            {
+                                open: "`",
+                                close: "`",
+                                notIn: ["string", "comment"],
+                            },
+                            {
+                                open: "/**",
+                                close: " */",
+                                notIn: ["string"],
+                            },
+                        ],
+                        autoCloseBefore: ";:.,=}])>` \n\t",
+                        surroundingPairs: [
+                            {
+                                open: "{",
+                                close: "}",
+                            },
+                            {
+                                open: "[",
+                                close: "]",
+                            },
+                            {
+                                open: "(",
+                                close: ")",
+                            },
+                            {
+                                open: "'",
+                                close: "'",
+                            },
+                            {
+                                open: '"',
+                                close: '"',
+                            },
+                            {
+                                open: "`",
+                                close: "`",
+                            },
+                            {
+                                open: "/**",
+                                close: " */",
+                            },
+                        ],
+                        folding: {
+                            markers: {
+                                start: new RegExp("^\\s*//\\s*#?region\\b"),
+                                end: new RegExp("^\\s*//\\s*#?endregion\\b"),
+                            },
                         },
-                        {
-                            open: "(",
-                            close: ")",
-                        },
-                        {
-                            open: "'",
-                            close: "'",
-                            notIn: ["string", "comment"],
-                        },
-                        {
-                            open: '"',
-                            close: '"',
-                            notIn: ["string"],
-                        },
-                        {
-                            open: "`",
-                            close: "`",
-                            notIn: ["string", "comment"],
-                        },
-                        {
-                            open: "/**",
-                            close: " */",
-                            notIn: ["string"],
-                        },
-                    ],
-                    autoCloseBefore: ";:.,=}])>` \n\t",
-                    surroundingPairs: [
-                        {
-                            open: "{",
-                            close: "}",
-                        },
-                        {
-                            open: "[",
-                            close: "]",
-                        },
-                        {
-                            open: "(",
-                            close: ")",
-                        },
-                        {
-                            open: "'",
-                            close: "'",
-                        },
-                        {
-                            open: '"',
-                            close: '"',
-                        },
-                        {
-                            open: "`",
-                            close: "`",
-                        },
-                        {
-                            open: "/**",
-                            close: " */",
-                        },
-                    ],
-                    folding: {
-                        markers: {
-                            start: new RegExp("^\\s*//\\s*#?region\\b"),
-                            end: new RegExp("^\\s*//\\s*#?endregion\\b"),
-                        },
-                    },
-                    wordPattern: new RegExp(
-                        "(-?\\d*\\.\\d\\w*)|([^\\`\\~\\!\\@\\#\\%\\^\\&\\*\\(\\)\\=\\+\\[\\{\\]\\}\\\\\\|\\;\\:\\'\\\"\\,\\.\\<\\>\\/\\?\\s]+)",
-                    ),
-                    indentationRules: {
-                        increaseIndentPattern: new RegExp(
-                            "^((?!\\/\\/).)*(\\{[^}\"'`]*|\\([^)\"'`]*|\\[[^\\]\"'`]*)$",
+                        wordPattern: new RegExp(
+                            "(-?\\d*\\.\\d\\w*)|([^\\`\\~\\!\\@\\#\\%\\^\\&\\*\\(\\)\\=\\+\\[\\{\\]\\}\\\\\\|\\;\\:\\'\\\"\\,\\.\\<\\>\\/\\?\\s]+)",
                         ),
-                        decreaseIndentPattern: new RegExp(
-                            "^((?!.*?\\/\\*).*\\*/)?\\s*[\\}\\]].*$",
-                        ),
-                    },
-                });
-                monaco.languages.onLanguage("slint", () => {
-                    monaco.languages.setMonarchTokensProvider(
-                        "slint",
-                        slint_language,
-                    );
-                });
+                        indentationRules: {
+                            increaseIndentPattern: new RegExp(
+                                "^((?!\\/\\/).)*(\\{[^}\"'`]*|\\([^)\"'`]*|\\[[^\\]\"'`]*)$",
+                            ),
+                            decreaseIndentPattern: new RegExp(
+                                "^((?!.*?\\/\\*).*\\*/)?\\s*[\\}\\]].*$",
+                            ),
+                        },
+                    });
+                    monaco.languages.onLanguage("slint", () => {
+                        monaco.languages.setMonarchTokensProvider(
+                            "slint",
+                            slint_language,
+                        );
+                    });
 
-                resolve();
-            });
+                    resolve();
+                })
+                .catch(reject);
         } catch (e) {
             reject(e);
         }
@@ -366,6 +368,7 @@ export class EditorWidget extends Widget {
     #client: MonacoLanguageClient | null = null;
 
     #edit_era: number;
+    #save_timer: ReturnType<typeof setTimeout> | null = null;
 
     #url_mapper: UrlMapper | null = null;
     #extra_file_urls: { [key: string]: string } = {};
@@ -392,16 +395,20 @@ export class EditorWidget extends Widget {
 
         this.clear_editors();
 
-        this.open_default_content();
+        void this.open_default_content();
     }
 
     switch_to_pane(pane: EditorPaneWidget) {
         this.#tab_panel!.currentWidget = pane;
     }
 
-    private open_default_content() {
+    private async open_default_content() {
         const params = new URLSearchParams(window.location.search);
-        const code = params.get("snippet");
+        const compressed = params.get("gz");
+        let code = params.get("snippet");
+        if (compressed) {
+            code = await decompress(compressed);
+        }
         const load_url = params.get("load_url");
         const load_demo = params.get("load_demo");
 
@@ -416,8 +423,10 @@ export class EditorWidget extends Widget {
         }
         if (load_url) {
             void this.project_from_url(load_url);
-        } else {
-            void this.set_demo(load_demo ?? "");
+        } else if (load_demo) {
+            void this.set_demo(load_demo);
+        } else if (!this.restore_from_history_state()) {
+            void this.set_demo("");
         }
     }
 
@@ -431,6 +440,12 @@ export class EditorWidget extends Widget {
         this.#tab_panel = new TabPanel({ addButtonEnabled: false });
         this.#layout.addWidget(this.#tab_panel);
 
+        // Dispose the underlying Monaco models so that re-opening the same URI
+        // reads fresh content from the filesystem provider instead of reusing
+        // the stale in-memory model.
+        for (const uri_str of this.#tab_map.keys()) {
+            monaco.editor.getModel(monaco.Uri.parse(uri_str))?.dispose();
+        }
         this.#tab_map.clear();
         this.#extra_file_urls = {};
 
@@ -469,6 +484,10 @@ export class EditorWidget extends Widget {
             internal_file_uri("unknown.slint");
 
         const pane = new EditorPaneWidget(model_ref);
+
+        model_ref.object.textEditorModel?.onDidChangeContent(() => {
+            this.schedule_save_to_history_state();
+        });
 
         this.#tab_map.set(uri.toString(), pane);
         this.#tab_panel!.addWidget(pane);
@@ -531,6 +550,8 @@ export class EditorWidget extends Widget {
             return null;
         }
 
+        // Don't restore the old project on next reload
+        EditorWidget.clear_history_state();
         this.clear_editors();
 
         return (await this.open_tab_from_url(monaco.Uri.parse(uri)))[0];
@@ -553,24 +574,6 @@ export class EditorWidget extends Widget {
         );
     }
 
-    public known_demos(): [string, string][] {
-        return [
-            ["", "Hello World!"],
-            ["examples/gallery/gallery.slint", "Gallery"],
-            ["demos/home-automation/ui/demo-debug.slint", "Home Automation"],
-            ["demos/usecases/ui/app.slint", "Use Cases Demo"],
-            ["demos/printerdemo/ui/printerdemo.slint", "Printer Demo"],
-            ["demos/energy-monitor/ui/desktop_window.slint", "Energy Monitor"],
-            ["examples/todo/ui/todo.slint", "Todo Demo"],
-            ["examples/iot-dashboard/main.slint", "IOT Dashboard"],
-            ["examples/fancy-switches/demo.slint", "Fancy Switches"],
-            ["examples/dial/dial.slint", "Fanncy Dial"],
-            ["examples/orbit-animation/demo.slint", "Fancy Animations"],
-            ["examples/repeater/demo.slint", "Fancy Repeater"],
-            ["examples/sprite-sheet/demo.slint", "Spritesheet Demo"],
-        ];
-    }
-
     public add_empty_file_to_project(name: string) {
         let abs_name = name;
         if (!abs_name.startsWith("/")) {
@@ -589,6 +592,8 @@ export class EditorWidget extends Widget {
     }
 
     public set_demo(location: string): Promise<monaco.Uri | null> {
+        // Don't restore the old project on next reload
+        EditorWidget.clear_history_state();
         if (location) {
             const default_tag = "XXXX_DEFAULT_TAG_XXXX";
             let tag = default_tag.startsWith("XXXX_DEFAULT_TAG_")
@@ -625,24 +630,28 @@ export class EditorWidget extends Widget {
     }
 
     protected async handle_lsp_url_request(url: string): Promise<string> {
-        if (this.#url_mapper === null) {
-            return Promise.resolve("Error: Can not resolve URL.");
+        if (url.startsWith("slintpad:/")) {
+            if (this.#url_mapper === null) {
+                return Promise.resolve("Error: Can not resolve URL.");
+            }
+
+            const internal_uri = monaco.Uri.parse(url);
+            const uri = this.#url_mapper.from_internal(internal_uri);
+
+            if (uri === null) {
+                return Promise.resolve("Error: Can not map URL.");
+            }
+
+            return (
+                await this.safely_open_editor_with_url_content(
+                    uri,
+                    internal_uri,
+                    false,
+                )
+            )[1];
         }
-
-        const internal_uri = monaco.Uri.parse(url);
-        const uri = this.#url_mapper.from_internal(internal_uri);
-
-        if (uri === null) {
-            return Promise.resolve("Error: Can not map URL.");
-        }
-
-        return (
-            await this.safely_open_editor_with_url_content(
-                uri,
-                internal_uri,
-                false,
-            )
-        )[1];
+        const r = await fetch(url);
+        return await r.text();
     }
 
     private async safely_open_editor_with_url_content(
@@ -683,4 +692,91 @@ export class EditorWidget extends Widget {
 
         return [internal_uri, doc];
     }
+
+    private schedule_save_to_history_state() {
+        if (this.#save_timer !== null) {
+            clearTimeout(this.#save_timer);
+        }
+        this.#save_timer = setTimeout(() => {
+            this.#save_timer = null;
+            this.save_to_history_state();
+        }, 500);
+    }
+
+    private save_to_history_state() {
+        const files: { [path: string]: string } = {};
+        for (const [uri_str, pane] of this.#tab_map) {
+            const content = pane.editor.getModel()?.getValue();
+            if (content !== undefined) {
+                const uri = monaco.Uri.parse(uri_str);
+                files[uri.path] = content;
+            }
+        }
+        history.replaceState({ files }, "");
+    }
+
+    private restore_from_history_state(): boolean {
+        const files: { [path: string]: string } | undefined =
+            history.state?.files;
+        if (!files) {
+            return false;
+        }
+        const paths = Object.keys(files);
+        if (paths.length === 0) {
+            return false;
+        }
+        this.clear_editors();
+        for (const path of paths) {
+            this.open_file_with_content(internal_file_uri(path), files[path]);
+        }
+        return true;
+    }
+
+    public static clear_history_state() {
+        history.replaceState(null, "");
+    }
+
+    public async copy_permalink_to_clipboard() {
+        navigator.clipboard.writeText(await this.share_url());
+    }
+
+    public async share_url(): Promise<string> {
+        const params = new URLSearchParams(window.location.search);
+        params.delete("load_url");
+        params.delete("load_demo");
+        params.delete("snippet");
+        params.set("gz", await compress(this.current_editor_content));
+
+        const url = new URL(window.location.href);
+        url.search = params.toString();
+        return url.toString();
+    }
+}
+
+// Return an URL-compatible base64 encoded string
+async function compress(text: string): Promise<string> {
+    const input = new TextEncoder().encode(text);
+    const compressedStream = new Blob([input])
+        .stream()
+        .pipeThrough(new CompressionStream("gzip"));
+
+    const compressedBuffer = await new Response(compressedStream).arrayBuffer();
+    const binary = String.fromCharCode(...new Uint8Array(compressedBuffer));
+    const b64 = btoa(binary);
+    return b64.replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+async function decompress(b64: string): Promise<string> {
+    const base64 = b64.replace(/-/g, "+").replace(/_/g, "/");
+    const binary = atob(base64);
+    const compressed = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+
+    const decompressedStream = new Blob([compressed])
+        .stream()
+        .pipeThrough(new DecompressionStream("gzip"));
+
+    const decompressedBuffer = await new Response(
+        decompressedStream,
+    ).arrayBuffer();
+    return new TextDecoder().decode(decompressedBuffer);
 }

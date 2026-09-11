@@ -1,4 +1,3 @@
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: MIT -->
 
 # Demos
 
@@ -8,8 +7,9 @@ These demos showcase different complex use-cases for building UIs with Slint.
 
 | Thumbnail  | Description | Demo |
 | --- | --- | --- |
-| [Printer UI ![Printer Demo image](https://github.com/user-attachments/assets/7e7400ad-283a-4404-b04a-8620ba4df452)](./printerdemo) |  A fictional user interface for the touch screen of a printer. <br/> [Project...](./printerdemo) | [Wasm Demo](https://slint.dev/snapshots/master/demos/printerdemo/) |
+| [Printer UI ![Printer Demo image](https://github.com/user-attachments/assets/34627f84-affd-46a6-9c52-1f623d33a507)](./printerdemo) |  A fictional user interface for the touch screen of a printer. <br/> [Project...](./printerdemo) | [Wasm Demo](https://slint.dev/snapshots/master/demos/printerdemo/) |
 | [Energy Meter![Energy meter demo image](https://github.com/user-attachments/assets/abfe03e3-ded6-4ddc-82b7-8303ee45515c "Energy meter demo image")](./energy-monitor/) |  A fictional user interface of a device that monitors energy consumption in a building. <br/> [Project...](./energy-monitor) | [Wasm Demo](https://slint.dev/snapshots/master/demos/energy-monitor/) |
+| [Home Automation![Home Automation demo image](https://github.com/user-attachments/assets/607e07a5-2e79-4045-9fe4-3da2493ba187 "Home Automation demo image")](./home-automation/) |  A fictional user interface of a device that automates the control of a home. <br/> [Project...](./home-automation) | [Wasm Demo](https://slint.dev/snapshots/master/demos/home-automation/) |
 | [Weather![Weather demo image](./weather-demo/docs/img/desktop-preview.png "7 GUI's demo image")](./weather-demo/) | A simple, cross-platform (Desktop, Android, Wasm) weather application using real weather data from the [OpenWeather](https://openweathermap.org/) API. <br/> [Project...](./weather-demo/) | [Wasm Demo](https://slint.dev/snapshots/master/demos/weather-demo/) |
 | [Usecases ![Usecases Demo image](https://github.com/user-attachments/assets/72dd3e98-36b8-41b6-9d6e-6eb6053ace43)](./usecases) |  Different example use cases in one app. <br/> [Project...](./usecases) | [Wasm Demo](https://slint.dev/snapshots/master/demos/usecases/) |
 
@@ -37,12 +37,14 @@ files to uncomment the line starting with `#wasm#` (or use the `sed` line bellow
 You can then use wasm-pack (which you may need to obtain with `cargo install wasm-pack`).
 This will generate the wasm in the `./pkg` directory, which the `index.html` file will open.
 Since wasm files cannot be served from `file://` URL, you need to open a wab server to serve
-the content
+the content.
+The `--features` flags select only the winit backend and the femtovg renderer,
+which keeps the software renderer out of the binary.
 
 ```sh
 cd demos/printerdemo/rust
 sed -i "s/^#wasm# //" Cargo.toml
-wasm-pack build --release --target web
+wasm-pack build --release --target web --no-default-features --features slint/backend-winit,slint/renderer-femtovg
 python3 -m http.server
 ```
 

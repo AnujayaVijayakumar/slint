@@ -1,5 +1,5 @@
 ;; Copyright © Luke. D Jones <luke@ljones.dev>
-;; SPDX-License-Identifier: GPL-3.0-or-later
+;; SPDX-License-Identifier: MIT
 
 [
   (anon_struct_block)
@@ -117,4 +117,4 @@
   (#set! reference.kind "type"))
 
 (unary_expression
-  left: (_) @local.reference)
+  expr: (_) @local.reference)

@@ -4,7 +4,8 @@
 // cSpell: ignore hframe qreal tabbar vframe
 
 use i_slint_core::{
-    input::{FocusEventResult, FocusReason},
+    cursor::MouseCursorInner,
+    input::{FocusEventResult, FocusReason, InternalKeyEvent},
     platform::PointerEventButton,
 };
 
@@ -23,6 +24,7 @@ pub struct NativeTabWidget {
     pub tabbar_preferred_width: Property<LogicalLength>,
     pub current_index: Property<i32>,
     pub current_focused: Property<i32>,
+    pub orientation: Property<Orientation>,
 
     // outputs
     pub content_x: Property<LogicalLength>,
@@ -40,7 +42,8 @@ pub struct NativeTabWidget {
 
 impl Item for NativeTabWidget {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {
-        let animation_tracker_property_ptr = Self::FIELD_OFFSETS.animation_tracker.apply_pin(self);
+        let animation_tracker_property_ptr =
+            Self::FIELD_OFFSETS.animation_tracker().apply_pin(self);
         self.widget_ptr.set(cpp! { unsafe [animation_tracker_property_ptr as "void*"] -> SlintTypeErasedWidgetPtr as "std::unique_ptr<SlintTypeErasedWidget>" {
             return make_unique_animated_widget<QTabWidget>(animation_tracker_property_ptr);
         }});
@@ -63,6 +66,7 @@ impl Item for NativeTabWidget {
             height: Property<LogicalLength>,
             tabbar_preferred_height: Property<LogicalLength>,
             tabbar_preferred_width: Property<LogicalLength>,
+            orientation: Property<Orientation>,
             horizontal_metrics: Property<TabWidgetMetrics>,
             vertical_metrics: Property<TabWidgetMetrics>,
         }
@@ -70,8 +74,8 @@ impl Item for NativeTabWidget {
         macro_rules! link {
             ($prop:ident) => {
                 Property::link_two_way(
-                    Self::FIELD_OFFSETS.$prop.apply_pin(self),
-                    TabBarSharedData::FIELD_OFFSETS.$prop.apply_pin(shared_data.as_ref()),
+                    Self::FIELD_OFFSETS.$prop().apply_pin(self),
+                    TabBarSharedData::FIELD_OFFSETS.$prop().apply_pin(shared_data.as_ref()),
                 );
             };
         }
@@ -79,6 +83,7 @@ impl Item for NativeTabWidget {
         link!(height);
         link!(tabbar_preferred_width);
         link!(tabbar_preferred_height);
+        link!(orientation);
 
         let shared_data_weak = pin_weak::rc::PinWeak::downgrade(shared_data.clone());
 
@@ -89,34 +94,34 @@ impl Item for NativeTabWidget {
                 Orientation::Horizontal => (
                     qttypes::QSizeF {
                         width: TabBarSharedData::FIELD_OFFSETS
-                            .width
+                            .width()
                             .apply_pin(shared_data.as_ref())
                             .get()
                             .get() as _,
-                        height: (std::i32::MAX / 2) as _,
+                        height: (i32::MAX / 2) as _,
                     },
                     qttypes::QSizeF {
                         width: TabBarSharedData::FIELD_OFFSETS
-                            .tabbar_preferred_width
+                            .tabbar_preferred_width()
                             .apply_pin(shared_data.as_ref())
                             .get()
                             .get() as _,
-                        height: (std::i32::MAX / 2) as _,
+                        height: (i32::MAX / 2) as _,
                     },
                 ),
                 Orientation::Vertical => (
                     qttypes::QSizeF {
-                        width: (std::i32::MAX / 2) as _,
+                        width: (i32::MAX / 2) as _,
                         height: TabBarSharedData::FIELD_OFFSETS
-                            .height
+                            .height()
                             .apply_pin(shared_data.as_ref())
                             .get()
                             .get() as _,
                     },
                     qttypes::QSizeF {
-                        width: (std::i32::MAX / 2) as _,
+                        width: (i32::MAX / 2) as _,
                         height: TabBarSharedData::FIELD_OFFSETS
-                            .tabbar_preferred_height
+                            .tabbar_preferred_height()
                             .apply_pin(shared_data.as_ref())
                             .get()
                             .get() as _,
@@ -125,13 +130,17 @@ impl Item for NativeTabWidget {
             };
 
             let horizontal: bool = matches!(orientation, Orientation::Horizontal);
+            let prop_horizontal: bool = matches!(
+                TabBarSharedData::FIELD_OFFSETS.orientation().apply_pin(shared_data.as_ref()).get(),
+                Orientation::Horizontal
+            );
 
-            cpp!(unsafe [horizontal as "bool", size as "QSizeF", tabbar_size as "QSizeF"] -> TabWidgetMetrics as "TabWidgetMetrics" {
+            cpp!(unsafe [horizontal as "bool", size as "QSizeF", tabbar_size as "QSizeF", prop_horizontal as "bool"] -> TabWidgetMetrics as "TabWidgetMetrics" {
                 ensure_initialized();
                 QStyleOptionTabWidgetFrame option;
                 auto style = qApp->style();
                 option.lineWidth = style->pixelMetric(QStyle::PM_DefaultFrameWidth, 0, nullptr);
-                option.shape = QTabBar::RoundedNorth;
+                option.shape = prop_horizontal? QTabBar::RoundedNorth: QTabBar::RoundedWest;
                 option.rect = QRect(QPoint(), size.toSize());
                 option.tabBarSize = tabbar_size.toSize();
                 option.tabBarRect = QRect(QPoint(), option.tabBarSize);
@@ -160,7 +169,7 @@ impl Item for NativeTabWidget {
                 let shared_data = shared_data.clone();
                 self.$prop.set_binding(move || {
                     let metrics = TabBarSharedData::FIELD_OFFSETS
-                        .$field1
+                        .$field1()
                         .apply_pin(shared_data.as_ref())
                         .get();
                     LogicalLength::new(metrics.$field2 as f32)
@@ -177,9 +186,12 @@ impl Item for NativeTabWidget {
         bind!(tabbar_height = vertical_metrics.tabbar_size);
     }
 
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
+
     fn layout_info(
         self: Pin<&Self>,
         orientation: Orientation,
+        _cross_axis_constraint: Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> LayoutInfo {
@@ -187,33 +199,34 @@ impl Item for NativeTabWidget {
             Orientation::Horizontal => (
                 qttypes::QSizeF {
                     width: self.content_min_width().get() as _,
-                    height: (std::i32::MAX / 2) as _,
+                    height: i16::MAX as _,
                 },
                 qttypes::QSizeF {
                     width: self.tabbar_preferred_width().get() as _,
-                    height: (std::i32::MAX / 2) as _,
+                    height: i16::MAX as _,
                 },
             ),
             Orientation::Vertical => (
                 qttypes::QSizeF {
-                    width: (std::i32::MAX / 2) as _,
+                    width: i16::MAX as _,
                     height: self.content_min_height().get() as _,
                 },
                 qttypes::QSizeF {
-                    width: (std::i32::MAX / 2) as _,
+                    width: i16::MAX as _,
                     height: self.tabbar_preferred_height().get() as _,
                 },
             ),
         };
         let widget: NonNull<()> = SlintTypeErasedWidgetPtr::qwidget_ptr(&self.widget_ptr);
+        let prop_horizontal: bool = matches!(self.orientation(), Orientation::Horizontal);
 
-        let size = cpp!(unsafe [content_size as "QSizeF", tabbar_size as "QSizeF", widget as "QWidget*"] -> qttypes::QSize as "QSize" {
+        let size = cpp!(unsafe [content_size as "QSizeF", tabbar_size as "QSizeF", widget as "QWidget*", prop_horizontal as "bool"] -> qttypes::QSize as "QSize" {
             ensure_initialized();
 
             QStyleOptionTabWidgetFrame option;
             auto style = qApp->style();
             option.lineWidth = style->pixelMetric(QStyle::PM_DefaultFrameWidth, 0, widget);
-            option.shape = QTabBar::RoundedNorth;
+            option.shape = prop_horizontal? QTabBar::RoundedNorth: QTabBar::RoundedWest;
             option.tabBarSize = tabbar_size.toSize();
             option.rightCornerWidgetSize = QSize(0, 0);
             option.leftCornerWidgetSize = QSize(0, 0);
@@ -240,6 +253,7 @@ impl Item for NativeTabWidget {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardEvent
     }
@@ -249,13 +263,23 @@ impl Item for NativeTabWidget {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &i_slint_core::items::ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventResult {
         InputEventResult::EventIgnored
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _event: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> KeyEventResult {
+        KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        _: &KeyEvent,
+        _: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
@@ -276,20 +300,22 @@ impl Item for NativeTabWidget {
             width: this.tabbar_preferred_width().get() as _,
             height: this.tabbar_preferred_height().get() as _,
         };
+        let prop_horizontal: bool = matches!(this.orientation(), Orientation::Horizontal);
         cpp!(unsafe [
             painter as "QPainterPtr*",
             widget as "QWidget*",
             size as "QSize",
             dpr as "float",
             tabbar_size as "QSizeF",
-            initial_state as "int"
+            initial_state as "int",
+            prop_horizontal as "bool"
         ] {
             QStyleOptionTabWidgetFrame option;
             option.styleObject = widget;
             option.state |= QStyle::State(initial_state);
             auto style = qApp->style();
             option.lineWidth = style->pixelMetric(QStyle::PM_DefaultFrameWidth, 0, widget);
-            option.shape = QTabBar::RoundedNorth;
+            option.shape = prop_horizontal? QTabBar::RoundedNorth: QTabBar::RoundedWest;
             if (true /*enabled*/) {
                 option.state |= QStyle::State_Enabled;
             } else {
@@ -336,7 +362,7 @@ impl Item for NativeTabWidget {
 
 impl ItemConsts for NativeTabWidget {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<Self, CachedRenderingData> =
-        Self::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+        Self::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
 }
 
 declare_item_vtable! {
@@ -362,15 +388,19 @@ pub struct NativeTab {
 
 impl Item for NativeTab {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {
-        let animation_tracker_property_ptr = Self::FIELD_OFFSETS.animation_tracker.apply_pin(self);
+        let animation_tracker_property_ptr =
+            Self::FIELD_OFFSETS.animation_tracker().apply_pin(self);
         self.widget_ptr.set(cpp! { unsafe [animation_tracker_property_ptr as "void*"] -> SlintTypeErasedWidgetPtr as "std::unique_ptr<SlintTypeErasedWidget>" {
             return make_unique_animated_widget<QWidget>(animation_tracker_property_ptr);
         }});
     }
 
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
+
     fn layout_info(
         self: Pin<&Self>,
         orientation: Orientation,
+        _cross_axis_constraint: Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> LayoutInfo {
@@ -425,6 +455,7 @@ impl Item for NativeTab {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardEvent
     }
@@ -434,13 +465,14 @@ impl Item for NativeTab {
         event: &MouseEvent,
         window_adapter: &Rc<dyn WindowAdapter>,
         self_rc: &i_slint_core::items::ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventResult {
         let enabled = self.enabled();
         if !enabled {
             return InputEventResult::EventIgnored;
         }
 
-        Self::FIELD_OFFSETS.pressed.apply_pin(self).set(match event {
+        Self::FIELD_OFFSETS.pressed().apply_pin(self).set(match event {
             MouseEvent::Pressed { button, .. } => *button == PointerEventButton::Left,
             MouseEvent::Exit | MouseEvent::Released { .. } => false,
             MouseEvent::Moved { .. } => {
@@ -448,11 +480,14 @@ impl Item for NativeTab {
                     InputEventResult::GrabMouse
                 } else {
                     InputEventResult::EventIgnored
-                }
+                };
             }
             MouseEvent::Wheel { .. } => return InputEventResult::EventIgnored,
-            MouseEvent::DragMove(..) | MouseEvent::Drop(..) => {
-                return InputEventResult::EventIgnored
+            MouseEvent::PinchGesture { .. } | MouseEvent::RotationGesture { .. } => {
+                return InputEventResult::EventIgnored;
+            }
+            MouseEvent::DragMove { .. } | MouseEvent::Drop { .. } => {
+                return InputEventResult::EventIgnored;
             }
         });
         let click_on_press = cpp!(unsafe [] -> bool as "bool" {
@@ -473,9 +508,18 @@ impl Item for NativeTab {
         }
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _event: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> KeyEventResult {
+        KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        _: &KeyEvent,
+        _: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
@@ -570,7 +614,7 @@ impl Item for NativeTab {
 
 impl ItemConsts for NativeTab {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<Self, CachedRenderingData> =
-        Self::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+        Self::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
 }
 
 declare_item_vtable! {

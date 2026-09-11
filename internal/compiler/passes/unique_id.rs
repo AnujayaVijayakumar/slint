@@ -4,7 +4,7 @@
 use crate::diagnostics::BuildDiagnostics;
 use crate::langtype::ElementType;
 use crate::object_tree::*;
-use smol_str::{format_smolstr, SmolStr, ToSmolStr};
+use smol_str::{SmolStr, ToSmolStr, format_smolstr};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -53,6 +53,8 @@ fn rename_globals(doc: &Document, mut count: u32) {
             root.id.clone_from(&g.id);
         } else if let Some(s) = g.exported_global_names.borrow().first() {
             root.id = s.to_smolstr();
+        } else if g.from_library.get() {
+            root.id = format_smolstr!("{}", g.id);
         } else {
             root.id = format_smolstr!("{}-{}", g.id, count);
         }

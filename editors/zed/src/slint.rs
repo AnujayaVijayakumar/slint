@@ -1,9 +1,10 @@
 // Copyright © Luke. D Jones <luke@ljones.dev>
-// SPDX-License-Identifier: GPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 
+// cSpell: ignore worktree
 use std::fs;
 use zed::{DownloadedFileType, LanguageServerId};
-use zed_extension_api::{self as zed, settings::LspSettings, Architecture, Os, Result};
+use zed_extension_api::{self as zed, Architecture, Os, Result, settings::LspSettings};
 
 struct SlintBinary {
     path: String,
@@ -34,14 +35,14 @@ impl SlintExtension {
             return Ok(SlintBinary { path, args: binary_args });
         }
 
-        if let Some(path) = &self.cached_binary_path {
-            if fs::metadata(path).is_ok_and(|stat| stat.is_file()) {
-                zed::set_language_server_installation_status(
-                    language_server_id,
-                    &zed::LanguageServerInstallationStatus::None,
-                );
-                return Ok(SlintBinary { path: path.to_owned(), args: binary_args });
-            }
+        if let Some(path) = &self.cached_binary_path
+            && fs::metadata(path).is_ok_and(|stat| stat.is_file())
+        {
+            zed::set_language_server_installation_status(
+                language_server_id,
+                &zed::LanguageServerInstallationStatus::None,
+            );
+            return Ok(SlintBinary { path: path.to_owned(), args: binary_args });
         }
 
         zed::set_language_server_installation_status(
@@ -49,21 +50,21 @@ impl SlintExtension {
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
 
-        let release = zed::latest_github_release(
-            "slint-ui/slint",
-            zed::GithubReleaseOptions { require_assets: true, pre_release: false },
-        )?;
+        let dev_mode = worktree.shell_env().iter().any(|(k, v)| k == "SLINT_DEV_MODE" && v == "1");
+        let release_tag =
+            if dev_mode { "nightly" } else { concat!("v", env!("CARGO_PKG_VERSION")) };
+        let release = zed::github_release_by_tag_name("slint-ui/slint", release_tag)
+            .map_err(|e| format!("Failed to get Slint release {release_tag} from GitHub: {e}",))?;
 
         let target = zed::current_platform();
 
         let target_name = match target {
-            (Os::Mac, _) => "slint-lsp-macos",
-            (Os::Windows, Architecture::X86) | (Os::Windows, Architecture::X8664) => {
-                "slint-lsp-windows"
-            }
-            (Os::Linux, Architecture::X86) | (Os::Linux, Architecture::X8664) => "slint-lsp-linux",
+            (Os::Mac, _) => "slint-lsp-universal-apple-darwin",
+            (Os::Windows, Architecture::X8664) => "slint-lsp-x86_64-pc-windows-msvc",
+            (Os::Windows, Architecture::Aarch64) => "slint-lsp-aarch64-pc-windows-msvc",
+            (Os::Linux, Architecture::X8664) => "slint-lsp-x86_64-unknown-linux-gnu",
             (Os::Linux, Architecture::Aarch64) => "slint-lsp-aarch64-unknown-linux-gnu",
-            (_, _) => return Err("platform or architecture not supported".to_string()),
+            (_, _) => return Err("Platform or architecture not supported for automatic slint-lsp download. Please install it manually and use the 'lsp.slint.binary' setting to point to it.".to_string()),
         };
 
         let (asset_file_type, asset_name_ext, binary_ext) = match target.0 {
@@ -79,15 +80,30 @@ impl SlintExtension {
             .find(|asset| asset.name == asset_name)
             .ok_or_else(|| format!("no asset found matching {:?}", asset_name))?;
 
-        let extension_dir = "slint-lsp";
-        let binary_path = format!(
-            "{extension_dir}/{}/slint-lsp{binary_ext}",
-            if target_name == "slint-lsp-aarch64-unknown-linux-gnu" {
-                target_name
+        let extension_dir = format!(
+            "slint-lsp-{}{}",
+            release.version,
+            if dev_mode {
+                // Add a timestamp to the extension directory to invalidate the cache every day
+                (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    / (60 * 60 * 24))
+                    .to_string()
             } else {
-                "slint-lsp"
-            },
+                String::new()
+            }
         );
+        let subdir = if asset_file_type == DownloadedFileType::Zip {
+            ""
+        } else if target_name == "slint-lsp-aarch64-unknown-linux-gnu" {
+            // The directory in the tarball is usually named "slint-lsp", but it is different for the slint-lsp-*-linux-*
+            target_name
+        } else {
+            "slint-lsp"
+        };
+        let binary_path = format!("{extension_dir}/{subdir}/slint-lsp{binary_ext}",);
 
         if !fs::metadata(&binary_path).is_ok_and(|stat| stat.is_file()) {
             zed::set_language_server_installation_status(
@@ -95,14 +111,14 @@ impl SlintExtension {
                 &zed::LanguageServerInstallationStatus::Downloading,
             );
 
-            zed::download_file(&asset.download_url, extension_dir, asset_file_type)
+            zed::download_file(&asset.download_url, &extension_dir, asset_file_type)
                 .map_err(|e| format!("failed to download file: {e}"))?;
 
             let entries =
                 fs::read_dir(".").map_err(|e| format!("failed to list working directory {e}"))?;
             for entry in entries {
                 let entry = entry.map_err(|e| format!("failed to load directory entry {e}"))?;
-                if entry.file_name().to_str() != Some(extension_dir) {
+                if entry.file_name().to_str() != Some(&extension_dir) {
                     fs::remove_dir_all(entry.path()).ok();
                 }
             }

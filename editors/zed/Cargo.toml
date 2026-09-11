@@ -1,15 +1,16 @@
 # Copyright © Luke. D Jones <luke@ljones.dev>
-# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-License-Identifier: MIT
 
 [package]
 name = "zed_slint"
-version = "0.0.9"
-edition = "2021"
+version = "1.18.0"
+edition.workspace = true
 publish = false
-license = "GPL-3.0-or-later"
+license = "MIT"
 
 [dependencies]
-zed_extension_api = "0.3.0"
+# Don't update: a newer extension API requires a newer Zed.
+zed_extension_api = "0.6.0"
 
 [lib]
 path = "src/slint.rs"

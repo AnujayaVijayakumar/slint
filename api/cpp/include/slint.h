@@ -1,40 +1,51 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell:ignore itemvtable
 #pragma once
 
-#if defined(__GNUC__) || defined(__clang__)
-// In C++17, it is conditionally supported, but still valid for all compiler we care
-#    pragma GCC diagnostic ignored "-Winvalid-offsetof"
-#endif
-
-#include "slint_internal.h"
-#include "slint_platform_internal.h"
-#include "slint_qt_internal.h"
-#include "slint_window.h"
-#include "slint_models.h"
-#include "slint_item_tree.h"
+#include "private/slint_internal.h"
+#include "private/slint_platform_internal.h"
+#include "private/slint_qt_internal.h"
+#include "private/slint_window.h"
+#include "private/slint_models.h"
+#include "private/slint_item_tree.h"
+#include "private/slint_keys.h"
+#include "private/slint_data_transfer.h"
 
 #include <vector>
 #include <chrono>
 #include <span>
 #include <concepts>
+#include <limits>
 
 #ifndef SLINT_FEATURE_FREESTANDING
 #    include <mutex>
 #    include <condition_variable>
+#    include <cstdint>
+#    include <memory>
 #endif
 
-/// \rst
-/// The :code:`slint` namespace is the primary entry point into the Slint C++ API.
+/// The `slint` namespace is the primary entry point into the Slint C++ API.
 /// All available types are in this namespace.
 ///
-/// See the :doc:`Overview <../overview>` documentation for the C++ integration how
-/// to load :code:`.slint` designs.
-/// \endrst
+/// See the Overview documentation for the C++ integration and how
+/// to load `.slint` designs.
 namespace slint {
 
 namespace private_api {
+
+/// Saturating float-to-int cast matching Rust's `as i32` (NaN maps to 0).
+inline int saturating_float_to_int(double value)
+{
+    if (value != value) // NaN
+        return 0;
+    if (value >= std::numeric_limits<int>::max())
+        return std::numeric_limits<int>::max();
+    if (value <= std::numeric_limits<int>::min())
+        return std::numeric_limits<int>::min();
+    return static_cast<int>(value);
+}
 
 /// Convert a slint `{height: length, width: length, x: length, y: length}` to a Rect
 inline cbindgen_private::Rect convert_anonymous_rect(std::tuple<float, float, float, float> tuple)
@@ -44,23 +55,16 @@ inline cbindgen_private::Rect convert_anonymous_rect(std::tuple<float, float, fl
     return cbindgen_private::Rect { .x = x, .y = y, .width = w, .height = h };
 }
 
-inline void dealloc(const ItemTreeVTable *, uint8_t *ptr, [[maybe_unused]] vtable::Layout layout)
+inline void dealloc(const ItemTreeVTable *vtable, uint8_t *ptr,
+                    [[maybe_unused]] vtable::Layout layout)
 {
-#ifdef __cpp_sized_deallocation
-    ::operator delete(reinterpret_cast<void *>(ptr), layout.size,
-                      static_cast<std::align_val_t>(layout.align));
-#elif !defined(__APPLE__) || MAC_OS_X_VERSION_MIN_REQUIRED >= MAC_OS_X_VERSION_10_14
-    ::operator delete(reinterpret_cast<void *>(ptr), static_cast<std::align_val_t>(layout.align));
-#else
-    ::operator delete(reinterpret_cast<void *>(ptr));
-#endif
+    vtable::dealloc(vtable, ptr, layout);
 }
 
 template<typename T>
 inline vtable::Layout drop_in_place(ItemTreeRef item_tree)
 {
-    reinterpret_cast<T *>(item_tree.instance)->~T();
-    return vtable::Layout { sizeof(T), alignof(T) };
+    return vtable::drop_in_place<ItemTreeVTable, T>(item_tree);
 }
 
 #if !defined(DOXYGEN)
@@ -110,6 +114,8 @@ inline bool operator==(const EasingCurve &a, const EasingCurve &b)
         return false;
     } else if (a.tag == EasingCurve::Tag::CubicBezier) {
         return std::equal(a.cubic_bezier._0, a.cubic_bezier._0 + 4, b.cubic_bezier._0);
+    } else if (a.tag == EasingCurve::Tag::Spring) {
+        return a.spring._0 == b.spring._0;
     }
     return true;
 }
@@ -126,31 +132,82 @@ inline static void register_item_tree(const vtable::VRc<ItemTreeVTable> *c,
 }
 
 inline SharedVector<float> solve_box_layout(const cbindgen_private::BoxLayoutData &data,
-                                            cbindgen_private::Slice<int> repeater_indexes)
+                                            cbindgen_private::Slice<int> repeater_indices)
 {
     SharedVector<float> result;
-    cbindgen_private::Slice<uint32_t> ri { reinterpret_cast<uint32_t *>(repeater_indexes.ptr),
-                                           repeater_indexes.len };
+    cbindgen_private::Slice<uint32_t> ri =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_indices.ptr), repeater_indices.len);
     cbindgen_private::slint_solve_box_layout(&data, ri, &result);
     return result;
 }
 
-inline SharedVector<float> solve_grid_layout(const cbindgen_private::GridLayoutData &data)
+inline SharedVector<float> solve_box_layout_ortho(const cbindgen_private::BoxLayoutOrthoData &data,
+                                                  cbindgen_private::Slice<int> repeater_indices)
 {
     SharedVector<float> result;
-    cbindgen_private::slint_solve_grid_layout(&data, &result);
+    cbindgen_private::Slice<uint32_t> ri =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_indices.ptr), repeater_indices.len);
+    cbindgen_private::slint_solve_box_layout_ortho(&data, ri, &result);
+    return result;
+}
+
+inline SharedVector<uint16_t>
+organize_grid_layout(cbindgen_private::Slice<cbindgen_private::GridLayoutInputData> input_data,
+                     cbindgen_private::Slice<int> repeater_indices,
+                     cbindgen_private::Slice<int> repeater_steps)
+{
+    SharedVector<uint16_t> result;
+    cbindgen_private::Slice<uint32_t> ri =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_indices.ptr), repeater_indices.len);
+    cbindgen_private::Slice<uint32_t> rs =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_steps.ptr), repeater_steps.len);
+    cbindgen_private::slint_organize_grid_layout(input_data, ri, rs, &result);
+    return result;
+}
+
+inline SharedVector<uint16_t> organize_dialog_button_layout(
+        cbindgen_private::Slice<cbindgen_private::GridLayoutInputData> input_data,
+        cbindgen_private::Slice<DialogButtonRole> dialog_button_roles)
+{
+    SharedVector<uint16_t> result;
+    cbindgen_private::slint_organize_dialog_button_layout(input_data, dialog_button_roles, &result);
+    return result;
+}
+
+inline SharedVector<float>
+solve_grid_layout(const cbindgen_private::GridLayoutData &data,
+                  cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> constraints,
+                  cbindgen_private::Orientation orientation,
+                  cbindgen_private::Slice<int> repeater_indices,
+                  cbindgen_private::Slice<int> repeater_steps)
+{
+    SharedVector<float> result;
+    cbindgen_private::Slice<uint32_t> ri =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_indices.ptr), repeater_indices.len);
+    cbindgen_private::Slice<uint32_t> rs =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_steps.ptr), repeater_steps.len);
+    cbindgen_private::slint_solve_grid_layout(&data, constraints, orientation, ri, rs, &result);
     return result;
 }
 
 inline cbindgen_private::LayoutInfo
-grid_layout_info(cbindgen_private::Slice<cbindgen_private::GridLayoutCellData> cells, float spacing,
-                 const cbindgen_private::Padding &padding)
+grid_layout_info(const cbindgen_private::GridLayoutOrganizedData &organized_data,
+                 cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> constraints,
+                 cbindgen_private::Slice<int> repeater_indices,
+                 cbindgen_private::Slice<int> repeater_steps, float spacing,
+                 const cbindgen_private::Padding &padding,
+                 cbindgen_private::Orientation orientation)
 {
-    return cbindgen_private::slint_grid_layout_info(cells, spacing, &padding);
+    cbindgen_private::Slice<uint32_t> ri =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_indices.ptr), repeater_indices.len);
+    cbindgen_private::Slice<uint32_t> rs =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_steps.ptr), repeater_steps.len);
+    return cbindgen_private::slint_grid_layout_info(&organized_data, constraints, ri, rs, spacing,
+                                                    &padding, orientation);
 }
 
 inline cbindgen_private::LayoutInfo
-box_layout_info(cbindgen_private::Slice<cbindgen_private::BoxLayoutCellData> cells, float spacing,
+box_layout_info(cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> cells, float spacing,
                 const cbindgen_private::Padding &padding,
                 cbindgen_private::LayoutAlignment alignment)
 {
@@ -158,61 +215,204 @@ box_layout_info(cbindgen_private::Slice<cbindgen_private::BoxLayoutCellData> cel
 }
 
 inline cbindgen_private::LayoutInfo
-box_layout_info_ortho(cbindgen_private::Slice<cbindgen_private::BoxLayoutCellData> cells,
+box_layout_info_ortho(cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> cells,
                       const cbindgen_private::Padding &padding)
 {
     return cbindgen_private::slint_box_layout_info_ortho(cells, &padding);
 }
 
-/// Access the layout cache of an item within a repeater
-inline float layout_cache_access(const SharedVector<float> &cache, int offset, int repeater_index)
+inline SharedVector<float> solve_flexbox_layout(const cbindgen_private::FlexboxLayoutData &data,
+                                                cbindgen_private::Slice<int> repeater_indices)
 {
-    size_t idx = size_t(cache[offset]) + repeater_index * 2;
+    SharedVector<float> result;
+    cbindgen_private::Slice<uint32_t> ri =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_indices.ptr), repeater_indices.len);
+    cbindgen_private::slint_solve_flexbox_layout(&data, ri, &result, nullptr, nullptr);
+    return result;
+}
+
+// C thunk for the flexbox measure callbacks: unpack the type-erased functor
+// and forward. `measure(index, w, h, known_w, known_h)` returns `{width,
+// height}`; a dimension taffy has not determined (`known_* == false`) arrives
+// pre-resolved to the cell's preferred size.
+template<typename MeasureFn>
+inline void flexbox_measure_thunk(void *user_data, uintptr_t child_index, float width, float height,
+                                  bool known_width, bool known_height, float *out_width,
+                                  float *out_height)
+{
+    auto *f = reinterpret_cast<MeasureFn *>(user_data);
+    auto wh = (*f)(child_index, width, height, known_width, known_height);
+    *out_width = wh.first;
+    *out_height = wh.second;
+}
+
+// Like `solve_flexbox_layout`, but with a measure callback (see
+// `flexbox_measure_thunk`) used for height-for-width.
+template<typename MeasureFn>
+inline SharedVector<float>
+solve_flexbox_layout_with_measure(const cbindgen_private::FlexboxLayoutData &data,
+                                  cbindgen_private::Slice<int> repeater_indices, MeasureFn measure)
+{
+    SharedVector<float> result;
+    cbindgen_private::Slice<uint32_t> ri =
+            make_slice(reinterpret_cast<uint32_t *>(repeater_indices.ptr), repeater_indices.len);
+    cbindgen_private::slint_solve_flexbox_layout(
+            &data, ri, &result, reinterpret_cast<const void *>(&flexbox_measure_thunk<MeasureFn>),
+            reinterpret_cast<void *>(&measure));
+    return result;
+}
+
+inline cbindgen_private::LayoutInfo
+flexbox_layout_info_main_axis(cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> cells,
+                              float spacing, const cbindgen_private::Padding &padding,
+                              cbindgen_private::FlexboxLayoutWrap flex_wrap)
+{
+    return cbindgen_private::slint_flexbox_layout_info_main_axis(cells, spacing, &padding,
+                                                                 flex_wrap);
+}
+
+inline float
+flexbox_layout_unwrapped_main(cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> cells,
+                              float spacing, const cbindgen_private::Padding &padding)
+{
+    return cbindgen_private::slint_flexbox_layout_unwrapped_main(cells, spacing, &padding);
+}
+
+inline cbindgen_private::LayoutInfo
+flexbox_layout_info_cross_axis(cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> cells_h,
+                               cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> cells_v,
+                               cbindgen_private::Slice<cbindgen_private::FlexItemProps> flex_props,
+                               float spacing_h, float spacing_v,
+                               const cbindgen_private::Padding &padding_h,
+                               const cbindgen_private::Padding &padding_v,
+                               cbindgen_private::FlexboxLayoutDirection direction,
+                               cbindgen_private::LayoutAlignment alignment,
+                               cbindgen_private::FlexboxLayoutWrap flex_wrap, float constraint_size)
+{
+    return cbindgen_private::slint_flexbox_layout_info_cross_axis(
+            cells_h, cells_v, flex_props, spacing_h, spacing_v, &padding_h, &padding_v, direction,
+            alignment, flex_wrap, constraint_size);
+}
+
+// Like `flexbox_layout_info_cross_axis`, but with a measure callback (see
+// `flexbox_measure_thunk`) so height-for-width cells are re-measured at the
+// size taffy assigns them.
+template<typename MeasureFn>
+inline cbindgen_private::LayoutInfo flexbox_layout_info_cross_axis_with_measure(
+        cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> cells_h,
+        cbindgen_private::Slice<cbindgen_private::LayoutItemInfo> cells_v,
+        cbindgen_private::Slice<cbindgen_private::FlexItemProps> flex_props, float spacing_h,
+        float spacing_v, const cbindgen_private::Padding &padding_h,
+        const cbindgen_private::Padding &padding_v,
+        cbindgen_private::FlexboxLayoutDirection direction,
+        cbindgen_private::LayoutAlignment alignment, cbindgen_private::FlexboxLayoutWrap flex_wrap,
+        float constraint_size, MeasureFn measure)
+{
+    return cbindgen_private::slint_flexbox_layout_info_cross_axis_with_measure(
+            cells_h, cells_v, flex_props, spacing_h, spacing_v, &padding_h, &padding_v, direction,
+            alignment, flex_wrap, constraint_size,
+            reinterpret_cast<const void *>(&flexbox_measure_thunk<MeasureFn>),
+            reinterpret_cast<void *>(&measure));
+}
+
+/// Access the layout cache of an item within a repeater (standard cache)
+template<typename T>
+inline T layout_cache_access(const SharedVector<T> &cache, int offset, int repeater_index,
+                             int entries_per_item)
+{
+    size_t idx = size_t(cache[offset]) + repeater_index * entries_per_item;
     return idx < cache.size() ? cache[idx] : 0;
+}
+
+/// Access the layout cache of an item within a grid repeater (two-level indirection cache)
+/// Formula: cache[cache[jump_index] + repeater_index * stride + child_offset]
+template<typename T>
+inline T layout_cache_grid_repeater_access(const SharedVector<T> &cache, size_t jump_index,
+                                           size_t repeater_index, size_t stride,
+                                           size_t child_offset)
+{
+    size_t base = jump_index < cache.size() ? size_t(cache[jump_index]) : 0;
+    size_t data_idx = base + repeater_index * stride + child_offset;
+    return data_idx < cache.size() ? cache[data_idx] : 0;
 }
 
 template<typename VT, typename ItemType>
 inline cbindgen_private::LayoutInfo
 item_layout_info(VT *itemvtable, ItemType *item_ptr, cbindgen_private::Orientation orientation,
-                 WindowAdapterRc *window_adapter, const ItemTreeRc &component_rc,
-                 uint32_t item_index)
+                 float cross_axis_constraint, WindowAdapterRc *window_adapter,
+                 const ItemTreeRc &component_rc, uint32_t item_index)
 {
     cbindgen_private::ItemRc item_rc { component_rc, item_index };
-    return itemvtable->layout_info({ itemvtable, item_ptr }, orientation, window_adapter, &item_rc);
+    return itemvtable->layout_info({ itemvtable, item_ptr }, orientation, cross_axis_constraint,
+                                   window_adapter, &item_rc);
 }
 } // namespace private_api
 
 namespace private_api {
 
+template<typename T>
+union MaybeUninitialized {
+    T value;
+    ~MaybeUninitialized() { }
+    MaybeUninitialized() { }
+    T take()
+    {
+        T result = std::move(value);
+        value.~T();
+        return result;
+    }
+};
+
+inline vtable::VRc<cbindgen_private::MenuVTable>
+create_menu_wrapper(const ItemTreeRc &menu_item_tree,
+                    bool (*condition)(const ItemTreeRc *menu_tree) = nullptr,
+                    bool (*visible)(const ItemTreeRc *menu_tree) = nullptr)
+{
+    MaybeUninitialized<vtable::VRc<cbindgen_private::MenuVTable>> maybe;
+    cbindgen_private::slint_menus_create_wrapper(&menu_item_tree, &maybe.value, condition, visible);
+    return maybe.take();
+}
+
 inline void setup_popup_menu_from_menu_item_tree(
-        const ItemTreeRc &menu_item_tree,
+        const vtable::VRc<cbindgen_private::MenuVTable> &shared,
         Property<std::shared_ptr<Model<cbindgen_private::MenuEntry>>> &entries,
         Callback<std::shared_ptr<Model<cbindgen_private::MenuEntry>>(cbindgen_private::MenuEntry)>
                 &sub_menu,
         Callback<void(cbindgen_private::MenuEntry)> &activated)
 {
     using cbindgen_private::MenuEntry;
-    using cbindgen_private::MenuVTable;
-    auto shared = std::make_shared<vtable::VBox<MenuVTable>>(nullptr, nullptr);
-    cbindgen_private::slint_menus_create_wrapper(&menu_item_tree, &*shared);
     entries.set_binding([shared] {
-        vtable::VRefMut<MenuVTable> ref { shared->vtable, shared->instance };
         SharedVector<MenuEntry> entries_sv;
-        shared->vtable->sub_menu(ref, nullptr, &entries_sv);
+        shared.vtable()->sub_menu(shared.borrow(), nullptr, &entries_sv);
         std::vector<MenuEntry> entries_vec(entries_sv.begin(), entries_sv.end());
         return std::make_shared<VectorModel<MenuEntry>>(std::move(entries_vec));
     });
     sub_menu.set_handler([shared](const auto &entry) {
-        vtable::VRefMut<MenuVTable> ref { shared->vtable, shared->instance };
         SharedVector<MenuEntry> entries_sv;
-        shared->vtable->sub_menu(ref, &entry, &entries_sv);
+        shared.vtable()->sub_menu(shared.borrow(), &entry, &entries_sv);
         std::vector<MenuEntry> entries_vec(entries_sv.begin(), entries_sv.end());
         return std::make_shared<VectorModel<MenuEntry>>(std::move(entries_vec));
     });
-    activated.set_handler([shared](const auto &entry) {
-        vtable::VRefMut<MenuVTable> ref { shared->vtable, shared->instance };
-        shared->vtable->activate(ref, &entry);
-    });
+    activated.set_handler(
+            [shared](const auto &entry) { shared.vtable()->activate(shared.borrow(), &entry); });
+}
+
+// Set up a menu bar from a menu item tree: register its shortcuts, install the native menu bar when
+// the platform provides one, and always wire the fallback handlers, which also keep the tree alive
+// on the component (the native menu bar holds only a weak reference to it).
+inline void setup_menu_bar_from_menu_item_tree(
+        const cbindgen_private::WindowAdapterRcOpaque *window_handle, bool no_native,
+        const vtable::VRc<cbindgen_private::MenuVTable> &shared,
+        Property<std::shared_ptr<Model<cbindgen_private::MenuEntry>>> &entries,
+        Callback<std::shared_ptr<Model<cbindgen_private::MenuEntry>>(cbindgen_private::MenuEntry)>
+                &sub_menu,
+        Callback<void(cbindgen_private::MenuEntry)> &activated)
+{
+    cbindgen_private::slint_windowrc_setup_menu_bar_shortcuts(window_handle, &shared);
+    if (!no_native && cbindgen_private::slint_windowrc_supports_native_menu_bar(window_handle)) {
+        cbindgen_private::slint_windowrc_setup_native_menu_bar(window_handle, &shared);
+    }
+    setup_popup_menu_from_menu_item_tree(shared, entries, sub_menu, activated);
 }
 
 inline SharedString translate(const SharedString &original, const SharedString &context,
@@ -225,14 +425,58 @@ inline SharedString translate(const SharedString &original, const SharedString &
     return result;
 }
 
+inline SharedString decimal_separator()
+{
+    SharedString out;
+    cbindgen_private::slint_decimal_separator(&out);
+    return out;
+}
+
+inline SharedString default_window_title()
+{
+    SharedString out;
+    cbindgen_private::slint_default_window_title(&out);
+    return out;
+}
+
+inline StyledText parse_markdown(const SharedString &format_string,
+                                 cbindgen_private::Slice<StyledText> args)
+{
+    StyledText result;
+    cbindgen_private::slint_parse_markdown(&format_string, args, &result);
+    return result;
+}
+
+inline StyledText string_to_styled_text(const SharedString &text)
+{
+    StyledText result;
+    cbindgen_private::slint_string_to_styled_text(&text, &result);
+    return result;
+}
+
+inline StyledText color_to_styled_text(const Color &color)
+{
+    StyledText result;
+    cbindgen_private::slint_color_to_styled_text(&color, &result);
+    return result;
+}
+
+inline bool open_url(const SharedString &url, const WindowAdapterRc &window_adapter)
+{
+    return cbindgen_private::slint_open_url(&url, &window_adapter.handle());
+}
+
+inline void macos_bring_all_windows_to_front()
+{
+    cbindgen_private::slint_macos_bring_all_windows_to_front();
+}
+
 inline SharedString translate_from_bundle(std::span<const char8_t *const> strs,
                                           cbindgen_private::Slice<SharedString> arguments)
 {
     SharedString result;
     cbindgen_private::slint_translate_from_bundle(
-            cbindgen_private::Slice<const char *>(
-                    const_cast<char const **>(reinterpret_cast<char const *const *>(strs.data())),
-                    strs.size()),
+            make_slice((reinterpret_cast<char const *const *>(strs.data())), strs.size()),
             arguments, &result);
     return result;
 }
@@ -243,29 +487,133 @@ translate_from_bundle_with_plural(std::span<const char8_t *const> strs,
                                   cbindgen_private::Slice<SharedString> arguments, int n)
 {
     SharedString result;
-    cbindgen_private::Slice<const char *> strs_slice(
-            const_cast<char const **>(reinterpret_cast<char const *const *>(strs.data())),
-            strs.size());
-    cbindgen_private::Slice<uint32_t> indices_slice(
-            const_cast<uint32_t *>(reinterpret_cast<const uint32_t *>(indices.data())),
-            indices.size());
-    cbindgen_private::Slice<uintptr_t (*)(int32_t)> plural_rules_slice(
-            const_cast<uintptr_t (**)(int32_t)>(
-                    reinterpret_cast<uintptr_t (*const *)(int32_t)>(plural_rules.data())),
-            plural_rules.size());
+    cbindgen_private::Slice<const char *> strs_slice =
+            make_slice(reinterpret_cast<char const *const *>(strs.data()), strs.size());
+    cbindgen_private::Slice<uint32_t> indices_slice =
+            make_slice(reinterpret_cast<const uint32_t *>(indices.data()), indices.size());
+    cbindgen_private::Slice<uintptr_t (*)(int32_t)> plural_rules_slice =
+            make_slice(reinterpret_cast<uintptr_t (*const *)(int32_t)>(plural_rules.data()),
+                       plural_rules.size());
     cbindgen_private::slint_translate_from_bundle_with_plural(
             strs_slice, indices_slice, plural_rules_slice, arguments, n, &result);
     return result;
 }
 
+template<typename Component>
+inline float get_resolved_default_font_size(const Component &component)
+{
+    ItemTreeRc item_tree_rc = (*component.self_weak.lock()).into_dyn();
+    return slint::cbindgen_private::slint_windowrc_resolved_default_font_size(&item_tree_rc);
+}
+
 } // namespace private_api
 
-#ifdef SLINT_FEATURE_GETTEXT
-/// Forces all the strings that are translated with `@tr(...)` to be re-evaluated.
-/// This is useful if the language is changed at runtime.
-/// The function is only available when Slint is compiled with `SLINT_FEATURE_GETTEXT`.
+// Translator API is currently considered experimental due to discussions
+// about the returned string type (SharedString vs. Cow<str> etc.). Also it
+// is not available with no_std due to the tr crate.
+// See discussion in https://github.com/slint-ui/slint/pull/10979.
+#if defined(SLINT_FEATURE_EXPERIMENTAL) && !defined(SLINT_FEATURE_FREESTANDING)
+/// Interface for an external translator.
+struct Translator
+{
+    /// Destroys the translator.
+    virtual ~Translator() { }
+    /// Translate a singular string. Arguments are passed as UTF-8 strings.
+    /// Slint will call this method from the thread which runs the event loop.
+    virtual SharedString translate(std::string_view string, std::string_view context) const = 0;
+    /// Translate a plural string. Arguments are passed as UTF-8 strings.
+    /// Slint will call this method from the thread which runs the event loop.
+    virtual SharedString ntranslate(uint64_t n, std::string_view singular, std::string_view plural,
+                                    std::string_view context) const = 0;
+};
+
+namespace private_api {
+
+/// Helper to dispatch calls from the Rust translator to the C++ translator.
+struct TranslatorDispatcher
+{
+    static void drop(const void *obj) { delete cast(obj); }
+
+    static void translate(const void *obj, private_api::Slice<uint8_t> string,
+                          private_api::Slice<uint8_t> context, slint::SharedString *out)
+    {
+        *out = cast(obj)->translate(private_api::slice_to_string_view(string),
+                                    private_api::slice_to_string_view(context));
+    }
+
+    static void ntranslate(const void *obj, uint64_t n, private_api::Slice<uint8_t> singular,
+                           private_api::Slice<uint8_t> plural, private_api::Slice<uint8_t> context,
+                           slint::SharedString *out)
+    {
+        *out = cast(obj)->ntranslate(n, private_api::slice_to_string_view(singular),
+                                     private_api::slice_to_string_view(plural),
+                                     private_api::slice_to_string_view(context));
+    }
+
+private:
+    static const Translator *cast(const void *obj) { return static_cast<const Translator *>(obj); }
+};
+
+} // namespace private_api
+
+/// Register a custom translator.
 ///
-/// Example
+/// Allows using a custom translation framework by implementing the
+/// `slint::Translator` interface. Passing `nullptr` will unregister any
+/// previously registered translator.
+///
+/// Returns `true` on success, `false` if no platform is available.
+///
+/// Safety & Ownership:
+/// * The ownership of the translator object is passed to Slint. It will be
+///   destroyed automatically when the program quits or when
+///   `set_external_translator()` is called the next time.
+/// * The methods on the translator object will be called from the thread
+///   which the Slint event loop is running.
+///
+/// The function is only available when Slint is compiled with
+/// `SLINT_FEATURE_EXPERIMENTAL` and without `SLINT_FEATURE_FREESTANDING`.
+///
+/// Note that this function has no effect if the `.slint` file was compiled
+/// with bundled translations.
+///
+/// Example:
+/// \code
+///     struct MyTranslator : public slint::Translator {
+///       slint::SharedString translate(std::string_view string,
+///                                     std::string_view context) const override {
+///         return slint::SharedString("Singular String");
+///       }
+///
+///       slint::SharedString ntranslate(uint64_t n,
+///                                      std::string_view singular,
+///                                      std::string_view plural,
+///                                      std::string_view context) const override {
+///         return slint::SharedString("Plural String");
+///       }
+///     };
+///
+///     slint::set_external_translator(std::make_unique<MyTranslator>());
+/// \endcode
+inline bool set_translator(std::unique_ptr<Translator> obj)
+{
+    const bool success = cbindgen_private::slint_translate_set_translator(
+            obj.get(), &private_api::TranslatorDispatcher::drop,
+            &private_api::TranslatorDispatcher::translate,
+            &private_api::TranslatorDispatcher::ntranslate);
+    if (success) {
+        obj.release(); // Ownership is moved to Rust.
+    }
+    return success;
+}
+#endif
+
+/// Forces all the strings that are translated with `@tr(...)` to be re-evaluated.
+/// Call this function after changing the language at run-time and when translating
+/// with either gettext or a custom translator. For bundled translations, there is no need
+/// to call this function.
+///
+/// Example (assuming usage of gettext):
 /// ```cpp
 ///     my_ui->global<LanguageSettings>().on_french_selected([] {
 ///        setenv("LANGUAGE", langs[l], true);
@@ -276,7 +624,6 @@ inline void update_all_translations()
 {
     cbindgen_private::slint_translations_mark_dirty();
 }
-#endif
 
 /// Select the current translation language when using bundled translations.
 /// This function requires that the application's `.slint` file was compiled with bundled
@@ -301,6 +648,33 @@ cbindgen_private::Flickable::Flickable()
 cbindgen_private::Flickable::~Flickable()
 {
     slint_flickable_data_free(&data);
+}
+
+cbindgen_private::Path::Path()
+{
+    slint_path_fitted_cache_init(&fitted_path);
+}
+cbindgen_private::Path::~Path()
+{
+    slint_path_fitted_cache_free(&fitted_path);
+}
+
+cbindgen_private::SystemTrayIcon::SystemTrayIcon()
+{
+    slint_system_tray_icon_data_init(&data);
+}
+cbindgen_private::SystemTrayIcon::~SystemTrayIcon()
+{
+    slint_system_tray_icon_data_free(&data);
+}
+
+cbindgen_private::FocusScope::FocusScope()
+{
+    slint_maybe_key_binding_list_init(&key_bindings);
+}
+cbindgen_private::FocusScope::~FocusScope()
+{
+    slint_maybe_key_binding_list_free(&key_bindings);
 }
 
 cbindgen_private::NativeStyleMetrics::NativeStyleMetrics(void *)
@@ -335,12 +709,13 @@ struct [[deprecated]] VersionCheckHelper
 /// Enum for the event loop mode parameter of the slint::run_event_loop() function.
 /// It is used to determine when the event loop quits.
 enum class EventLoopMode {
-    /// The event loop will quit when the last window is closed
-    /// or when slint::quit_event_loop() is called.
+    /// The event loop quits when the last window is closed and the last
+    /// visible system tray icon is hidden, or when slint::quit_event_loop()
+    /// is called. A visible SystemTrayIcon keeps the loop alive on its own.
     QuitOnLastWindowClosed,
 
-    /// The event loop will keep running until slint::quit_event_loop() is called,
-    /// even when all windows are closed.
+    /// The event loop keeps running until slint::quit_event_loop() is
+    /// called, even when no windows or system tray icons are visible.
     RunUntilQuit
 };
 
@@ -348,9 +723,9 @@ enum class EventLoopMode {
 /// events from the windowing system in order to render to the screen
 /// and react to user input.
 ///
-/// The mode parameter determines the behavior of the event loop when all windows are closed.
-/// By default, it is set to QuitOnLastWindowClose, which means the event loop will
-/// quit when the last window is closed.
+/// The mode parameter determines when the loop returns. The default,
+/// QuitOnLastWindowClosed, returns once the last window is closed and the
+/// last visible system tray icon is hidden.
 inline void run_event_loop(EventLoopMode mode = EventLoopMode::QuitOnLastWindowClosed)
 {
     private_api::assert_main_thread();

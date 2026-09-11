@@ -4,6 +4,8 @@
 // cSpell: ignore qstyle unshade
 
 use super::*;
+use i_slint_core::cursor::MouseCursorInner;
+use i_slint_core::graphics::euclid;
 
 #[allow(nonstandard_style)]
 #[allow(unused)]
@@ -93,7 +95,7 @@ mod standard_button {
 }
 
 use i_slint_core::{
-    input::{FocusEventResult, KeyEventType},
+    input::{FocusEventResult, InternalKeyEvent, KeyEventType},
     items::StandardButtonKind,
     platform::PointerEventButton,
 };
@@ -107,6 +109,7 @@ type ActualStandardButtonKind = Option<StandardButtonKind>;
 pub struct NativeButton {
     pub text: Property<SharedString>,
     pub icon: Property<i_slint_core::graphics::Image>,
+    pub icon_size: Property<LogicalLength>,
     pub pressed: Property<bool>,
     pub has_hover: Property<bool>,
     pub checkable: Property<bool>,
@@ -145,7 +148,7 @@ impl NativeButton {
             Some(StandardButtonKind::Abort) => "Abort".into(),
             Some(StandardButtonKind::Retry) => "Retry".into(),
             Some(StandardButtonKind::Ignore) => "Ignore".into(),
-            None => self.text().as_str().into(),
+            _ => self.text().as_str().into(),
         }
     }
 
@@ -165,8 +168,10 @@ impl NativeButton {
             Some(StandardButtonKind::Abort) => QStyle_StandardPixmap_SP_DialogAbortButton,
             Some(StandardButtonKind::Retry) => QStyle_StandardPixmap_SP_DialogRetryButton,
             Some(StandardButtonKind::Ignore) => QStyle_StandardPixmap_SP_DialogIgnoreButton,
-            None => {
-                return crate::qt_window::image_to_pixmap((&self.icon()).into(), None)
+            _ => {
+                let icon_size = self.icon_size().get().round() as u32;
+                let source_size = Some(euclid::Size2D::new(icon_size, icon_size));
+                return crate::qt_window::image_to_pixmap((&self.icon()).into(), source_size)
                     .unwrap_or_default();
             }
         };
@@ -181,36 +186,54 @@ impl NativeButton {
     }
 
     fn activate(self: Pin<&Self>) {
-        Self::FIELD_OFFSETS.pressed.apply_pin(self).set(false);
+        Self::FIELD_OFFSETS.pressed().apply_pin(self).set(false);
         if self.checkable() {
-            let checked = Self::FIELD_OFFSETS.checked.apply_pin(self);
+            let checked = Self::FIELD_OFFSETS.checked().apply_pin(self);
             checked.set(!checked.get());
         }
-        Self::FIELD_OFFSETS.clicked.apply_pin(self).call(&());
+        Self::FIELD_OFFSETS.clicked().apply_pin(self).call(&());
     }
 }
 
 impl Item for NativeButton {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {
-        let animation_tracker_property_ptr = Self::FIELD_OFFSETS.animation_tracker.apply_pin(self);
+        let animation_tracker_property_ptr =
+            Self::FIELD_OFFSETS.animation_tracker().apply_pin(self);
         self.widget_ptr.set(cpp! { unsafe [animation_tracker_property_ptr as "void*"] -> SlintTypeErasedWidgetPtr as "std::unique_ptr<SlintTypeErasedWidget>" {
             return make_unique_animated_widget<QPushButton>(animation_tracker_property_ptr);
-        }})
+        }});
+        let widget_ptr: NonNull<()> = SlintTypeErasedWidgetPtr::qwidget_ptr(&self.widget_ptr);
+        let icon_size = unsafe {
+            cpp!([widget_ptr as "QWidget*" ] -> i32 as "int"
+            {
+                ensure_initialized();
+                return qApp->style()->pixelMetric(QStyle::PM_ButtonIconSize, 0, widget_ptr);
+            })
+        };
+        Self::FIELD_OFFSETS
+            .icon_size()
+            .apply_pin(self)
+            .set(LogicalLength::new(icon_size as i_slint_core::Coord));
     }
+
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
 
     fn layout_info(
         self: Pin<&Self>,
         orientation: Orientation,
+        _cross_axis_constraint: Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> LayoutInfo {
         let standard_button_kind = self.actual_standard_button_kind();
         let mut text: qttypes::QString = self.actual_text(standard_button_kind);
         let icon: qttypes::QPixmap = self.actual_icon(standard_button_kind);
+        let icon_size = self.icon_size().get() as i32;
         let widget_ptr: NonNull<()> = SlintTypeErasedWidgetPtr::qwidget_ptr(&self.widget_ptr);
         let size = cpp!(unsafe [
             mut text as "QString",
             icon as "QPixmap",
+            icon_size as "int",
             widget_ptr as "QWidget*"
         ] -> qttypes::QSize as "QSize" {
             ensure_initialized();
@@ -220,11 +243,10 @@ impl Item for NativeButton {
             option.rect = option.fontMetrics.boundingRect(text);
             option.text = std::move(text);
             option.icon = icon;
-            auto iconSize = qApp->style()->pixelMetric(QStyle::PM_ButtonIconSize, 0, widget_ptr);
-            option.iconSize = QSize(iconSize, iconSize);
+            option.iconSize = QSize(icon_size, icon_size);
             if (!icon.isNull()) {
-                option.rect.setHeight(qMax(option.rect.height(), iconSize));
-                option.rect.setWidth(option.rect.width() + 4 + iconSize);
+                option.rect.setHeight(qMax(option.rect.height(), icon_size));
+                option.rect.setWidth(option.rect.width() + 4 + icon_size);
             }
             return qApp->style()->sizeFromContents(QStyle::CT_PushButton, &option, option.rect.size(), widget_ptr);
         });
@@ -240,8 +262,9 @@ impl Item for NativeButton {
         event: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventFilterResult {
-        Self::FIELD_OFFSETS.has_hover.apply_pin(self).set(!matches!(event, MouseEvent::Exit));
+        Self::FIELD_OFFSETS.has_hover().apply_pin(self).set(!matches!(event, MouseEvent::Exit));
         InputEventFilterResult::ForwardEvent
     }
 
@@ -250,9 +273,10 @@ impl Item for NativeButton {
         event: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         self_rc: &i_slint_core::items::ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventResult {
         if matches!(event, MouseEvent::Exit) {
-            Self::FIELD_OFFSETS.has_hover.apply_pin(self).set(false);
+            Self::FIELD_OFFSETS.has_hover().apply_pin(self).set(false);
         }
         let enabled = self.enabled();
         if !enabled {
@@ -261,7 +285,7 @@ impl Item for NativeButton {
 
         let was_pressed = self.pressed();
 
-        Self::FIELD_OFFSETS.pressed.apply_pin(self).set(match event {
+        Self::FIELD_OFFSETS.pressed().apply_pin(self).set(match event {
             MouseEvent::Pressed { button, .. } => *button == PointerEventButton::Left,
             MouseEvent::Exit | MouseEvent::Released { .. } => false,
             MouseEvent::Moved { .. } => {
@@ -269,11 +293,14 @@ impl Item for NativeButton {
                     InputEventResult::GrabMouse
                 } else {
                     InputEventResult::EventAccepted
-                }
+                };
             }
             MouseEvent::Wheel { .. } => return InputEventResult::EventIgnored,
-            MouseEvent::DragMove(..) | MouseEvent::Drop(..) => {
-                return InputEventResult::EventIgnored
+            MouseEvent::PinchGesture { .. } | MouseEvent::RotationGesture { .. } => {
+                return InputEventResult::EventIgnored;
+            }
+            MouseEvent::DragMove { .. } | MouseEvent::Drop { .. } => {
+                return InputEventResult::EventIgnored;
             }
         });
         if let MouseEvent::Released { position, .. } = event {
@@ -289,19 +316,32 @@ impl Item for NativeButton {
         }
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _event: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> KeyEventResult {
+        KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        event: &KeyEvent,
+        event: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
         match event.event_type {
-            KeyEventType::KeyPressed if event.text == " " || event.text == "\n" => {
-                Self::FIELD_OFFSETS.pressed.apply_pin(self).set(true);
+            KeyEventType::KeyPressed
+                if event.key_event.text == " " || event.key_event.text == "\n" =>
+            {
+                Self::FIELD_OFFSETS.pressed().apply_pin(self).set(true);
                 KeyEventResult::EventAccepted
             }
             KeyEventType::KeyPressed => KeyEventResult::EventIgnored,
-            KeyEventType::KeyReleased if event.text == " " || event.text == "\n" => {
+            KeyEventType::KeyReleased
+                if event.key_event.text == " " || event.key_event.text == "\n" =>
+            {
                 self.activate();
                 KeyEventResult::EventAccepted
             }
@@ -320,7 +360,7 @@ impl Item for NativeButton {
     ) -> FocusEventResult {
         if self.enabled() {
             Self::FIELD_OFFSETS
-                .has_focus
+                .has_focus()
                 .apply_pin(self)
                 .set(matches!(event, FocusEvent::FocusIn(_)));
             FocusEventResult::FocusAccepted
@@ -339,6 +379,7 @@ impl Item for NativeButton {
         let has_focus = this.has_focus();
         let has_hover = this.has_hover();
         let primary = this.primary();
+        let icon_size = this.icon_size().get().round() as i32;
         let colorize_icon = this.colorize_icon();
 
         cpp!(unsafe [
@@ -353,6 +394,7 @@ impl Item for NativeButton {
             has_focus as "bool",
             has_hover as "bool",
             primary as "bool",
+            icon_size as "int",
             colorize_icon as "bool",
             dpr as "float",
             initial_state as "int"
@@ -420,8 +462,7 @@ impl Item for NativeButton {
             } else {
                 option.icon = icon;
             }
-            auto iconSize = qApp->style()->pixelMetric(QStyle::PM_ButtonIconSize, 0, nullptr);
-            option.iconSize = QSize(iconSize, iconSize);
+            option.iconSize = QSize(icon_size, icon_size);
             option.rect = QRect(QPoint(), size / dpr);
 
             qApp->style()->drawControl(QStyle::CE_PushButton, &option, painter->get(), widget);
@@ -444,7 +485,7 @@ impl Item for NativeButton {
 
 impl ItemConsts for NativeButton {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<Self, CachedRenderingData> =
-        Self::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+        Self::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
 }
 
 declare_item_vtable! {

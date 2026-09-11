@@ -17,8 +17,9 @@ export component DatePickerPopup inherits PopupWindow {
     callback canceled();
     callback accepted(date: Date);
 
-    width: 360px;
-    height: 524px;
+    width: dialog.width;
+    height: dialog.height;
+
     close-policy: PopupClosePolicy.no-auto-close;
 
     background-layer := MenuBorder {
@@ -61,8 +62,6 @@ export component DatePickerPopup inherits PopupWindow {
                       font-weight: CupertinoFontSettings.title.font-weight,
                   },
                   title-style: {
-                      font-size: CupertinoFontSettings.body.font-size,
-                      font-weight: CupertinoFontSettings.body.font-weight,
                       foreground: CupertinoPalette.foreground,
                   },
                   previous-icon: Icons.arrow-back,
@@ -74,8 +73,6 @@ export component DatePickerPopup inherits PopupWindow {
                       foreground: CupertinoPalette.foreground,
                       state-brush: CupertinoPalette.state,
                       icon-size: 8px,
-                      font-size: CupertinoFontSettings.body.font-size,
-                      font-weight: CupertinoFontSettings.body.font-weight
                   }
             };
         }

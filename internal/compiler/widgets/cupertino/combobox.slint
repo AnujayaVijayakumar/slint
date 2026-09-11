@@ -17,6 +17,7 @@ export component ComboBox {
 
     property <brush> background: CupertinoPalette.control-background;
     property <length> popup-padding: 4px;
+    property <length> popup-scroll-y: -max(0, root.current-index - root.visible-items + 1) * CupertinoSizeSettings.item-height;
     property <int> visible-items: min(6, model.length);
 
     min-width: max(160px, layout.min-width);
@@ -98,20 +99,22 @@ export component ComboBox {
             horizontal-stretch: 1;
             horizontal-alignment: left;
             vertical-alignment: center;
-            font-size: CupertinoFontSettings.body.font-size;
-            font-weight: CupertinoFontSettings.body.font-weight;
             color: CupertinoPalette.foreground;
             text: root.current-value;
+            overflow: elide;
             accessible-role: none;
         }
 
-        VerticalLayout {
-            alignment: center;
+        Rectangle {
+            min-width: 16px;
+            preferred-width: button-layout.preferred-width;
+            min-height: 16px;
+            horizontal-stretch: 0;
 
             Rectangle {
-                horizontal-stretch: 0;
-                min-width: 16px;
-                min-height: max(self.min-width, button-layout.min-height);
+                x: 0px;
+                width: 100%;
+                y: (parent.height - self.height) / 2;
 
                 if root.enabled : Rectangle {
                     width: 100%;
@@ -172,6 +175,7 @@ export component ComboBox {
         y: parent.height + 6px;
         width: root.width;
         height: root.visible-items * CupertinoSizeSettings.item-height  + 2 * root.popup-padding;
+        close-policy: close-on-click-outside;
         forward-focus: inner-fs;
 
         inner-fs := FocusScope {
@@ -184,6 +188,7 @@ export component ComboBox {
 
             MenuBorder {
                 ScrollView {
+                    content-y: root.popup-scroll-y;
                     VerticalLayout {
                         alignment: start;
                         padding: root.popup-padding;
@@ -200,6 +205,7 @@ export component ComboBox {
                             touch-area := TouchArea {
                                 clicked => {
                                     base.select(index);
+                                    popup.close();
                                 }
                             }
                         }

@@ -7,12 +7,12 @@ use i_slint_compiler::expression_tree::Expression;
 use i_slint_compiler::langtype::{Function, Type};
 use i_slint_compiler::object_tree::PropertyVisibility;
 use i_slint_compiler::typeloader::TypeLoader;
-use i_slint_compiler::typeregister::TypeRegister;
 use smol_str::{SmolStr, ToSmolStr};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(PartialEq, Debug)]
 struct PropertyInfo {
@@ -24,10 +24,10 @@ struct PropertyInfo {
 impl Display for PropertyInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}{:?}", self.ty, if self.pure { "pure-" } else { "" }, self.vis)?;
-        if let Type::Callback(cb) = &self.ty {
-            if !cb.arg_names.is_empty() {
-                write!(f, "{:?}", cb.arg_names)?
-            }
+        if let Type::Callback(cb) = &self.ty
+            && !cb.arg_names.is_empty()
+        {
+            write!(f, "{:?}", cb.arg_names)?
         }
         Ok(())
     }
@@ -66,19 +66,19 @@ fn load_component(component: &Rc<i_slint_compiler::object_tree::Component>) -> C
                 }),
         );
 
-        if result.accessible_role.is_none() {
-            if let Some(role) = elem.borrow().bindings.get("accessible-role") {
-                match &role.borrow().expression {
-                    Expression::Invalid => (),
-                    Expression::EnumerationValue(e) => {
-                        result.accessible_role = Some(e.enumeration.values[e.value].to_string())
-                    }
-                    e => panic!(
-                        "accessible-role not an EnumerationValue : {e:?}    (for {:?})",
-                        role.borrow().span
-                    ),
-                };
-            }
+        if result.accessible_role.is_none()
+            && let Some(role) = elem.borrow().binding("accessible-role")
+        {
+            match role.expression.ignore_debug_hooks() {
+                Expression::Invalid => (),
+                Expression::EnumerationValue(e) => {
+                    result.accessible_role = Some(e.enumeration.values[e.value].to_string())
+                }
+                e => panic!(
+                    "accessible-role not an EnumerationValue : {e:?}    (for {:?})",
+                    role.span
+                ),
+            };
         }
 
         let e = match &elem.borrow().base_type {
@@ -104,10 +104,10 @@ fn load_component(component: &Rc<i_slint_compiler::object_tree::Component>) -> C
                     result.properties.insert(
                         "focus".into(),
                         PropertyInfo {
-                            ty: Type::Function(Rc::new(Function {
+                            ty: Type::Function(Arc::new(Function {
                                 return_type: Type::Void,
-                                args: vec![],
-                                arg_names: vec![],
+                                args: Vec::new(),
+                                arg_names: Vec::new(),
                             })),
                             vis: PropertyVisibility::Public,
                             pure: false,
@@ -116,10 +116,10 @@ fn load_component(component: &Rc<i_slint_compiler::object_tree::Component>) -> C
                     result.properties.insert(
                         "clear-focus".into(),
                         PropertyInfo {
-                            ty: Type::Function(Rc::new(Function {
+                            ty: Type::Function(Arc::new(Function {
                                 return_type: Type::Void,
-                                args: vec![],
-                                arg_names: vec![],
+                                args: Vec::new(),
+                                arg_names: Vec::new(),
                             })),
                             vis: PropertyVisibility::Public,
                             pure: false,
@@ -131,6 +131,7 @@ fn load_component(component: &Rc<i_slint_compiler::object_tree::Component>) -> C
             i_slint_compiler::langtype::ElementType::Native(_) => unreachable!(),
             i_slint_compiler::langtype::ElementType::Error => unreachable!(),
             i_slint_compiler::langtype::ElementType::Global => break,
+            i_slint_compiler::langtype::ElementType::Interface => break,
         };
         elem = e;
     }
@@ -143,7 +144,7 @@ fn load_style(style_name: String) -> Style {
     );
     config.style = Some(style_name);
     let mut diag = i_slint_compiler::diagnostics::BuildDiagnostics::default();
-    let mut loader = TypeLoader::new(TypeRegister::builtin(), config, &mut diag);
+    let mut loader = TypeLoader::new(config, &mut diag);
     // ensure that the style is loaded
     spin_on::spin_on(loader.import_component("std-widgets.slint", "Button", &mut diag));
 
@@ -202,7 +203,9 @@ fn compare_styles(base: &Style, mut other: Style, style_name: &str) -> bool {
             for (prop_name, p1) in c1.properties.iter() {
                 if let Some(p2) = c2.properties.remove(prop_name) {
                     if p1 != &p2 {
-                        eprintln!("Mismatch property info '{compo_name}::{prop_name}' in {style_name} : {p1} != {p2}",);
+                        eprintln!(
+                            "Mismatch property info '{compo_name}::{prop_name}' in {style_name} : {p1} != {p2}",
+                        );
                         ok = false;
                     }
                 } else if !ignore_extra {

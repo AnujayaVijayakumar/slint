@@ -9,7 +9,7 @@
 #    warning "slint-interpreter.h API only available when SLINT_FEATURE_INTERPRETER is activated"
 #else
 
-#    include "slint_interpreter_internal.h"
+#    include "private/slint_interpreter_internal.h"
 
 #    include <optional>
 
@@ -19,14 +19,14 @@ class QWidget;
 
 namespace slint::cbindgen_private {
 //  This has to stay opaque, but VRc don't compile if it is just forward declared
-struct ErasedItemTreeBox : vtable::Dyn
+struct Instance : vtable::Dyn
 {
-    ~ErasedItemTreeBox() = delete;
-    ErasedItemTreeBox() = delete;
-    ErasedItemTreeBox(ErasedItemTreeBox &) = delete;
+    ~Instance() = delete;
+    Instance() = delete;
+    Instance(Instance &) = delete;
 };
 }
-namespace slint::private_api::live_reload {
+namespace slint::private_api::live_preview {
 class LiveReloadingComponent;
 class LiveReloadModelWrapperBase;
 }
@@ -396,12 +396,13 @@ public:
     }
 
 private:
-    inline Value(const void *) = delete; // Avoid that for example Value("foo") turns to Value(bool)
+    inline Value(const void *) =
+            SLINT_DELETED_FUNCTION("pointers would otherwise implicitly convert to Value(bool)");
     slint::cbindgen_private::Value *inner;
     friend struct Struct;
     friend class ComponentInstance;
-    friend class slint::private_api::live_reload::LiveReloadingComponent;
-    friend class slint::private_api::live_reload::LiveReloadModelWrapperBase;
+    friend class slint::private_api::live_preview::LiveReloadingComponent;
+    friend class slint::private_api::live_preview::LiveReloadModelWrapperBase;
     // Internal constructor that takes ownership of the value
     explicit Value(slint::cbindgen_private::Value *&&inner) : inner(inner) { }
 };
@@ -479,6 +480,19 @@ inline Value::Value(const std::shared_ptr<slint::Model<Value>> &model)
         Value v(std::move(value));
         reinterpret_cast<ModelWrapper *>(self.instance)->model->set_row_data(int(row), v);
     };
+    auto push_row = [](VRef<ModelAdaptorVTable> self,
+                       slint::cbindgen_private::Value *value) -> bool {
+        Value v(std::move(value));
+        return reinterpret_cast<ModelWrapper *>(self.instance)->model->push_row(v);
+    };
+    auto remove_row = [](VRef<ModelAdaptorVTable> self, uintptr_t row) -> bool {
+        return reinterpret_cast<ModelWrapper *>(self.instance)->model->remove_row(int(row));
+    };
+    auto insert_row = [](VRef<ModelAdaptorVTable> self, uintptr_t row,
+                         slint::cbindgen_private::Value *value) -> bool {
+        Value v(std::move(value));
+        return reinterpret_cast<ModelWrapper *>(self.instance)->model->insert_row(int(row), v);
+    };
     auto get_notify =
             [](VRef<ModelAdaptorVTable> self) -> const cbindgen_private::ModelNotifyOpaque * {
         return &reinterpret_cast<ModelWrapper *>(self.instance)->notify;
@@ -487,7 +501,8 @@ inline Value::Value(const std::shared_ptr<slint::Model<Value>> &model)
         reinterpret_cast<ModelWrapper *>(self.instance)->self = nullptr;
     };
 
-    static const ModelAdaptorVTable vt { row_count, row_data, set_row_data, get_notify, drop };
+    static const ModelAdaptorVTable vt { row_count,  row_data,   set_row_data, push_row,
+                                         remove_row, insert_row, get_notify,   drop };
     inner = cbindgen_private::slint_interpreter_value_new_model(
             reinterpret_cast<uint8_t *>(wrapper.get()), &vt);
 }
@@ -500,10 +515,7 @@ inline Struct::Struct(std::initializer_list<std::pair<std::string_view, Value>> 
 inline std::optional<Value> Struct::get_field(std::string_view name) const
 {
     using namespace cbindgen_private;
-    cbindgen_private::Slice<uint8_t> name_view {
-        const_cast<unsigned char *>(reinterpret_cast<const unsigned char *>(name.data())),
-        name.size()
-    };
+    cbindgen_private::Slice<uint8_t> name_view = slint::private_api::string_to_slice(name);
     if (cbindgen_private::Value *field_val =
                 cbindgen_private::slint_interpreter_struct_get_field(&inner, name_view)) {
         return Value(std::move(field_val));
@@ -513,10 +525,7 @@ inline std::optional<Value> Struct::get_field(std::string_view name) const
 }
 inline void Struct::set_field(std::string_view name, const Value &value)
 {
-    cbindgen_private::Slice<uint8_t> name_view {
-        const_cast<unsigned char *>(reinterpret_cast<const unsigned char *>(name.data())),
-        name.size()
-    };
+    cbindgen_private::Slice<uint8_t> name_view = slint::private_api::string_to_slice(name);
     cbindgen_private::slint_interpreter_struct_set_field(&inner, name_view, value.inner);
 }
 
@@ -562,11 +571,11 @@ class ComponentInstance : vtable::Dyn
     ComponentInstance &operator=(ComponentInstance &) = delete;
     friend class ComponentDefinition;
 
-    // ComponentHandle<ComponentInstance>  is in fact a VRc<ItemTreeVTable, ErasedItemTreeBox>
-    const cbindgen_private::ErasedItemTreeBox *inner() const
+    // ComponentHandle<ComponentInstance> is in fact a VRc<ItemTreeVTable, Instance>
+    const cbindgen_private::Instance *inner() const
     {
         slint::private_api::assert_main_thread();
-        return reinterpret_cast<const cbindgen_private::ErasedItemTreeBox *>(this);
+        return reinterpret_cast<const cbindgen_private::Instance *>(this);
     }
 
 public:
@@ -587,7 +596,7 @@ public:
     /// Returns the Window associated with this component. The window API can be used
     /// to control different aspects of the integration into the windowing system,
     /// such as the position on the screen.
-    const slint::Window &window()
+    const slint::Window &window() const
     {
         const cbindgen_private::WindowAdapterRcOpaque *win_ptr = nullptr;
         cbindgen_private::slint_interpreter_component_instance_window(inner(), &win_ptr);
@@ -661,11 +670,8 @@ public:
     std::optional<Value> invoke(std::string_view name, std::span<const Value> args) const
     {
         using namespace cbindgen_private;
-        Slice<Box<cbindgen_private::Value>> args_view {
-            const_cast<Box<cbindgen_private::Value> *>(
-                    reinterpret_cast<const Box<cbindgen_private::Value> *>(args.data())),
-            args.size()
-        };
+        Slice<Box<cbindgen_private::Value>> args_view = slint::private_api::make_slice(
+                reinterpret_cast<const Box<cbindgen_private::Value> *>(args.data()), args.size());
         if (cbindgen_private::Value *rval_inner = slint_interpreter_component_instance_invoke(
                     inner(), slint::private_api::string_to_slice(name), args_view)) {
             return Value(std::move(rval_inner));
@@ -796,12 +802,11 @@ public:
                                        std::span<const Value> args) const
     {
         using namespace cbindgen_private;
-        Slice<cbindgen_private::Box<cbindgen_private::Value>> args_view {
-            const_cast<cbindgen_private::Box<cbindgen_private::Value> *>(
-                    reinterpret_cast<const cbindgen_private::Box<cbindgen_private::Value> *>(
-                            args.data())),
-            args.size()
-        };
+        Slice<cbindgen_private::Box<cbindgen_private::Value>> args_view =
+                slint::private_api::make_slice(
+                        reinterpret_cast<const cbindgen_private::Box<cbindgen_private::Value> *>(
+                                args.data()),
+                        args.size());
         if (cbindgen_private::Value *rval_inner =
                     slint_interpreter_component_instance_invoke_global(
                             inner(), slint::private_api::string_to_slice(global),
@@ -1075,19 +1080,6 @@ public:
         }
     }
 };
-}
-
-namespace slint::private_api::testing {
-/// Send a key events to the given component instance
-inline void send_keyboard_string_sequence(const slint::interpreter::ComponentInstance *component,
-                                          const slint::SharedString &str)
-{
-    const cbindgen_private::WindowAdapterRcOpaque *win_ptr = nullptr;
-    cbindgen_private::slint_interpreter_component_instance_window(
-            reinterpret_cast<const cbindgen_private::ErasedItemTreeBox *>(component), &win_ptr);
-    cbindgen_private::send_keyboard_string_sequence(
-            &str, reinterpret_cast<const cbindgen_private::WindowAdapterRc *>(win_ptr));
-}
 }
 
 #endif

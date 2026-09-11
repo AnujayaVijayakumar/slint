@@ -1,11 +1,16 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore uncallable
+
 //! This pass follows the forward-focus property on the root element to determine the initial focus item
 //! as well as handle the forward for `focus()` calls in code.
 
+#![allow(clippy::mutable_key_type)] // Element/NamedReference keys rely on Rc<RefCell<...>> identity semantics
+
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::diagnostics::{BuildDiagnostics, SourceLocation, Spanned};
 use crate::expression_tree::{BuiltinFunction, Callable, Expression};
@@ -76,14 +81,13 @@ impl<'a> LocalFocusForwards<'a> {
         let mut forwards = HashMap::new();
 
         recurse_elem_no_borrow(&component.root_element, &(), &mut |elem, _| {
-            let Some(forward_focus_binding) =
-                elem.borrow_mut().bindings.remove("forward-focus").map(RefCell::into_inner)
+            let Some(forward_focus_binding) = elem.borrow_mut().take_binding("forward-focus")
             else {
                 return;
             };
 
             let Expression::ElementReference(focus_target) =
-                super::ignore_debug_hooks(&forward_focus_binding.expression)
+                forward_focus_binding.expression.ignore_debug_hooks()
             else {
                 // resolve expressions pass has produced type errors
                 debug_assert!(diag.has_errors());
@@ -220,20 +224,18 @@ impl<'a> LocalFocusForwards<'a> {
                     elem.borrow_mut().property_declarations.insert(
                         function.name().into(),
                         PropertyDeclaration {
-                            property_type: Type::Function(Rc::new(Function {
-                                return_type: Type::Void.into(),
-                                args: vec![],
-                                arg_names: vec![],
+                            property_type: Type::Function(Arc::new(Function {
+                                return_type: Type::Void,
+                                args: Vec::new(),
+                                arg_names: Vec::new(),
                             })),
                             visibility: PropertyVisibility::Public,
                             pure: Some(false),
                             ..Default::default()
                         },
                     );
-                    elem.borrow_mut().bindings.insert(
-                        function.name().into(),
-                        RefCell::new(set_or_clear_focus_code.into()),
-                    );
+                    elem.borrow_mut()
+                        .set_binding(function.name().into(), set_or_clear_focus_code.into());
                 }
             }
         }
@@ -289,7 +291,7 @@ fn call_set_focus_function(
                 element,
                 SmolStr::new_static(function_name),
             )),
-            arguments: vec![],
+            arguments: Vec::new(),
             source_location: source_location.cloned(),
         })
     } else if builtin_focus_function {

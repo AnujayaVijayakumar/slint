@@ -30,6 +30,7 @@ use super::prelude::*;
 /// array[index]
 /// {object:42}
 /// "foo".bar.something().something.xx({a: 1.foo}.a)
+/// (x) => x > 0
 /// ```
 pub fn parse_expression(p: &mut impl Parser) -> bool {
     p.peek(); // consume the whitespace so they aren't part of the Expression node
@@ -75,9 +76,16 @@ fn parse_expression_helper(p: &mut impl Parser, precedence: OperatorPrecedence) 
         }
         SyntaxKind::ColorLiteral => p.consume(),
         SyntaxKind::LParent => {
-            p.consume();
-            parse_expression(&mut *p);
-            p.expect(SyntaxKind::RParent);
+            if p.nth(1).kind() == SyntaxKind::Identifier
+                && p.nth(2).kind() == SyntaxKind::RParent
+                && p.nth(3).kind() == SyntaxKind::FatArrow
+            {
+                parse_closure(&mut *p);
+            } else {
+                p.consume();
+                parse_expression(&mut *p);
+                p.expect(SyntaxKind::RParent);
+            }
         }
         SyntaxKind::LBracket => parse_array(&mut *p),
         SyntaxKind::LBrace => parse_object_notation(&mut *p),
@@ -104,7 +112,10 @@ fn parse_expression_helper(p: &mut impl Parser, precedence: OperatorPrecedence) 
                 let mut p = p.start_node_at(checkpoint.clone(), SyntaxKind::MemberAccess);
                 p.consume(); // '.'
                 if possible_range && p.peek().kind() == SyntaxKind::NumberLiteral {
-                    let error = format!("Parse error. Range expressions are not supported in Slint. You can use an integer as a model to repeat something multiple time. Eg: `for i in {} : ...`", p.peek().as_str());
+                    let error = format!(
+                        "Parse error. Range expressions are not supported in Slint. You can use an integer as a model to repeat something multiple time. Eg: `for i in {} : ...`",
+                        p.peek().as_str()
+                    );
                     p.error(error);
                     p.consume();
                     return false;
@@ -229,8 +240,32 @@ fn parse_expression_helper(p: &mut impl Parser, precedence: OperatorPrecedence) 
 
 #[cfg_attr(test, parser_test)]
 /// ```test
+/// (x) => x > 0
+/// (y) => y == 42
+/// (z) => true
+/// ```
+fn parse_closure(p: &mut impl Parser) {
+    let mut p = p.start_node(SyntaxKind::Closure);
+
+    p.expect(SyntaxKind::LParent);
+
+    {
+        let mut p = p.start_node(SyntaxKind::DeclaredIdentifier);
+        p.expect(SyntaxKind::Identifier);
+    }
+
+    p.expect(SyntaxKind::RParent);
+
+    p.expect(SyntaxKind::FatArrow);
+
+    parse_expression(&mut *p);
+}
+
+#[cfg_attr(test, parser_test)]
+/// ```test
 /// @image-url("/foo/bar.png")
 /// @linear-gradient(0deg, blue, red)
+/// @conic-gradient(blue 0deg, red 180deg)
 /// @tr("foo", bar)
 /// ```
 fn parse_at_keyword(p: &mut impl Parser) {
@@ -245,13 +280,22 @@ fn parse_at_keyword(p: &mut impl Parser) {
         "radial-gradient" | "radial_gradient" => {
             parse_gradient(p);
         }
+        "conic-gradient" | "conic_gradient" => {
+            parse_gradient(p);
+        }
         "tr" => {
             parse_tr(p);
+        }
+        "markdown" => {
+            parse_markdown(p);
+        }
+        "keys" => {
+            parse_keys(p);
         }
         _ => {
             p.consume();
             p.test(SyntaxKind::Identifier); // consume the identifier, so that autocomplete works
-            p.error("Expected 'image-url', 'tr', 'linear-gradient' or 'radial-gradient' after '@'");
+            p.error("Expected 'image-url', 'tr', 'keys', 'markdown' 'conic-gradient', 'linear-gradient', or 'radial-gradient' after '@'");
         }
     }
 }
@@ -326,17 +370,13 @@ fn parse_function_arguments(p: &mut impl Parser) {
 fn parse_template_string(p: &mut impl Parser) {
     let mut p = p.start_node(SyntaxKind::StringTemplate);
     debug_assert!(p.nth(0).as_str().ends_with("\\{"));
-    {
-        let mut p = p.start_node(SyntaxKind::Expression);
-        p.expect(SyntaxKind::StringLiteral);
-    }
+    p.expect(SyntaxKind::StringLiteral);
     loop {
         parse_expression(&mut *p);
         let peek = p.peek();
         if peek.kind != SyntaxKind::StringLiteral || !peek.as_str().starts_with('}') {
             p.error("Error while parsing string template")
         }
-        let mut p = p.start_node(SyntaxKind::Expression);
         let cont = peek.as_str().ends_with('{');
         p.consume();
         if !cont {
@@ -353,6 +393,10 @@ fn parse_template_string(p: &mut impl Parser) {
 /// @linear-gradient(217deg, rgba(255,0,0,0.8), rgba(255,0,0,0) 70.71%)
 /// @linear_gradient(217deg, rgba(255,0,0,0.8), rgba(255,0,0,0) 70.71%)
 /// @radial-gradient(circle, #e66465, blue 50%, #9198e5)
+/// @conic-gradient(#e66465 0deg, #9198e5 180deg, #e66465 360deg)
+/// @conic-gradient(red 0deg, green 120deg, blue 240deg, red 360deg)
+/// @conic-gradient(#fff 0turn, #000 0.5turn, #fff 1turn)
+/// @conic_gradient(red 0rad, blue 3.14159rad, red 6.28318rad)
 /// ```
 fn parse_gradient(p: &mut impl Parser) {
     let mut p = p.start_node(SyntaxKind::AtGradient);
@@ -425,6 +469,246 @@ fn parse_tr(p: &mut impl Parser) {
         }
     }
     p.expect(SyntaxKind::RParent);
+}
+
+/// ```test,AtTr
+/// @markdown("foo")
+/// @markdown("foo\{bar(42)} xx")
+/// @markdown("foo\n" "bar")
+/// ```
+fn parse_markdown(p: &mut impl Parser) {
+    let mut p = p.start_node(SyntaxKind::AtMarkdown);
+    p.expect(SyntaxKind::At);
+    debug_assert!(p.peek().as_str().ends_with("markdown"));
+    p.expect(SyntaxKind::Identifier); //eg "markdown"
+    p.expect(SyntaxKind::LParent);
+
+    let mut has_content = false;
+    loop {
+        let peek = p.peek();
+        if peek.kind() != SyntaxKind::StringLiteral {
+            break;
+        }
+        if peek.as_str().ends_with('{') {
+            parse_template_string(&mut *p)
+        } else {
+            p.consume()
+        }
+        has_content = true;
+    }
+
+    if !has_content {
+        p.error("Expected string literal");
+        p.until(SyntaxKind::RParent);
+        return;
+    }
+
+    if !p.expect(SyntaxKind::RParent) {
+        p.until(SyntaxKind::RParent);
+    }
+}
+
+#[cfg_attr(test, parser_test)]
+/// ```test,AtKeys
+/// @keys()
+/// @keys("x")
+/// @keys(Control +Shift + Alt+Meta+"A")
+/// @keys(Control +Shift + Alt+Meta+Return)
+/// @keys(Control +Shift? + Alt+Meta+Return)
+/// @keys(Control +Shift + Alt?+Meta+Return)
+/// ```
+fn parse_keys(p: &mut impl Parser) {
+    let mut p = p.start_node(SyntaxKind::AtKeys);
+    p.expect(SyntaxKind::At);
+    debug_assert_eq!(p.peek().as_str(), "keys");
+    p.expect(SyntaxKind::Identifier); //"keys"
+    p.expect(SyntaxKind::LParent);
+
+    // Parse custom syntax here...
+    let mut key_count = 0_u32;
+
+    let mut alt_count = 0_u32;
+    let mut control_count = 0_u32;
+    let mut shift_count = 0_u32;
+    let mut meta_count = 0_u32;
+    let mut ignore_shift_count = 0_u32;
+    let mut ignore_alt_count = 0_u32;
+
+    #[derive(Eq, PartialEq)]
+    enum State {
+        Start,
+        NeedPlus,
+        NeedKey,
+    }
+    let mut state = State::Start;
+
+    fn bail(p: &mut crate::parser::Node<'_, impl Parser>, message: &str) {
+        p.error(message);
+        p.until(SyntaxKind::RParent);
+    }
+
+    loop {
+        match p.peek().kind() {
+            SyntaxKind::RParent => {
+                assert!(key_count <= 1);
+                // Trailing plus
+                if state == State::NeedKey {
+                    p.error("Expected another identifier or string literal");
+                } else if key_count == 0
+                    && (alt_count + control_count + shift_count + meta_count) > 0
+                {
+                    p.error("A keyboard shortcut must be empty or contain exactly one key (with modifiers)");
+                }
+                p.consume();
+                break;
+            }
+            SyntaxKind::Plus => {
+                if state == State::NeedPlus {
+                    state = State::NeedKey;
+                    p.consume();
+                } else {
+                    bail(
+                        &mut p,
+                        "Unexpected '+' in keyboard shortcut (use Plus to refer to the key)",
+                    );
+                    break;
+                }
+                continue;
+            }
+            SyntaxKind::Identifier | SyntaxKind::StringLiteral => {
+                if state == State::NeedPlus {
+                    bail(&mut p, "Expected '+' to separate parts of a keyboard shortcut");
+                    break;
+                }
+
+                let token = p.peek();
+                let mut consume_count = 1;
+                // Modifiers must be identifiers, not string literals
+                if token.kind() == SyntaxKind::Identifier {
+                    let text = token.as_str();
+
+                    let mut try_consume_question = || -> bool {
+                        let next_token = p.nth(1);
+                        if next_token.kind() == SyntaxKind::Question {
+                            consume_count += 1;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+
+                    match text {
+                        "Ctrl" => {
+                            bail(&mut p, "Ctrl is not in the Key namespace (Use Control instead)");
+                            break;
+                        }
+                        "Control" => control_count += 1,
+                        "Meta" => meta_count += 1,
+                        "Alt" => {
+                            if try_consume_question() {
+                                ignore_alt_count += 1;
+                            } else {
+                                alt_count += 1
+                            }
+                        }
+                        "Shift" => {
+                            if try_consume_question() {
+                                ignore_shift_count += 1;
+                            } else {
+                                shift_count += 1;
+                            }
+                        }
+                        "AltR" | "ShiftR" | "MetaR" | "ControlR" => {
+                            bail(&mut p, "Right-side modifiers are not supported");
+                            break;
+                        }
+                        "AltGr" => {
+                            bail(&mut p, "AltGr cannot be used as a modifier");
+                            break;
+                        }
+                        "Command" | "Cmd" => {
+                            bail(
+                                &mut p,
+                                // \x20 equals to a space (needed to avoid the trailing \ eating
+                                // the indentation)
+                                &format!(
+                                    "{text} is not a cross-platform modifier\n\
+                                    Use cross-platform modifier names instead:\n\
+                                    \x20   ⌘ command -> Control\n\
+                                    \x20   ⌥ option -> Alt\n\
+                                    \x20   ^ control -> Meta\n\
+                                    \x20   ⇧ shift -> Shift"
+                                ),
+                            );
+                            break;
+                        }
+                        "Win" | "Windows" => {
+                            bail(
+                                &mut p,
+                                &format!(
+                                    "{text} is not a cross-platform modifier (Use `Meta` instead)"
+                                ),
+                            );
+                            break;
+                        }
+                        _ => key_count += 1,
+                    }
+                } else {
+                    key_count += 1;
+                }
+
+                state = State::NeedPlus;
+
+                if [
+                    alt_count,
+                    control_count,
+                    meta_count,
+                    shift_count,
+                    ignore_shift_count,
+                    ignore_alt_count,
+                ]
+                .into_iter()
+                .max()
+                .unwrap_or_default()
+                    > 1
+                {
+                    bail(&mut p, "Duplicated modifier in keyboard shortcut");
+                    break;
+                }
+                if shift_count > 0 && ignore_shift_count > 0 {
+                    bail(&mut p, "Cannot use both Shift and Shift? (remove one of them)");
+                    break;
+                }
+                if alt_count > 0 && ignore_alt_count > 0 {
+                    bail(&mut p, "Cannot use both Alt and Alt? (remove one of them)");
+                    break;
+                }
+                if key_count > 1 {
+                    bail(&mut p, "A keyboard shortcut can only contain one key (with modifiers)");
+                    break;
+                }
+
+                for _ in 0..consume_count {
+                    p.consume();
+                }
+                continue;
+            }
+            _ => {
+                let hint = if state == State::NeedKey {
+                    format!("\n(Consider using \"{}\")", p.peek().as_str())
+                } else {
+                    "".into()
+                };
+                bail(
+                    &mut p,
+                    &format!(
+                        "Expected '+', a string literal, or an identifier in the Keys namespace{hint}"
+                    ),
+                );
+                break;
+            }
+        }
+    }
 }
 
 #[cfg_attr(test, parser_test)]

@@ -17,6 +17,9 @@ export component TimePickerPopup inherits PopupWindow {
     callback canceled();
     callback accepted(/* current-time */ Time);
 
+    width: dialog.width;
+    height: dialog.height;
+
     close-policy: PopupClosePolicy.no-auto-close;
 
     background-layer := Rectangle {
@@ -51,8 +54,8 @@ export component TimePickerPopup inherits PopupWindow {
                     foreground: MaterialPalette.foreground,
                     foreground-selected: MaterialPalette.foreground,
                     border-radius: 8px,
-                    font-size: 57 * 0.0625rem,
-                    font-weight: 400
+                    font-size: 57pt * 1rem / 16pt,
+                    font-weight: FontWeight.normal
                 },
                 period-selector-style: {
                     border-radius: 8px,

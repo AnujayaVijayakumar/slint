@@ -9,7 +9,8 @@ in particular the `BackendSelector` type.
 */
 
 use alloc::boxed::Box;
-use alloc::{format, string::String};
+use alloc::format;
+use alloc::string::{String, ToString};
 
 use i_slint_core::api::PlatformError;
 use i_slint_core::graphics::{RequestedGraphicsAPI, RequestedOpenGLVersion};
@@ -44,6 +45,11 @@ pub struct BackendSelector {
     >,
     #[cfg(feature = "unstable-winit-030")]
     winit_event_loop_builder: Option<i_slint_backend_winit::EventLoopBuilder>,
+    #[cfg(feature = "unstable-winit-030")]
+    winit_custom_application_handler:
+        Option<Box<dyn i_slint_backend_winit::CustomApplicationHandler>>,
+    #[cfg(all(target_os = "linux", feature = "unstable-libinput-09"))]
+    libinput_event_hook: Option<Box<dyn Fn(&input::Event) -> bool>>,
 }
 
 impl BackendSelector {
@@ -110,17 +116,35 @@ impl BackendSelector {
     /// Adds the requirement to the selector that the backend must render using [WGPU](http://wgpu.rs).
     /// Use this when you integrate other WGPU-based renderers with a Slint UI.
     ///
-    /// *Note*: This function is behind the [`unstable-wgpu-25` feature flag](slint:rust:slint/docs/cargo_features/#backends)
+    /// *Note*: This function is behind the [`unstable-wgpu-30` feature flag](slint:rust:slint/docs/cargo_features/#backends)
     ///         and may be removed or changed in future minor releases, as new major WGPU releases become available.
     ///
-    /// See also the [`slint::wgpu_25`](slint:rust:slint/wgpu_25) module.
-    #[cfg(feature = "unstable-wgpu-25")]
+    /// See also the [`slint::wgpu_30`](slint:rust:slint/wgpu_30) module.
+    #[cfg(feature = "unstable-wgpu-30")]
     #[must_use]
-    pub fn require_wgpu_25(
+    pub fn require_wgpu_30(
         mut self,
-        configuration: i_slint_core::graphics::wgpu_25::WGPUConfiguration,
+        configuration: i_slint_core::graphics::wgpu_30::api::WGPUConfiguration,
     ) -> Self {
-        self.requested_graphics_api = Some(RequestedGraphicsAPI::WGPU25(configuration));
+        self.requested_graphics_api = Some(RequestedGraphicsAPI::WGPU30(configuration));
+        self
+    }
+
+    #[i_slint_core_macros::slint_doc]
+    /// Adds the requirement to the selector that the backend must render using [WGPU](http://wgpu.rs).
+    /// Use this when you integrate other WGPU-based renderers with a Slint UI.
+    ///
+    /// *Note*: This function is behind the [`unstable-wgpu-29` feature flag](slint:rust:slint/docs/cargo_features/#backends)
+    ///         and may be removed or changed in future minor releases, as new major WGPU releases become available.
+    ///
+    /// See also the [`slint::wgpu_29`](slint:rust:slint/wgpu_29) module.
+    #[cfg(feature = "unstable-wgpu-29")]
+    #[must_use]
+    pub fn require_wgpu_29(
+        mut self,
+        configuration: i_slint_core::graphics::wgpu_29::api::WGPUConfiguration,
+    ) -> Self {
+        self.requested_graphics_api = Some(RequestedGraphicsAPI::WGPU29(configuration));
         self
     }
 
@@ -147,9 +171,9 @@ impl BackendSelector {
     pub fn with_winit_window_attributes_hook(
         mut self,
         hook: impl Fn(
-                i_slint_backend_winit::winit::window::WindowAttributes,
-            ) -> i_slint_backend_winit::winit::window::WindowAttributes
-            + 'static,
+            i_slint_backend_winit::winit::window::WindowAttributes,
+        ) -> i_slint_backend_winit::winit::window::WindowAttributes
+        + 'static,
     ) -> Self {
         self.winit_window_attributes_hook = Some(Box::new(hook));
         self
@@ -173,6 +197,43 @@ impl BackendSelector {
         self
     }
 
+    #[i_slint_core_macros::slint_doc]
+    /// Configures this builder to invoke the functions on the supplied application handler whenever winit wakes up the
+    /// event loop.
+    ///
+    /// *Note*: This function is behind the [`unstable-winit-030` feature flag](slint:rust:slint/docs/cargo_features/#backends)
+    ///         and may be removed or changed in future minor releases, as new major Winit releases become available.
+    ///
+    /// See also the [`slint::winit_030`](slint:rust:slint/winit_030) module
+    #[must_use]
+    #[cfg(feature = "unstable-winit-030")]
+    pub fn with_winit_custom_application_handler(
+        mut self,
+        custom_application_handler: impl i_slint_backend_winit::CustomApplicationHandler + 'static,
+    ) -> Self {
+        self.winit_custom_application_handler = Some(Box::new(custom_application_handler));
+        self
+    }
+
+    #[i_slint_core_macros::slint_doc]
+    /// Configures this builder to use the specified libinput event filter hook when the LinuxKMS backend
+    /// is selected.
+    ///
+    /// The provided hook is invoked for every event received. If the function returns true, the event is
+    /// not dispatched further.
+    ///
+    /// *Note*: This function is behind the [`unstable-libinput-09` feature flag](slint:rust:slint/docs/cargo_features/#backends)
+    ///         and may be removed or changed in future minor releases, as new major Winit releases become available.
+    #[must_use]
+    #[cfg(all(target_os = "linux", feature = "unstable-libinput-09"))]
+    pub fn with_libinput_event_hook(
+        mut self,
+        event_hook: impl Fn(&input::Event) -> bool + 'static,
+    ) -> Self {
+        self.libinput_event_hook = Some(Box::new(event_hook));
+        self
+    }
+
     /// Adds the requirement that the selected renderer must match the given name. This is
     /// equivalent to setting the `SLINT_BACKEND=name` environment variable and requires
     /// that the corresponding renderer feature is enabled. For example, to select the Skia renderer,
@@ -189,7 +250,12 @@ impl BackendSelector {
     /// enable the `backend-winit` feature and call this function with `winit` as argument.
     #[must_use]
     pub fn backend_name(mut self, name: String) -> Self {
-        self.backend = Some(name);
+        let lowercase = name.to_lowercase();
+        let (backend, renderer) = crate::parse_backend_env_var(&lowercase);
+        self.backend = Some(backend.to_string());
+        if self.renderer.is_none() && !renderer.is_empty() {
+            self.renderer = Some(renderer.to_string())
+        }
         self
     }
 
@@ -200,6 +266,7 @@ impl BackendSelector {
         self.select_internal()
     }
 
+    #[cfg(not(target_os = "android"))]
     fn select_internal(&mut self) -> Result<(), PlatformError> {
         self.selected = true;
 
@@ -208,8 +275,9 @@ impl BackendSelector {
             feature = "i-slint-backend-winit",
             feature = "i-slint-backend-linuxkms"
         ))]
-        if self.backend.is_none() || self.renderer.is_none() {
-            let backend_config = std::env::var("SLINT_BACKEND").unwrap_or_default();
+        if (self.backend.is_none() || self.renderer.is_none())
+            && let Ok(backend_config) = std::env::var("SLINT_BACKEND")
+        {
             let backend_config = backend_config.to_lowercase();
             let (backend, renderer) = super::parse_backend_env_var(backend_config.as_str());
             if !backend.is_empty() {
@@ -220,26 +288,73 @@ impl BackendSelector {
             }
         }
 
-        let backend_name = self.backend.as_deref().unwrap_or_else(|| {
-            // Only the winit backend supports graphics API requests right now, so prefer that over
-            // aborting.
-            #[cfg(feature = "i-slint-backend-winit")]
-            if self.requested_graphics_api.is_some() {
-                return "winit";
+        let backend_name = match self.backend.as_deref() {
+            Some(name) => name,
+            None => {
+                // Only the winit backend supports graphics API requests right now, so prefer that over
+                // aborting.
+                #[cfg(feature = "i-slint-backend-winit")]
+                if self.requested_graphics_api.is_some() {
+                    "winit"
+                } else {
+                    super::DEFAULT_BACKEND_NAME
+                }
+                #[cfg(not(feature = "i-slint-backend-winit"))]
+                super::DEFAULT_BACKEND_NAME
             }
-            super::DEFAULT_BACKEND_NAME
-        });
+        };
+
+        // Fail fast when wgpu rendering was required but no GPU-backed adapter
+        // is available for the requested backends. Otherwise the winit/linuxkms
+        // backends silently fall through to a non-wgpu renderer (e.g. the
+        // standalone software renderer), and the failure surfaces much later
+        // as an Unsupported error from set_rendering_notifier.
+        #[cfg(feature = "unstable-wgpu-30")]
+        if matches!(self.requested_graphics_api, Some(RequestedGraphicsAPI::WGPU30(_)))
+            && !i_slint_core::graphics::wgpu_30::any_wgpu30_adapters_with_gpu(
+                self.requested_graphics_api.clone(),
+                i_slint_core::graphics::wgpu_30::default_backends_to_avoid(),
+            )
+        {
+            return Err(
+                "WGPU 30.x rendering was required but no GPU-backed WGPU adapter is available \
+                 for the requested backends. Set SLINT_WGPU_CPU=1 to allow CPU adapters."
+                    .into(),
+            );
+        }
+        #[cfg(feature = "unstable-wgpu-29")]
+        if matches!(self.requested_graphics_api, Some(RequestedGraphicsAPI::WGPU29(_)))
+            && !i_slint_core::graphics::wgpu_29::any_wgpu29_adapters_with_gpu(
+                self.requested_graphics_api.clone(),
+                i_slint_core::graphics::wgpu_29::default_backends_to_avoid(),
+            )
+        {
+            return Err(
+                "WGPU 29.x rendering was required but no GPU-backed WGPU adapter is available \
+                 for the requested backends. Set SLINT_WGPU_CPU=1 to allow CPU adapters."
+                    .into(),
+            );
+        }
 
         let backend: Box<dyn i_slint_core::platform::Platform> = match backend_name {
             #[cfg(all(feature = "i-slint-backend-linuxkms", target_os = "linux"))]
             "linuxkms" => {
-                if self.requested_graphics_api.is_some() {
-                    return Err("The linuxkms backend does not implement renderer selection by graphics API".into());
+                let mut builder = i_slint_backend_linuxkms::BackendBuilder::default();
+
+                if let Some(api) = self.requested_graphics_api.take() {
+                    builder = builder.request_graphics_api(api);
                 }
 
-                Box::new(i_slint_backend_linuxkms::Backend::new_with_renderer_by_name(
-                    self.renderer.as_deref(),
-                )?)
+                if let Some(renderer_name) = self.renderer.as_ref() {
+                    builder = builder.with_renderer_name(renderer_name.into());
+                }
+
+                #[cfg(all(target_os = "linux", feature = "unstable-libinput-09"))]
+                if let Some(event_hook) = self.libinput_event_hook.take() {
+                    builder = builder.with_libinput_event_hook(event_hook);
+                }
+
+                Box::new(builder.build()?)
             }
             #[cfg(feature = "i-slint-backend-winit")]
             "winit" => {
@@ -264,6 +379,14 @@ impl BackendSelector {
                 #[cfg(feature = "unstable-winit-030")]
                 let builder = match self.winit_event_loop_builder.take() {
                     Some(event_loop_builder) => builder.with_event_loop_builder(event_loop_builder),
+                    None => builder,
+                };
+
+                #[cfg(feature = "unstable-winit-030")]
+                let builder = match self.winit_custom_application_handler.take() {
+                    Some(custom_application_handler) => {
+                        builder.with_custom_application_handler(custom_application_handler)
+                    }
                     None => builder,
                 };
 
@@ -292,7 +415,42 @@ impl BackendSelector {
             }
         };
 
-        i_slint_core::platform::set_platform(backend).map_err(PlatformError::SetPlatformError)
+        let result =
+            i_slint_core::platform::set_platform(backend).map_err(PlatformError::SetPlatformError);
+
+        #[cfg(any(feature = "system-testing", feature = "mcp"))]
+        if result.is_ok() {
+            super::init_testing_backends();
+        }
+
+        result
+    }
+
+    #[cfg(target_os = "android")]
+    fn select_internal(&mut self) -> Result<(), PlatformError> {
+        self.selected = true;
+        if self.backend.as_ref().is_some_and(|b| !b.starts_with("android-activity-")) {
+            return Err(
+                format!("Only the android-activity-* backend is supported on Android").into()
+            );
+        }
+        if self.renderer.as_ref().is_some_and(|r| r != "skia") {
+            return Err(format!("Only the Skia renderer is supported on Android").into());
+        }
+
+        #[cfg(feature = "backend-android-activity")]
+        {
+            i_slint_backend_android_activity::set_requested_graphics_api(
+                self.requested_graphics_api.clone(),
+            )
+        }
+        #[cfg(not(feature = "backend-android-activity"))]
+        {
+            Err(format!(
+                "The BackendSelector is only supported with the backend-android-activity backend"
+            )
+            .into())
+        }
     }
 }
 

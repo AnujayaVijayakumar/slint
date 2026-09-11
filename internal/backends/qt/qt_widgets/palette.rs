@@ -1,9 +1,9 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-// cSpell: ignore deinit
+// cSpell: ignore deinit Midlight
 
-use i_slint_core::{items::ColorScheme, Brush};
+use i_slint_core::{Brush, items::ColorScheme};
 
 use super::*;
 
@@ -92,7 +92,7 @@ impl NativePalette {
         self.background.set(Brush::from(background));
 
         let alternate_background = cpp!(unsafe[] -> u32 as "QRgb" {
-            return qApp->palette().color(QPalette::Base).rgba();
+            return qApp->palette().color(QPalette::AlternateBase).rgba();
         });
         let alternate_background = Color::from_argb_encoded(alternate_background);
         self.alternate_background.set(Brush::from(alternate_background));

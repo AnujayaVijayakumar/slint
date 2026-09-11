@@ -38,7 +38,7 @@ fn eval_expression(
 
     match expression {
         Expression::StringLiteral(s) => Value::String(s.as_str().into()),
-        Expression::NumberLiteral(n, unit) => Value::Number(unit.normalize(*n)),
+        Expression::NumberLiteral(n, _unit) => Value::Number(*n),
         Expression::BoolLiteral(b) => Value::Bool(*b),
         Expression::StructFieldAccess { base, name } => {
             if let Value::Struct(o) = eval_expression(
@@ -54,7 +54,7 @@ fn eval_expression(
         Expression::PropertyReference(source) => {
             let elem = source.element();
             let elem = elem.borrow();
-            if let Some(binding) = elem.bindings.get(source.name()) {
+            if let Some(binding) = elem.binding_cell_including_synthetic(source.name()) {
                 let binding = binding.borrow();
                 let mut ctx = EvalLocalContext {
                     recursion_count: local_context.recursion_count + 1,
@@ -80,6 +80,9 @@ fn eval_expression(
                     slint::Color::from_argb_encoded(n as u32).into()
                 }
                 (Value::Brush(brush), langtype::Type::Color) => brush.color().into(),
+                (Value::EnumerationValue(_, val), langtype::Type::String) => {
+                    Value::String(val.into())
+                }
                 (v, _) => v,
             }
         }
@@ -98,7 +101,7 @@ fn eval_expression(
             arguments,
             source_location: _,
         } => handle_builtin_function(f, arguments, local_context),
-        Expression::BinaryExpression { lhs, rhs, op } => {
+        Expression::BinaryExpression { lhs, rhs, op, .. } => {
             let lhs = eval_expression(lhs, local_context, None);
             let rhs = eval_expression(rhs, local_context, None);
 
@@ -113,11 +116,7 @@ fn eval_expression(
                 ('+', a @ Value::Struct(_), b @ Value::Struct(_)) => {
                     let a: Option<i_slint_core::layout::LayoutInfo> = a.try_into().ok();
                     let b: Option<i_slint_core::layout::LayoutInfo> = b.try_into().ok();
-                    if let (Some(a), Some(b)) = (a, b) {
-                        a.merge(&b).into()
-                    } else {
-                        Value::Void
-                    }
+                    if let (Some(a), Some(b)) = (a, b) { a.merge(&b).into() } else { Value::Void }
                 }
                 ('-', Value::Number(a), Value::Number(b)) => Value::Number(a - b),
                 ('/', Value::Number(a), Value::Number(b)) => Value::Number(a / b),
@@ -146,7 +145,7 @@ fn eval_expression(
                 (_, _) => Value::Void,
             }
         }
-        Expression::Condition { true_expr, false_expr, condition } => {
+        Expression::Condition { true_expr, false_expr, condition, .. } => {
             let condition = eval_expression(condition, local_context, None);
             if condition.try_into().unwrap_or(true) {
                 eval_expression(true_expr, local_context, field_filter)
@@ -212,6 +211,9 @@ fn eval_expression(
             expression_tree::EasingCurve::CubicBezier(a, b, c, d) => {
                 i_slint_core::animations::EasingCurve::CubicBezier([*a, *b, *c, *d])
             }
+            expression_tree::EasingCurve::Spring(a) => {
+                i_slint_core::animations::EasingCurve::Spring(*a)
+            }
         }),
         Expression::LinearGradient { angle, stops } => {
             let angle = eval_expression(angle, local_context, None);
@@ -230,17 +232,50 @@ fn eval_expression(
                 ),
             ))
         }
-        Expression::RadialGradient { stops } => Value::Brush(slint::Brush::RadialGradient(
-            i_slint_core::graphics::RadialGradientBrush::new_circle(stops.iter().map(
-                |(color, stop)| {
+        Expression::RadialGradient { stops, center, radius } => {
+            let mut gradient = i_slint_core::graphics::RadialGradientBrush::new_circle(
+                stops.iter().map(|(color, stop)| {
                     let color =
                         eval_expression(color, local_context, None).try_into().unwrap_or_default();
                     let position =
                         eval_expression(stop, local_context, None).try_into().unwrap_or_default();
                     i_slint_core::graphics::GradientStop { color, position }
-                },
-            )),
-        )),
+                }),
+            );
+            if let Some((cx, cy)) = center {
+                let cx: f32 =
+                    eval_expression(cx, local_context, None).try_into().unwrap_or_default();
+                let cy: f32 =
+                    eval_expression(cy, local_context, None).try_into().unwrap_or_default();
+                gradient = gradient.with_center(cx, cy);
+            }
+            if let Some(radius) = radius {
+                let r: f32 =
+                    eval_expression(radius, local_context, None).try_into().unwrap_or_default();
+                gradient = gradient.with_radius(r);
+            }
+            Value::Brush(slint::Brush::RadialGradient(gradient))
+        }
+        Expression::ConicGradient { from_angle, stops, center } => {
+            let mut gradient = i_slint_core::graphics::ConicGradientBrush::new(
+                eval_expression(from_angle, local_context, None).try_into().unwrap_or_default(),
+                stops.iter().map(|(color, stop)| {
+                    let color =
+                        eval_expression(color, local_context, None).try_into().unwrap_or_default();
+                    let position =
+                        eval_expression(stop, local_context, None).try_into().unwrap_or_default();
+                    i_slint_core::graphics::GradientStop { color, position }
+                }),
+            );
+            if let Some((cx, cy)) = center {
+                let cx: f32 =
+                    eval_expression(cx, local_context, None).try_into().unwrap_or_default();
+                let cy: f32 =
+                    eval_expression(cy, local_context, None).try_into().unwrap_or_default();
+                gradient = gradient.with_center(cx, cy);
+            }
+            Value::Brush(slint::Brush::ConicGradient(gradient))
+        }
         Expression::EnumerationValue(value) => {
             Value::EnumerationValue(value.enumeration.name.to_string(), value.to_string())
         }
@@ -405,6 +440,11 @@ fn handle_builtin_function(
             let precision: usize = precision.max(0) as usize;
             Value::String(i_slint_core::string::shared_string_from_number_precision(n, precision))
         }
+        BuiltinFunction::ToStringUnlocalized => {
+            let n: f64 =
+                eval_expression(&arguments[0], local_context, None).try_into().unwrap_or_default();
+            Value::String(i_slint_core::string::shared_string_from_number_unlocalized(n))
+        }
         BuiltinFunction::StringIsFloat => {
             if arguments.len() != 1 {
                 return Value::Void;
@@ -455,6 +495,24 @@ fn handle_builtin_function(
                 Value::Void
             }
         }
+        BuiltinFunction::StringReplaceAll => {
+            if arguments.len() != 3 {
+                return Value::Void;
+            }
+            if let (Value::String(s), Value::String(from), Value::String(to)) = (
+                eval_expression(&arguments[0], local_context, None),
+                eval_expression(&arguments[1], local_context, None),
+                eval_expression(&arguments[2], local_context, None),
+            ) {
+                Value::String(i_slint_core::string::shared_string_replace_all(
+                    &s,
+                    from.as_str(),
+                    to.as_str(),
+                ))
+            } else {
+                Value::Void
+            }
+        }
         BuiltinFunction::ColorRgbaStruct => {
             if arguments.len() != 1 {
                 return Value::Void;
@@ -483,6 +541,24 @@ fn handle_builtin_function(
                     ("hue".to_string(), Value::Number(color.hue.into())),
                     ("saturation".to_string(), Value::Number(color.saturation.into())),
                     ("value".to_string(), Value::Number(color.value.into())),
+                    ("alpha".to_string(), Value::Number(color.alpha.into())),
+                ])
+                .collect();
+                Value::Struct(values)
+            } else {
+                Value::Void
+            }
+        }
+        BuiltinFunction::ColorOklchStruct => {
+            if arguments.len() != 1 {
+                return Value::Void;
+            }
+            if let Value::Brush(brush) = eval_expression(&arguments[0], local_context, None) {
+                let color = brush.color().to_oklch();
+                let values = IntoIterator::into_iter([
+                    ("lightness".to_string(), Value::Number(color.lightness.into())),
+                    ("chroma".to_string(), Value::Number(color.chroma.into())),
+                    ("hue".to_string(), Value::Number(color.hue.into())),
                     ("alpha".to_string(), Value::Number(color.alpha.into())),
                 ])
                 .collect();
@@ -592,6 +668,63 @@ fn handle_builtin_function(
                 _ => Value::Void,
             }
         }
+        BuiltinFunction::ArrayPush => {
+            if arguments.len() != 2 {
+                panic!("internal error: incorrect argument count to ArrayPush")
+            }
+
+            let model = match eval_expression(&arguments[0], local_context, None) {
+                Value::Model(m) => m,
+                _ => panic!("First argument not an array: {:?}", arguments[0]),
+            };
+            let value = eval_expression(&arguments[1], local_context, None);
+
+            let _ = model.push_row(value);
+
+            Value::Void
+        }
+        BuiltinFunction::ArrayRemove => {
+            if arguments.len() != 2 {
+                panic!("internal error: incorrect argument count to ArrayRemove")
+            }
+
+            let model = match eval_expression(&arguments[0], local_context, None) {
+                Value::Model(m) => m,
+                _ => panic!("First argument not an array: {:?}", arguments[0]),
+            };
+
+            let index = match eval_expression(&arguments[1], local_context, None) {
+                Value::Number(i) => i,
+                _ => panic!("Second argument not an integer: {:?}", arguments[1]),
+            };
+
+            if let Ok(index) = usize::try_from(index as i64) {
+                let _ = model.remove_row(index);
+            }
+
+            Value::Void
+        }
+        BuiltinFunction::ArrayInsert => {
+            if arguments.len() != 3 {
+                panic!("internal error: incorrect argument count to ArrayInsert")
+            }
+
+            let model = match eval_expression(&arguments[0], local_context, None) {
+                Value::Model(m) => m,
+                _ => panic!("First argument not an array: {:?}", arguments[0]),
+            };
+            let index = match eval_expression(&arguments[1], local_context, None) {
+                Value::Number(i) => i,
+                _ => panic!("Second argument not an integer: {:?}", arguments[1]),
+            };
+
+            let value = eval_expression(&arguments[2], local_context, None);
+            if let Ok(index) = usize::try_from(index as i64) {
+                let _ = model.insert_row(index, value);
+            }
+
+            Value::Void
+        }
         BuiltinFunction::Rgb => {
             let r: i32 =
                 eval_expression(&arguments[0], local_context, None).try_into().unwrap_or_default();
@@ -619,10 +752,25 @@ fn handle_builtin_function(
             let a = (1. * a).clamp(0., 1.);
             Value::Brush(slint::Brush::SolidColor(slint::Color::from_hsva(h, s, v, a)))
         }
+        BuiltinFunction::Oklch => {
+            let l: f32 =
+                eval_expression(&arguments[0], local_context, None).try_into().unwrap_or_default();
+            let c: f32 =
+                eval_expression(&arguments[1], local_context, None).try_into().unwrap_or_default();
+            let h: f32 =
+                eval_expression(&arguments[2], local_context, None).try_into().unwrap_or_default();
+            let a: f32 =
+                eval_expression(&arguments[3], local_context, None).try_into().unwrap_or_default();
+            let l = l.clamp(0., 1.);
+            let c = c.max(0.);
+            let a = a.clamp(0., 1.);
+            Value::Brush(slint::Brush::SolidColor(slint::Color::from_oklch(l, c, h, a)))
+        }
         BuiltinFunction::ColorScheme => {
             local_context.window_adapter.as_ref().map_or(Value::Void, |win| {
-                win.internal(i_slint_core::InternalToken)
-                    .map_or(Value::Void, |x| x.color_scheme().into())
+                let inner = i_slint_core::window::WindowInner::from_pub(win.window());
+                let root = inner.component();
+                inner.context().color_scheme(Some(&root)).into()
             })
         }
         BuiltinFunction::MonthDayCount => {

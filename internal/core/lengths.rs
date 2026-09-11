@@ -16,6 +16,7 @@ pub type LogicalPoint = euclid::Point2D<Coord, LogicalPx>;
 pub type LogicalSize = euclid::Size2D<Coord, LogicalPx>;
 pub type LogicalVector = euclid::Vector2D<Coord, LogicalPx>;
 pub type LogicalBorderRadius = BorderRadius<Coord, LogicalPx>;
+pub type PhysicalBorderRadius = BorderRadius<f32, PhysicalPx>;
 pub type ItemTransform = euclid::Transform2D<f32, LogicalPx, LogicalPx>;
 
 pub type ScaleFactor = euclid::Scale<f32, LogicalPx, PhysicalPx>;
@@ -68,9 +69,11 @@ pub trait RectLengths {
     fn size_length(&self) -> Self::SizeType;
     fn width_length(&self) -> Self::LengthType;
     fn height_length(&self) -> Self::LengthType;
+    /// The typed horizontal range, unlike euclid's unitless [`euclid::Rect::x_range`].
+    fn x_length_range(&self) -> core::ops::Range<Self::LengthType>;
 }
 
-impl<T: Copy, U> RectLengths for euclid::Rect<T, U> {
+impl<T: Copy + core::ops::Add<Output = T>, U> RectLengths for euclid::Rect<T, U> {
     type LengthType = euclid::Length<T, U>;
     type SizeType = euclid::Size2D<T, U>;
     fn size_length(&self) -> Self::SizeType {
@@ -81,6 +84,9 @@ impl<T: Copy, U> RectLengths for euclid::Rect<T, U> {
     }
     fn height_length(&self) -> Self::LengthType {
         self.size_length().height_length()
+    }
+    fn x_length_range(&self) -> core::ops::Range<Self::LengthType> {
+        self.origin.x_length()..self.origin.x_length() + self.width_length()
     }
 }
 
@@ -100,4 +106,110 @@ pub fn logical_position_to_api(pos: LogicalPoint) -> crate::api::LogicalPosition
 
 pub fn logical_size_to_api(size: LogicalSize) -> crate::api::LogicalSize {
     crate::api::LogicalSize::from_euclid(size)
+}
+
+/// Four distances from the edges of a rectangle represented in the coordinate space of logical pixels.
+#[derive(Debug, Default, Copy, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(C)]
+pub struct LogicalEdges {
+    /// The top distance in logical pixels.
+    pub top: f32,
+    /// The bottom distance in logical pixels.
+    pub bottom: f32,
+    /// The left distance in logical pixels.
+    pub left: f32,
+    /// The right distance in logical pixels.
+    pub right: f32,
+}
+
+impl LogicalEdges {
+    /// Construct a new logical edges struct from the given border values, that are assumed to be
+    /// in the logical coordinate space.
+    pub const fn new(top: f32, bottom: f32, left: f32, right: f32) -> Self {
+        Self { top, bottom, left, right }
+    }
+
+    /// Converts the top edge to logical pixels.
+    #[inline]
+    pub const fn top(&self) -> LogicalLength {
+        LogicalLength::new(self.top as crate::Coord)
+    }
+    /// Converts the bottom edge to logical pixels.
+    #[inline]
+    pub const fn bottom(&self) -> LogicalLength {
+        LogicalLength::new(self.bottom as crate::Coord)
+    }
+    /// Converts the left edge to logical pixels.
+    #[inline]
+    pub const fn left(&self) -> LogicalLength {
+        LogicalLength::new(self.left as crate::Coord)
+    }
+    /// Converts the right edge to logical pixels.
+    #[inline]
+    pub const fn right(&self) -> LogicalLength {
+        LogicalLength::new(self.right as crate::Coord)
+    }
+}
+
+/// Four distances from the edges of a rectangle represented in the coordinate space of physical pixels.
+#[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PhysicalEdges {
+    /// The top edge in physical pixels.
+    pub top: i32,
+    /// The bottom edge in physical pixels.
+    pub bottom: i32,
+    /// The left edge in physical pixels.
+    pub left: i32,
+    /// The right edge in physical pixels.
+    pub right: i32,
+}
+
+impl PhysicalEdges {
+    /// Construct a new physical edges struct from the given border values, that are assumed to be
+    /// in the physical coordinate space.
+    pub const fn new(top: i32, bottom: i32, left: i32, right: i32) -> Self {
+        Self { top, bottom, left, right }
+    }
+
+    /// Convert a given logical edges to a physical edges by dividing the lengths by the
+    /// specified scale factor.
+    #[inline]
+    pub const fn to_logical(&self, scale_factor: f32) -> LogicalEdges {
+        LogicalEdges::new(
+            self.top_to_logical(scale_factor).0 as f32,
+            self.bottom_to_logical(scale_factor).0 as f32,
+            self.left_to_logical(scale_factor).0 as f32,
+            self.right_to_logical(scale_factor).0 as f32,
+        )
+    }
+
+    /// Convert the top logical edge to a physical edge by dividing the length by the
+    /// specified scale factor.
+    #[inline]
+    pub const fn top_to_logical(&self, scale_factor: f32) -> LogicalLength {
+        LogicalLength::new((self.top as f32 / scale_factor) as crate::Coord)
+    }
+
+    /// Convert the bottom logical edge to a physical edge by dividing the length by the
+    /// specified scale factor.
+    #[inline]
+    pub const fn bottom_to_logical(&self, scale_factor: f32) -> LogicalLength {
+        LogicalLength::new((self.bottom as f32 / scale_factor) as crate::Coord)
+    }
+
+    #[inline]
+    /// Convert the left logical edge to a physical edge by dividing the length by the
+    /// specified scale factor.
+    pub const fn left_to_logical(&self, scale_factor: f32) -> LogicalLength {
+        LogicalLength::new((self.left as f32 / scale_factor) as crate::Coord)
+    }
+
+    /// Convert the right logical edge to a physical edge by dividing the length by the
+    /// specified scale factor.
+    #[inline]
+    pub const fn right_to_logical(&self, scale_factor: f32) -> LogicalLength {
+        LogicalLength::new((self.right as f32 / scale_factor) as crate::Coord)
+    }
 }

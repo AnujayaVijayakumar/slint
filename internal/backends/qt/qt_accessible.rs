@@ -6,13 +6,13 @@
 use crate::accessible_generated::*;
 use crate::qt_window::QtWindow;
 
+use i_slint_core::SharedVector;
 use i_slint_core::accessibility::{
     AccessibilityAction, AccessibleStringProperty, SupportedAccessibilityAction,
 };
 use i_slint_core::item_tree::{ItemRc, ItemWeak};
 use i_slint_core::properties::{PropertyDirtyHandler, PropertyTracker};
 use i_slint_core::window::WindowInner;
-use i_slint_core::SharedVector;
 
 use cpp::*;
 use pin_project::pin_project;
@@ -163,15 +163,15 @@ impl PropertyDirtyHandler for FocusDelegationPropertyTracker {
 #[pin_project]
 pub struct SlintAccessibleItemData {
     #[pin]
-    state_tracker: PropertyTracker<AccessibleItemPropertiesTracker>,
+    state_tracker: PropertyTracker<false, AccessibleItemPropertiesTracker>,
     #[pin]
-    value_tracker: PropertyTracker<ValuePropertyTracker>,
+    value_tracker: PropertyTracker<false, ValuePropertyTracker>,
     #[pin]
-    label_tracker: PropertyTracker<LabelPropertyTracker>,
+    label_tracker: PropertyTracker<false, LabelPropertyTracker>,
     #[pin]
-    description_tracker: PropertyTracker<DescriptionPropertyTracker>,
+    description_tracker: PropertyTracker<false, DescriptionPropertyTracker>,
     #[pin]
-    focus_delegation_tracker: PropertyTracker<FocusDelegationPropertyTracker>,
+    focus_delegation_tracker: PropertyTracker<false, FocusDelegationPropertyTracker>,
     item: ItemWeak,
 }
 
@@ -214,6 +214,7 @@ impl SlintAccessibleItemData {
                 item_rc.accessible_string_property(AccessibleStringProperty::Expandable);
                 item_rc.accessible_string_property(AccessibleStringProperty::Expanded);
                 item_rc.accessible_string_property(AccessibleStringProperty::ReadOnly);
+                item_rc.accessible_string_property(AccessibleStringProperty::Orientation);
             }
         });
     }
@@ -263,7 +264,9 @@ impl SlintAccessibleItemData {
 }
 
 cpp! {{
-    #include <QtWidgets/QtWidgets>
+    // Note: Do not include <QtWidgets> to avoid inclusion of gl.h (see #10989).
+    #include <QtGui/QAccessible>
+    #include <QtWidgets/QWidget>
 
     #include <memory>
 
@@ -287,7 +290,7 @@ cpp! {{
             rustDescendents = rust!(Descendents_ctor [root_item: *mut c_void as "void*"] ->
                     SharedVector<ItemRc> as "void*" {
                 i_slint_core::accessibility::accessible_descendents(
-                        &*(root_item as *mut ItemRc))
+                        unsafe { &*(root_item as *mut ItemRc) })
                 .collect()
             });
         }
@@ -333,6 +336,17 @@ cpp! {{
                     i_slint_core::items::AccessibleRole::TabPanel => QAccessible_Role_Pane,
                     i_slint_core::items::AccessibleRole::Groupbox => QAccessible_Role_Grouping,
                     i_slint_core::items::AccessibleRole::Image => QAccessible_Role_Graphic,
+                    i_slint_core::items::AccessibleRole::RadioButton => QAccessible_Role_RadioButton,
+                    i_slint_core::items::AccessibleRole::RadioGroup => QAccessible_Role_Grouping,
+                    i_slint_core::items::AccessibleRole::WindowTitleBar => QAccessible_Role_TitleBar,
+                    i_slint_core::items::AccessibleRole::Banner => QAccessible_Role_Section,
+                    i_slint_core::items::AccessibleRole::Complementary => QAccessible_Role_ComplementaryContent,
+                    i_slint_core::items::AccessibleRole::ContentInfo => QAccessible_Role_Footer,
+                    i_slint_core::items::AccessibleRole::Form => QAccessible_Role_Form,
+                    i_slint_core::items::AccessibleRole::Main => QAccessible_Role_Grouping,
+                    i_slint_core::items::AccessibleRole::Navigation => QAccessible_Role_Grouping,
+                    i_slint_core::items::AccessibleRole::Region => QAccessible_Role_Section,
+                    i_slint_core::items::AccessibleRole::Search => QAccessible_Role_Grouping,
                     _ => QAccessible_Role_NoRole,
                 }
             });
@@ -341,7 +355,7 @@ cpp! {{
         ~Descendents() {
             auto descendentsPtr = &rustDescendents;
             rust!(Descendents_dtor [descendentsPtr: *mut SharedVector<ItemRc> as "void**"] {
-                core::ptr::read(descendentsPtr);
+                unsafe { core::ptr::read(descendentsPtr); }
             });
         }
 
@@ -352,8 +366,25 @@ cpp! {{
     void *root_item_for_window(void *rustWindow) {
         return rust!(root_item_for_window_ [rustWindow: &crate::qt_window::QtWindow as "void*"]
                 -> *mut c_void as "void*" {
-            let root_item = Box::new(ItemRc::new(WindowInner::from_pub(&rustWindow.window).component(), 0).downgrade());
+            let root_item = Box::new(ItemRc::new_root(WindowInner::from_pub(&rustWindow.window).component()).downgrade());
             Box::into_raw(root_item) as _
+        });
+    }
+
+    // Returns the orientation of the item as a Qt::Orientation value
+    // (Qt::Horizontal=1, Qt::Vertical=2), or 0 if the property is not set.
+    int item_qt_orientation(void *data) {
+        return rust!(item_qt_orientation_
+            [data: &SlintAccessibleItemData as "void*"]
+                -> i32 as "int" {
+            data.item.upgrade()
+                .and_then(|i| i.accessible_string_property(AccessibleStringProperty::Orientation))
+                .and_then(|s| s.parse::<i_slint_core::items::Orientation>().ok())
+                .map(|o| match o {
+                    i_slint_core::items::Orientation::Horizontal => 1,
+                    i_slint_core::items::Orientation::Vertical => 2,
+                })
+                .unwrap_or(0)
         });
     }
 
@@ -514,7 +545,7 @@ cpp! {{
             auto item = rustItem();
             QRectF r = rust!(Slint_accessible_item_rect
                 [item: *const ItemWeak as "void*"] -> qttypes::QRectF as "QRectF" {
-                    if let Some(item_rc) = item.as_ref().unwrap().upgrade() {
+                    if let Some(item_rc) = unsafe { item.as_ref().unwrap().upgrade() } {
                         let geometry = item_rc.geometry();
 
                         let mapped = item_rc.map_to_window(geometry.origin);
@@ -559,7 +590,11 @@ cpp! {{
     // Slint_accessible_item:
     // ------------------------------------------------------------------------------
 
-    class Slint_accessible_item : public Slint_accessible, public QAccessibleValueInterface, public QAccessibleActionInterface {
+    class Slint_accessible_item : public Slint_accessible, public QAccessibleValueInterface, public QAccessibleActionInterface
+#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
+        , public QAccessibleAttributesInterface
+#endif
+    {
     public:
         Slint_accessible_item(void *item, QObject *obj, QAccessible::Role role, QAccessibleInterface *parent) :
             Slint_accessible(role, parent), m_object(obj)
@@ -652,8 +687,34 @@ cpp! {{
             } else if (t == QAccessible::ActionInterface) {
                 return static_cast<QAccessibleActionInterface*>(this);
             }
+#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
+            else if (t == QAccessible::AttributesInterface) {
+                return static_cast<QAccessibleAttributesInterface*>(this);
+            }
+#endif
             return QAccessibleInterface::interface_cast(t);
         }
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
+        // QAccessibleAttributesInterface
+        QList<QAccessible::Attribute> attributeKeys() const override {
+            QList<QAccessible::Attribute> keys;
+            if (item_qt_orientation(m_data) != 0) {
+                keys << QAccessible::Attribute::Orientation;
+            }
+            return keys;
+        }
+
+        QVariant attributeValue(QAccessible::Attribute key) const override {
+            if (key == QAccessible::Attribute::Orientation) {
+                int o = item_qt_orientation(m_data);
+                if (o != 0) {
+                    return QVariant::fromValue(static_cast<Qt::Orientation>(o));
+                }
+            }
+            return QVariant();
+        }
+#endif
 
         // AccessibleValueInterface:
         QVariant currentValue() const override {
@@ -744,7 +805,9 @@ cpp! {{
         ~Slint_accessible_window()
         {
             rust!(Slint_accessible_window_dtor [m_rustWindow: *mut c_void as "void*"] {
-                alloc::rc::Weak::from_raw(m_rustWindow as *const QtWindow); // Consume the Weak<QtWindow> we hold in our void*!
+                unsafe {
+                    alloc::rc::Weak::from_raw(m_rustWindow as *const QtWindow); // Consume the Weak<QtWindow> we hold in our void*!
+                }
             });
         }
 

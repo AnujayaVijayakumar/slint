@@ -1,7 +1,9 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-use i_slint_core::input::FocusEventResult;
+// cSpell: ignore foac
+use i_slint_core::cursor::MouseCursorInner;
+use i_slint_core::input::{FocusEventResult, InternalKeyEvent};
 use i_slint_core::items::ScrollBarPolicy;
 
 use super::*;
@@ -25,6 +27,7 @@ pub struct NativeScrollView {
     pub has_focus: Property<bool>,
     pub vertical_scrollbar_policy: Property<ScrollBarPolicy>,
     pub horizontal_scrollbar_policy: Property<ScrollBarPolicy>,
+    pub scrolled: Callback<VoidArg>,
     data: Property<NativeSliderData>,
     widget_ptr: std::cell::Cell<SlintTypeErasedWidgetPtr>,
     animation_tracker: Property<i32>,
@@ -34,7 +37,8 @@ pub struct NativeScrollView {
 
 impl Item for NativeScrollView {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {
-        let animation_tracker_property_ptr = Self::FIELD_OFFSETS.animation_tracker.apply_pin(self);
+        let animation_tracker_property_ptr =
+            Self::FIELD_OFFSETS.animation_tracker().apply_pin(self);
         self.widget_ptr.set(cpp! { unsafe [animation_tracker_property_ptr as "void*"] -> SlintTypeErasedWidgetPtr as "std::unique_ptr<SlintTypeErasedWidget>"  {
             return make_unique_animated_widget<QWidget>(animation_tracker_property_ptr);
         }});
@@ -89,9 +93,12 @@ impl Item for NativeScrollView {
         });
     }
 
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
+
     fn layout_info(
         self: Pin<&Self>,
         orientation: Orientation,
+        _cross_axis_constraint: Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> LayoutInfo {
@@ -108,6 +115,7 @@ impl Item for NativeScrollView {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardEvent
     }
@@ -117,6 +125,7 @@ impl Item for NativeScrollView {
         event: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         self_rc: &i_slint_core::items::ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventResult {
         let size: qttypes::QSize = get_size!(self_rc);
         let mut data = self.data();
@@ -170,6 +179,7 @@ impl Item for NativeScrollView {
                     if new_control == SC_ScrollBarSlider {
                         data.pressed_x = pos as f32;
                         data.pressed_val = -value as f32;
+                        data.pressed_max = max as f32;
                     }
                     data.active_controls = new_control;
                     InputEventResult::GrabMouse
@@ -198,34 +208,60 @@ impl Item for NativeScrollView {
                                 return -value;
                         }
                     });
-                    value_prop.set(LogicalLength::new(-(new_val.min(max).max(0) as f32)));
+                    let old_val = value_prop.get();
+                    let new_val = LogicalLength::new(-(new_val.min(max).max(0) as f32));
+                    value_prop.set(new_val);
+                    if new_val != old_val {
+                        Self::FIELD_OFFSETS.scrolled().apply_pin(self).call(&());
+                    }
                     InputEventResult::EventIgnored
                 }
                 MouseEvent::Moved { .. } => {
                     if data.pressed != 0 && data.active_controls == SC_ScrollBarSlider {
                         let max = max as f32;
+
+                        // Update reference points when the size of the viewport changes to
+                        // avoid 'jumping' during scrolling.
+                        // This happens when the height estimate of a ListView changes after
+                        // new items are loaded.
+                        if data.pressed_max != max {
+                            data.pressed_x = pos as f32;
+                            data.pressed_val = -value as f32;
+                            data.pressed_max = max;
+                        }
+
                         let new_val = data.pressed_val
                             + ((pos as f32) - data.pressed_x) * (max + (page_size as f32))
                                 / size as f32;
-                        value_prop.set(LogicalLength::new(-new_val.min(max).max(0.)));
+                        let old_val = value_prop.get();
+                        let new_val = LogicalLength::new(-new_val.min(max).max(0.));
+                        value_prop.set(new_val);
+                        if new_val != old_val {
+                            Self::FIELD_OFFSETS.scrolled().apply_pin(self).call(&());
+                        }
                         InputEventResult::GrabMouse
                     } else {
                         InputEventResult::EventAccepted
                     }
                 }
                 MouseEvent::Wheel { delta_x, delta_y, .. } => {
-                    if horizontal {
-                        let max = max as f32;
-                        let new_val = value as f32 + delta_x;
-                        value_prop.set(LogicalLength::new(new_val.min(0.).max(-max)));
-                    } else {
-                        let max = max as f32;
-                        let new_val = value as f32 + delta_y;
-                        value_prop.set(LogicalLength::new(new_val.min(0.).max(-max)));
+                    let max = max as f32;
+                    let new_val =
+                        if horizontal { value as f32 + delta_x } else { value as f32 + delta_y };
+                    let old_val = value_prop.get();
+                    let new_val = LogicalLength::new(new_val.min(0.).max(-max));
+                    value_prop.set(new_val);
+                    if new_val != old_val {
+                        Self::FIELD_OFFSETS.scrolled().apply_pin(self).call(&());
                     }
                     InputEventResult::EventAccepted
                 }
-                MouseEvent::DragMove(..) | MouseEvent::Drop(..) => InputEventResult::EventIgnored,
+                MouseEvent::PinchGesture { .. } | MouseEvent::RotationGesture { .. } => {
+                    InputEventResult::EventIgnored
+                }
+                MouseEvent::DragMove { .. } | MouseEvent::Drop { .. } => {
+                    InputEventResult::EventIgnored
+                }
             };
             self.data.set(data);
             result
@@ -244,7 +280,7 @@ impl Item for NativeScrollView {
                     width: (right - left) as _,
                     height: (size.height as f32 - (bottom + top)) as _,
                 },
-                Self::FIELD_OFFSETS.vertical_value.apply_pin(self),
+                Self::FIELD_OFFSETS.vertical_value().apply_pin(self),
                 self.vertical_page_size().get() as i32,
                 self.vertical_max().get() as i32,
             )
@@ -259,7 +295,7 @@ impl Item for NativeScrollView {
                     width: (size.width as f32 - (right + left)) as _,
                     height: (bottom - top) as _,
                 },
-                Self::FIELD_OFFSETS.horizontal_value.apply_pin(self),
+                Self::FIELD_OFFSETS.horizontal_value().apply_pin(self),
                 self.horizontal_page_size().get() as i32,
                 self.horizontal_max().get() as i32,
             )
@@ -268,9 +304,18 @@ impl Item for NativeScrollView {
         }
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _event: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> KeyEventResult {
+        KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        _: &KeyEvent,
+        _: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
@@ -464,7 +509,7 @@ impl Item for NativeScrollView {
 
 impl ItemConsts for NativeScrollView {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<Self, CachedRenderingData> =
-        Self::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+        Self::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
 }
 
 declare_item_vtable! {

@@ -1,4 +1,3 @@
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: MIT -->
 # Slint on Microcontrollers
 
 ![](https://slint.dev/blog/porting-slint-to-microcontrollers/rp-pico_and_screen.jpg)
@@ -29,7 +28,7 @@ Start by adding a dependency to the `slint` and the `slint-build` crates to your
 Start with the `slint` crate like this:
 
 ```sh
-cargo add slint@1.12 --no-default-features --features "compat-1-2 unsafe-single-threaded libm renderer-software"
+cargo add slint@1.16 --no-default-features --features "compat-1-2 unsafe-single-threaded libm renderer-software"
 ```
 
 The default features of the `slint` crate are tailored towards hosted environments and includes the "std" feature. In bare metal environments,
@@ -52,7 +51,7 @@ This is the default when using the Rust 2021 Edition, but not if you use a works
 Then add the `slint-build` crate as a build dependency:
 
 ```sh
-cargo add --build slint-build@1.12
+cargo add --build slint-build@1.16
 ```
 
 For reference: These are the relevant parts of your `Cargo.toml` file,
@@ -68,11 +67,11 @@ edition = "2021"
 ## ... your other dependencies
 
 [dependencies.slint]
-version = "1.12"
+version = "1.16"
 default-features = false
 features = ["compat-1-2", "unsafe-single-threaded", "libm", "renderer-software"]
 [build-dependencies]
-slint-build = "1.12"
+slint-build = "1.16.0"
 ```
 
 ## Changes to `build.rs`
@@ -222,7 +221,7 @@ loop {
     if let Some(event) = check_for_touch_event(/*...*/) {
         // convert the event from the driver into a `slint::platform::WindowEvent`
         // and pass it to the window.
-        window.try_dispatch_event(event).unwrap();
+        window.dispatch_event_with_result(event).unwrap();
     }
 
     // ... maybe some more application logic ...

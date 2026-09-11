@@ -7,11 +7,15 @@
 
 /// Call a macro with every enum exposed in the .slint language
 ///
+/// Each enum is declared with `pub enum` if it should be re-exported in a public
+/// language-binding module (e.g. `slint::language` in the Rust crate), or plain `enum`
+/// to stay private. Consumers can dispatch on `$vis:vis`.
+///
 /// ## Example
 /// ```rust
 /// macro_rules! print_enums {
-///     ($( $(#[$enum_doc:meta])* enum $Name:ident { $( $(#[$value_doc:meta])* $Value:ident,)* })*) => {
-///         $(println!("{} => [{}]", stringify!($Name), stringify!($($Value),*));)*
+///     ($( $(#[$enum_doc:meta])* $vis:vis enum $Name:ident { $( $(#[$value_doc:meta])* $Value:ident,)* })*) => {
+///         $(println!("{} ({}) => [{}]", stringify!($Name), stringify!($vis), stringify!($($Value),*));)*
 ///     }
 /// }
 /// i_slint_common::for_each_enums!(print_enums);
@@ -19,9 +23,16 @@
 #[macro_export]
 macro_rules! for_each_enums {
     ($macro:ident) => {
-        $macro![
-            /// This enum describes the different types of alignment of text along the horizontal axis of a `Text` element.
+        $macro! {
+            /// This enum describes the different types of alignment of text along the horizontal axis of a `Text` or `StyledText` element.
+            #[non_exhaustive]
             enum TextHorizontalAlignment {
+                /// The text will be aligned with the start edge of the containing box.
+                /// This could be left or right depending on the direction of the text.
+                Start,
+                /// The text will be aligned with the end edge of the containing box.
+                /// This could be left or right depending on the direction of the text.
+                End,
                 /// The text will be aligned with the left edge of the containing box.
                 Left,
                 /// The text will be horizontally centered within the containing box.
@@ -30,7 +41,8 @@ macro_rules! for_each_enums {
                 Right,
             }
 
-            /// This enum describes the different types of alignment of text along the vertical axis of a `Text` element.
+            /// This enum describes the different types of alignment of text along the vertical axis of a `Text` or `StyledText` element.
+            #[non_exhaustive]
             enum TextVerticalAlignment {
                 /// The text will be aligned to the top of the containing box.
                 Top,
@@ -40,7 +52,8 @@ macro_rules! for_each_enums {
                 Bottom,
             }
 
-            /// This enum describes the how the text wrap if it is too wide to fit in the `Text` width.
+            /// This enum describes the how the text wraps if it is too wide to fit in the width of a `Text` or `StyledText` element.
+            #[non_exhaustive]
             enum TextWrap {
                 /// The text won't wrap, but instead will overflow.
                 NoWrap,
@@ -50,7 +63,8 @@ macro_rules! for_each_enums {
                 CharWrap,
             }
 
-            /// This enum describes the how the text appear if it is too wide to fit in the `Text` width.
+            /// This enum describes the how the text appears if it is too wide to fit in the width of a `Text` or `StyledText` element.
+            #[non_exhaustive]
             enum TextOverflow {
                 /// The text will simply be clipped.
                 Clip,
@@ -58,7 +72,8 @@ macro_rules! for_each_enums {
                 Elide,
             }
 
-            /// This enum describes the positioning of a text stroke relative to the border of the glyphs in a `Text`.
+            /// This enum describes the positioning of a text stroke relative to the border of the glyphs in a `Text` or `StyledText` element.
+            #[non_exhaustive]
             enum TextStrokeStyle {
                 /// The inside edge of the stroke is at the outer edge of the text.
                 Outside,
@@ -66,7 +81,22 @@ macro_rules! for_each_enums {
                 Center,
             }
 
+            /// This enum describes the auto-capitalization behavior that the input method
+            /// (e.g. a soft keyboard) should apply while text is entered in a `TextInput`.
+            #[non_exhaustive]
+            pub enum CapitalizationMode {
+                /// No auto-capitalization.
+                None,
+                /// Capitalize the first character of each sentence.
+                Sentences,
+                /// Capitalize the first character of each word.
+                Words,
+                /// Capitalize all characters.
+                Characters,
+            }
+
             /// This enum describes whether an event was rejected or accepted by an event handler.
+            #[non_exhaustive]
             enum EventResult {
                 /// The event is rejected by this event handler and may then be handled by the parent item
                 Reject,
@@ -75,6 +105,7 @@ macro_rules! for_each_enums {
             }
 
             /// This enum describes the different ways of deciding what the inside of a shape described by a path shall be.
+            #[non_exhaustive]
             enum FillRule {
                 /// The ["nonzero" fill rule as defined in SVG](https://developer.mozilla.org/en-US/docs/Web/SVG/Attribute/fill-rule#nonzero).
                 Nonzero,
@@ -85,6 +116,7 @@ macro_rules! for_each_enums {
             /// Use this enum to add standard buttons to a `Dialog`. The look and positioning
             /// of these `StandardButton`s depends on the environment
             /// (OS, UI environment, etc.) the application runs in.
+            #[non_exhaustive]
             enum StandardButtonKind {
                 /// A "OK" button that accepts a `Dialog`, closing it when clicked.
                 Ok,
@@ -114,6 +146,7 @@ macro_rules! for_each_enums {
             /// This enum represents the value of the `dialog-button-role` property which can be added to
             /// any element within a `Dialog` to put that item in the button row, and its exact position
             /// depends on the role and the platform.
+            #[non_exhaustive]
             enum DialogButtonRole {
                 /// This isn't a button meant to go into the bottom row
                 None,
@@ -134,20 +167,21 @@ macro_rules! for_each_enums {
             /// This enum describes the different reasons for a FocusEvent
             #[non_exhaustive]
             enum FocusReason {
+                /// A built-in function invocation caused the event (`.focus()`, `.clear-focus()`)
+                Programmatic,
                 /// Keyboard navigation caused the event (tabbing)
                 TabNavigation,
                 /// A mouse click caused the event
                 PointerClick,
                 /// A popup caused the event
                 PopupActivation,
-                /// A built-in function invocation caused the event (`.focus()`, `.clear-focus()`)
-                Programmatic,
                 /// The window manager changed the active window and caused the event
                 WindowActivation,
             }
 
             /// The enum reports what happened to the `PointerEventButton` in the event
-            enum PointerEventKind {
+            #[non_exhaustive]
+            pub enum PointerEventKind {
                 /// The action was cancelled.
                 Cancel,
                 /// The button was pressed.
@@ -161,7 +195,7 @@ macro_rules! for_each_enums {
             /// This enum describes the different types of buttons for a pointer event,
             /// typically on a mouse or a pencil.
             #[non_exhaustive]
-            enum PointerEventButton {
+            pub enum PointerEventButton {
                 /// A button that is none of left, right, middle, back or forward. For example,
                 /// this is used for the task button on a mouse with many buttons.
                 Other,
@@ -177,10 +211,11 @@ macro_rules! for_each_enums {
                 Forward,
             }
 
-            /// This enum represents different types of mouse cursors. It's a subset of the mouse cursors available in CSS.
+            /// Represents different types of mouse cursors. It's a subset of the mouse cursors available in CSS.
             /// For details and pictograms see the [MDN Documentation for cursor](https://developer.mozilla.org/en-US/docs/Web/CSS/cursor#values).
             /// Depending on the backend and used OS unidirectional resize cursors may be replaced with bidirectional ones.
-            enum MouseCursor {
+            #[non_exhaustive]
+            enum BuiltInMouseCursor {
                 /// The systems default cursor.
                 Default,
                 /// No cursor is displayed.
@@ -247,22 +282,24 @@ macro_rules! for_each_enums {
                 //zoom_out,
             }
 
-            /// This enum defines how the source image shall fit into an `Image` element.
+            /// This enum defines how the source image or path shall fit into an `Image` or `Path` element.
+            #[non_exhaustive]
             enum ImageFit {
-                /// Scales and stretches the source image to fit the width and height of the `Image` element.
+                /// Scales and stretches the source to fit the width and height of the element.
                 Fill,
-                /// The source image is scaled to fit into the `Image` element's dimension while preserving the aspect ratio.
+                /// The source is scaled to fit into the element's dimensions while preserving the aspect ratio.
                 Contain,
-                /// The source image is scaled to cover into the `Image` element's dimension while preserving the aspect ratio.
-                /// If the aspect ratio of the source image doesn't match the element's one, then the image will be clipped to fit.
+                /// The source is scaled to cover the element's dimensions while preserving the aspect ratio.
+                /// If the aspect ratios don't match, the source will be clipped to fit.
                 Cover,
-                /// Preserves the size of the source image in logical pixels.
-                /// The source image will still be scaled by the scale factor that applies to all elements in the window.
+                /// Preserves the size of the source in logical pixels.
+                /// The source will still be scaled by the scale factor that applies to all elements in the window.
                 /// Any extra space will be left blank.
                 Preserve,
             }
 
             /// This enum specifies the horizontal alignment of the source image.
+            #[non_exhaustive]
             enum ImageHorizontalAlignment {
                 /// Aligns the source image at the center of the `Image` element.
                 Center,
@@ -273,6 +310,7 @@ macro_rules! for_each_enums {
             }
 
             /// This enum specifies the vertical alignment of the source image.
+            #[non_exhaustive]
             enum ImageVerticalAlignment {
                 /// Aligns the source image at the center of the `Image` element.
                 Center,
@@ -283,6 +321,7 @@ macro_rules! for_each_enums {
             }
 
             /// This enum specifies how the source image will be scaled.
+            #[non_exhaustive]
             enum ImageRendering {
                 /// The image is scaled with a linear interpolation algorithm.
                 Smooth,
@@ -291,6 +330,7 @@ macro_rules! for_each_enums {
             }
 
             /// This enum specifies how the source image will be tiled.
+            #[non_exhaustive]
             enum ImageTiling {
                 /// The source image will not be tiled.
                 None,
@@ -309,16 +349,28 @@ macro_rules! for_each_enums {
                 Password,
                 /// This will only accept and render number characters (0-9)
                 Number,
-                /// This will accept and render characters if it's valid part of a decimal
+                /// This will accept and render characters if it's valid part of a decimal,
+                /// using the decimal separator of the current locale
                 Decimal,
+                /// This identifies the input field as a search box. Characters are rendered normally,
+                /// but assistive technologies are informed that the field is used for searching or
+                /// filtering content.
+                Search,
             }
 
             /// Enum representing the `alignment` property of a
             /// `HorizontalBox`, a `VerticalBox`,
-            /// a `HorizontalLayout`, or `VerticalLayout`.
+            /// a `HorizontalLayout`, a `VerticalLayout`, or a `FlexboxLayout`,
+            /// and the `cross-axis-line-alignment` property of a `FlexboxLayout`.
+            ///
+            /// For `cross-axis-line-alignment`, the values below apply to the flex lines
+            /// instead of the elements.
+            #[non_exhaustive]
             enum LayoutAlignment {
-                /// Use the minimum size of all elements in a layout, distribute remaining space
-                /// based on `*-stretch` among all elements.
+                /// For `alignment`: use the minimum size of all elements in a layout, distribute
+                /// remaining space based on `*-stretch` among all elements.
+                /// For `cross-axis-line-alignment`: the flex lines have no stretch factor and
+                /// share the remaining space equally.
                 Stretch,
                 /// Use the preferred size for all elements, distribute remaining space evenly before the
                 /// first and after the last element.
@@ -331,13 +383,61 @@ macro_rules! for_each_enums {
                 /// Use the preferred size for all elements, distribute remaining space evenly between
                 /// elements.
                 SpaceBetween,
+                /// Use the preferred size for all elements, distribute remaining space evenly
+                /// between the elements, and use half spaces at the start and end.
+                SpaceAround,
                 /// Use the preferred size for all elements, distribute remaining space evenly before the
                 /// first element, after the last element and between elements.
-                SpaceAround,
+                SpaceEvenly,
+            }
+
+            /// The direction in which flex items are placed in a flex container.
+            #[non_exhaustive]
+            enum FlexboxLayoutDirection {
+                /// Items are placed in a row, from left to right.
+                Row,
+                /// Items are placed in a row in reverse order, from right to left.
+                RowReverse,
+                /// Items are placed in a column, from top to bottom.
+                Column,
+                /// Items are placed in a column in reverse order, from bottom to top.
+                ColumnReverse,
+            }
+
+            /// Controls the alignment of items along the cross axis of a layout.
+            /// Used as the `cross-axis-alignment` property of `HorizontalLayout`, `VerticalLayout`,
+            /// and `FlexboxLayout`, and as the `cross-axis-self-alignment` property of their
+            /// children, which overrides the container's alignment for a single item.
+            #[non_exhaustive]
+            enum CrossAxisAlignment {
+                /// The default: for `cross-axis-self-alignment`, use the container's
+                /// `cross-axis-alignment` value. For an unset `cross-axis-alignment` it is
+                /// equivalent to `stretch`; it is an error to set it explicitly there.
+                Auto,
+                /// Items are stretched to fill the cross axis.
+                Stretch,
+                /// Items are placed at the start of the cross axis.
+                Start,
+                /// Items are placed at the end of the cross axis.
+                End,
+                /// Items are centered along the cross axis.
+                Center,
+            }
+
+            /// Controls whether flex items wrap onto multiple lines.
+            #[non_exhaustive]
+            enum FlexboxLayoutWrap {
+                /// Flex items wrap onto multiple lines, from top to bottom (for row direction) or left to right (for column direction).
+                Wrap,
+                /// All flex items are laid out on a single line (default for CSS, but Slint defaults to `wrap`).
+                NoWrap,
+                /// Flex items wrap onto multiple lines in the reverse direction.
+                WrapReverse,
             }
 
             /// PathEvent is a low-level data structure describing the composition of a path. Typically it is
             /// generated at compile time from a higher-level description, such as SVG commands.
+            #[non_exhaustive]
             enum PathEvent {
                 /// The beginning of the path.
                 Begin,
@@ -355,8 +455,15 @@ macro_rules! for_each_enums {
 
             /// This enum represents the different values for the `accessible-role` property, used to describe the
             /// role of an element in the context of assistive technology such as screen readers.
+            ///
+            /// In addition to widget roles, this enum includes *landmark* roles (`banner`, `complementary`,
+            /// `content-info`, `form`, `main`, `navigation`, `region`, `search`).
+            /// Landmarks identify large content areas that screen reader users can jump between,
+            /// giving the application a navigable structure similar to headings in a document.
+            /// See [WAI-ARIA Landmark Regions](https://www.w3.org/WAI/ARIA/apg/practices/landmark-regions/)
+            /// for guidance on when and how to use them.
             #[non_exhaustive]
-            enum AccessibleRole {
+            pub enum AccessibleRole {
                 /// The element isn't accessible.
                 None,
                 /// The element is a `Button` or behaves like one.
@@ -396,11 +503,53 @@ macro_rules! for_each_enums {
                 Switch,
                 /// The element is an item in a `ListView`.
                 ListItem,
+                /// The element is a `RadioButton` or behaves like one.
+                RadioButton,
+                /// The element is a container grouping related `RadioButton`s.
+                RadioGroup,
+                /// The element is a window title bar, typically containing the window title and controls
+                /// such as minimize, maximize, and close.
+                WindowTitleBar,
+                // Landmark roles
+                /// Landmark: the header area of the application, typically containing a logo, title, or global navigation.
+                Banner,
+                /// Landmark: a supporting section that complements the main content, such as a sidebar.
+                Complementary,
+                /// Landmark: information about the application or its content, typically at the bottom (e.g. status bar, copyright).
+                ContentInfo,
+                /// Landmark: a region containing input fields and controls for submitting information.
+                Form,
+                /// Landmark: the primary content of the application. Each view should have exactly one `main` landmark.
+                Main,
+                /// Landmark: a group of links or controls used for navigating the application.
+                Navigation,
+                /// Landmark: a generic section significant enough to be listed in a summary.
+                /// Use a more specific landmark if one applies.
+                Region,
+                /// Landmark: a region containing controls for searching or filtering content.
+                Search,
+            }
+
+            /// This enum represents the different values of the `accessible-live-region` property.
+            /// It indicates that an element is a live region whose content changes should be
+            /// announced by assistive technologies.
+            #[non_exhaustive]
+            pub enum AccessibleLiveness {
+                /// Use in regions that present information that is of low-importance to the user.
+                /// Assistive technologies are expected to not announce changes unless the user explicitly asks for it.
+                Off,
+                /// Use in regions that present new information to users.
+                /// Assistive technologies are expected to not interrupt the user to inform of changes to the live region.
+                Polite,
+                /// Use in regions that present information that a user should know about right away.
+                /// Assistive technologies are expected to announce to the user as soon as possible.
+                Assertive,
             }
 
             /// This enum represents the different values of the `sort-order` property.
             /// It's used to sort a `StandardTableView` by a column.
-            enum SortOrder {
+            #[non_exhaustive]
+            pub enum SortOrder {
                 /// The column is unsorted.
                 Unsorted,
 
@@ -412,7 +561,8 @@ macro_rules! for_each_enums {
             }
 
             /// Represents the orientation of an element or widget such as the `Slider`.
-            enum Orientation {
+            // (on purpose not #[non_exhaustive])
+            pub enum Orientation {
                 /// Element is oriented horizontally.
                 Horizontal,
                 /// Element is oriented vertically.
@@ -421,7 +571,8 @@ macro_rules! for_each_enums {
 
             /// This enum indicates the color scheme used by the widget style. Use this to explicitly switch
             /// between dark and light schemes, or choose Unknown to fall back to the system default.
-            enum ColorScheme {
+            #[non_exhaustive]
+            pub enum ColorScheme {
                 /// The scheme is not known and a system wide setting configures this. This could mean that
                 /// the widgets are shown in a dark or light scheme, but it could also be a custom color scheme.
                 Unknown,
@@ -432,6 +583,7 @@ macro_rules! for_each_enums {
             }
 
             /// This enum describes the direction of an animation.
+            #[non_exhaustive]
             enum AnimationDirection {
                 /// The ["normal" direction as defined in CSS](https://developer.mozilla.org/en-US/docs/Web/CSS/animation-direction#normal).
                 Normal,
@@ -444,6 +596,7 @@ macro_rules! for_each_enums {
             }
 
             /// This enum describes the scrollbar visibility
+            #[non_exhaustive]
             enum ScrollBarPolicy {
                 /// Scrollbar will be visible only when needed
                 AsNeeded,
@@ -454,6 +607,7 @@ macro_rules! for_each_enums {
             }
 
             // This enum describes the close behavior of `PopupWindow`
+            #[non_exhaustive]
             enum PopupClosePolicy {
                 /// Closes the `PopupWindow` when user clicks or presses the escape key.
                 CloseOnClick,
@@ -466,6 +620,7 @@ macro_rules! for_each_enums {
             }
 
             /// This enum describes the appearance of the ends of stroked paths.
+            #[non_exhaustive]
             enum LineCap {
                 /// The stroke ends with a flat edge that is perpendicular to the path.
                 Butt,
@@ -473,6 +628,38 @@ macro_rules! for_each_enums {
                 Round,
                 /// The stroke ends with a square projection beyond the path.
                 Square,
+            }
+
+            /// This enum describes the appearance of the joins between segments of stroked paths.
+            #[non_exhaustive]
+            enum LineJoin {
+                /// The stroke joins with a sharp corner or a clipped corner, depending on the miter limit.
+                Miter,
+                /// The stroke joins with a smooth, rounded corner.
+                Round,
+                /// The stroke joins with a beveled (flattened) corner.
+                Bevel,
+            }
+
+            /// This enum describes the action negotiated between the source of a drag (`DragArea`)
+            /// and its target (`DropArea`) during a drag-and-drop operation. The source declares
+            /// which actions it permits, the target picks one in its `can-drop` callback, and the
+            /// chosen action is reported back to the source via `drag-finished` so that, for
+            /// example, a `move` source can remove the original data. The same enum is used for
+            /// drags that come from another application or window once native drag-and-drop is
+            /// in play.
+            #[non_exhaustive]
+            pub enum DragAction {
+                /// No action: the drag is rejected, no drop will be delivered.
+                None,
+                /// The data is copied to the target; the source retains it.
+                Copy,
+                /// The data is moved to the target; the source should remove it once the
+                /// operation completes.
+                Move,
+                /// A link to the source data is created at the target; neither side gives
+                /// up ownership.
+                Link,
             }
 
             /// This enum describes the detected operating system types.
@@ -491,6 +678,6 @@ macro_rules! for_each_enums {
                 /// This variant is reported when the operating system is none of the above.
                 Other,
             }
-        ];
+        }
     };
 }

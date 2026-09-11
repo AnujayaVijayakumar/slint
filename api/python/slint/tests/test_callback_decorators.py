@@ -1,13 +1,17 @@
 # Copyright © SixtyFPS GmbH <info@slint.dev>
 # SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-from slint import load_file
-import slint
-import pytest
+import asyncio
 from pathlib import Path
+
+import pytest
+
+import slint
+from slint import load_file
 
 
 def base_dir() -> Path:
+    assert __spec__
     origin = __spec__.origin
     assert origin is not None
     base_dir = Path(origin).parent
@@ -18,7 +22,7 @@ def base_dir() -> Path:
 def test_callback_decorators(caplog: pytest.LogCaptureFixture) -> None:
     module = load_file(base_dir() / "test-load-file.slint", quiet=False)
 
-    class SubClass(module.App):  # type: ignore
+    class SubClass(module.App):
         @slint.callback()
         def say_hello_again(self, arg: str) -> str:
             return "say_hello_again:" + arg
@@ -36,3 +40,59 @@ def test_callback_decorators(caplog: pytest.LogCaptureFixture) -> None:
     assert instance.invoke_say_hello_again("ok") == "say_hello_again:ok"
     assert instance.invoke_global_callback("ok") == "global:ok"
     del instance
+
+
+def test_callback_decorators_async() -> None:
+    module = load_file(base_dir() / "test-load-file.slint", quiet=False)
+
+    class SubClass(module.App):
+        def __init__(self, in_queue: asyncio.Queue[int], out_queue: asyncio.Queue[int]):
+            super().__init__()
+            self.in_queue = in_queue
+            self.out_queue = out_queue
+
+        @slint.callback()
+        async def call_void(self) -> None:
+            value = await self.in_queue.get()
+            await self.out_queue.put(value + 1)
+
+        @slint.callback()
+        async def call_void2(self) -> None:
+            value = await self.in_queue.get()
+            await self.out_queue.put(value + 2)
+
+    async def main(
+        instance: SubClass, in_queue: asyncio.Queue[int], out_queue: asyncio.Queue[int]
+    ) -> None:
+        await in_queue.put(42)
+        instance.invoke_call_void()
+        assert await out_queue.get() == 43
+        await in_queue.put(43)
+        instance.invoke_call_void2()
+        assert await out_queue.get() == 45
+        slint.quit_event_loop()
+
+    in_queue: asyncio.Queue[int] = asyncio.Queue()
+    out_queue: asyncio.Queue[int] = asyncio.Queue()
+    instance = SubClass(in_queue, out_queue)
+    slint.run_event_loop(main(instance, in_queue, out_queue))
+
+
+def test_callback_decorators_async_err() -> None:
+    module = load_file(base_dir() / "test-load-file.slint", quiet=False)
+
+    class SubClass(module.App):
+        def __init__(self) -> None:
+            super().__init__()
+
+        @slint.callback()
+        async def say_hello(self, msg: str) -> str:
+            return msg
+
+    with pytest.raises(RuntimeError) as excinfo:
+        SubClass()
+    err = excinfo.value
+    assert (
+        str(err)
+        == "Callback 'say_hello' cannot be used with a callback decorator for an async function, as it doesn't return void"
+    )

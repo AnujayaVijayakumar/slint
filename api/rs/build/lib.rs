@@ -7,6 +7,8 @@ It is meant to allow you to compile the `.slint` files from your `build.rs` scri
 
 The main entry point of this crate is the [`compile()`] function
 
+The generated code must be included in your crate by using the `slint::include_modules!()` macro.
+
 ## Example
 
 In your Cargo.toml:
@@ -17,11 +19,11 @@ In your Cargo.toml:
 build = "build.rs"
 
 [dependencies]
-slint = "1.12"
+slint = "1.16.0"
 ...
 
 [build-dependencies]
-slint-build = "1.12"
+slint-build = "1.16.0"
 ```
 
 In the `build.rs` file:
@@ -41,12 +43,16 @@ fn main() {
 }
 ```
 */
+#![cfg_attr(
+    feature = "document-features",
+    doc = concat!("## Feature flags\n\n", document_features::document_features!())
+)]
 #![doc(html_logo_url = "https://slint.dev/logo/slint-logo-square-light.svg")]
 #![warn(missing_docs)]
 
-#[cfg(not(feature = "default"))]
+#[cfg(not(feature = "compat-1-18"))]
 compile_error!(
-    "The feature `default` must be enabled to ensure \
+    "The feature `compat-1-18` must be enabled to ensure \
     forward compatibility with future version of this crate"
 );
 
@@ -57,24 +63,35 @@ use std::path::Path;
 
 use i_slint_compiler::diagnostics::BuildDiagnostics;
 
+/// Argument of [`CompilerConfiguration::with_default_translation_context()`]
+///
+pub use i_slint_compiler::DefaultTranslationContext;
+
 /// The structure for configuring aspects of the compilation of `.slint` markup files to Rust.
 #[derive(Clone)]
 pub struct CompilerConfiguration {
     config: i_slint_compiler::CompilerConfiguration,
 }
 
-/// How should the slint compiler embed images and fonts
+/// How should the Slint compiler embed images and fonts
 ///
 /// Parameter of [`CompilerConfiguration::embed_resources()`]
 #[derive(Clone, PartialEq)]
 pub enum EmbedResourcesKind {
-    /// Paths specified in .slint files are made absolute and the absolute
-    /// paths will be used at run-time to load the resources from the file system.
+    /// Resources are loaded from their absolute path at run-time.
+    ///
+    /// Only useful for debugging, since the files must still be present at the same path on the
+    /// machine running the application.
     AsAbsolutePath,
-    /// The raw files in .slint files are embedded in the application binary.
+    /// The files referenced from .slint files are embedded in the binary as-is (for example
+    /// a PNG stays compressed), and decoded at run-time.
     EmbedFiles,
-    /// File names specified in .slint files will be loaded by the Slint compiler,
-    /// optimized for use with the software renderer and embedded in the application binary.
+    #[cfg(feature = "renderer-software")]
+    /// Images and fonts are pre-processed at compile time and embedded as uncompressed pixel
+    /// data, ready to be drawn by the software renderer without any decoding at run-time.
+    ///
+    /// Useful for MCUs with no file system and little RAM.
+    /// Only the Slint software renderer can use these resources; Skia and FemtoVG can't.
     EmbedForSoftwareRenderer,
 }
 
@@ -157,6 +174,7 @@ impl CompilerConfiguration {
             EmbedResourcesKind::EmbedFiles => {
                 i_slint_compiler::EmbedResourcesKind::EmbedAllResources
             }
+            #[cfg(feature = "renderer-software")]
             EmbedResourcesKind::EmbedForSoftwareRenderer => {
                 i_slint_compiler::EmbedResourcesKind::EmbedTextures
             }
@@ -168,11 +186,12 @@ impl CompilerConfiguration {
     /// as constant value. This is only intended for MCU environments. Use
     /// in combination with [`Self::embed_resources`] to pre-scale images and glyphs
     /// accordingly.
+    ///
+    /// If this is set, changing the scale factor at runtime will not have any effect.
     #[must_use]
-    pub fn with_scale_factor(self, factor: f32) -> Self {
-        let mut config = self.config;
-        config.const_scale_factor = factor as f64;
-        Self { config }
+    pub fn with_scale_factor(mut self, factor: f32) -> Self {
+        self.config.const_scale_factor = Some(factor);
+        self
     }
 
     /// Configures the compiler to bundle translations when compiling Slint code.
@@ -193,6 +212,20 @@ impl CompilerConfiguration {
         Self { config }
     }
 
+    /// Unless explicitly specified with the `@tr("context" => ...)`, the default translation context is the component name.
+    /// Use this option with [`DefaultTranslationContext::None`] to disable the default translation context.
+    ///
+    /// The translation file must also not have context
+    /// (`--no-default-translation-context` argument of `slint-tr-extractor`)
+    #[must_use]
+    pub fn with_default_translation_context(
+        mut self,
+        default_translation_context: DefaultTranslationContext,
+    ) -> Self {
+        self.config.default_translation_context = default_translation_context;
+        self
+    }
+
     /// Configures the compiler to emit additional debug info when compiling Slint code.
     ///
     /// This is the equivalent to setting `SLINT_EMIT_DEBUG_INFO=1` and using the `slint!()` macro
@@ -205,6 +238,30 @@ impl CompilerConfiguration {
         Self { config }
     }
 
+    /// Configures the compiler to treat the Slint as part of a library.
+    ///
+    /// Use this when the components and types of the Slint code need
+    /// to be accessible from other modules.
+    ///
+    /// **Note**: This feature is experimental and may change or be removed in the future.
+    #[cfg(feature = "experimental-module-builds")]
+    #[must_use]
+    pub fn as_library(self, library_name: &str) -> Self {
+        let mut config = self.config;
+        config.library_name = Some(library_name.to_string());
+        Self { config }
+    }
+
+    /// Specify the Rust module to place the generated code in.
+    ///
+    /// **Note**: This feature is experimental and may change or be removed in the future.
+    #[cfg(feature = "experimental-module-builds")]
+    #[must_use]
+    pub fn rust_module(self, rust_module: &str) -> Self {
+        let mut config = self.config;
+        config.rust_module = Some(rust_module.to_string());
+        Self { config }
+    }
     /// Configures the compiler to use Signed Distance Field (SDF) encoding for fonts.
     ///
     /// This flag only takes effect when `embed_resources` is set to [`EmbedResourcesKind::EmbedForSoftwareRenderer`],
@@ -222,6 +279,32 @@ impl CompilerConfiguration {
         config.use_sdf_fonts = enable;
         Self { config }
     }
+
+    /// Converts any relative include_paths or library_paths to absolute paths relative to the manifest_dir.
+    #[must_use]
+    fn with_absolute_paths(self, manifest_dir: &std::path::Path) -> Self {
+        let mut config = self.config;
+
+        let to_absolute_path = |path: &mut std::path::PathBuf| {
+            if path.is_relative() {
+                *path = manifest_dir.join(&path);
+            }
+        };
+
+        for path in config.library_paths.values_mut() {
+            to_absolute_path(path);
+        }
+
+        for path in config.include_paths.iter_mut() {
+            to_absolute_path(path);
+        }
+
+        if let Some(path) = config.translation_path_bundle.as_mut() {
+            to_absolute_path(path);
+        }
+
+        Self { config }
+    }
 }
 
 /// Error returned by the `compile` function
@@ -229,7 +312,9 @@ impl CompilerConfiguration {
 #[non_exhaustive]
 pub enum CompileError {
     /// Cannot read environment variable CARGO_MANIFEST_DIR or OUT_DIR. The build script need to be run via cargo.
-    #[display("Cannot read environment variable CARGO_MANIFEST_DIR or OUT_DIR. The build script need to be run via cargo.")]
+    #[display(
+        "Cannot read environment variable CARGO_MANIFEST_DIR or OUT_DIR. The build script need to be run via cargo."
+    )]
     NotRunViaCargo,
     /// Parse error. The error are printed in the stderr, and also are in the vector
     #[display("{_0:?}")]
@@ -401,6 +486,8 @@ fn formatter_test() {
 /// about how to use the generated code.
 ///
 /// This function can only be called within a build script run by cargo.
+///
+/// See also [`compile_with_config()`] if you want to specify a configuration.
 pub fn compile(path: impl AsRef<std::path::Path>) -> Result<(), CompileError> {
     compile_with_config(path, CompilerConfiguration::default())
 }
@@ -418,8 +505,12 @@ pub fn compile_with_config(
     relative_slint_file_path: impl AsRef<std::path::Path>,
     config: CompilerConfiguration,
 ) -> Result<(), CompileError> {
-    let path = Path::new(&env::var_os("CARGO_MANIFEST_DIR").ok_or(CompileError::NotRunViaCargo)?)
-        .join(relative_slint_file_path.as_ref());
+    let manifest_path = std::path::PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").ok_or(CompileError::NotRunViaCargo)?,
+    );
+    let config = config.with_absolute_paths(&manifest_path);
+
+    let path = manifest_path.join(relative_slint_file_path.as_ref());
 
     let absolute_rust_output_file_path =
         Path::new(&env::var_os("OUT_DIR").ok_or(CompileError::NotRunViaCargo)?).join(
@@ -428,6 +519,23 @@ pub fn compile_with_config(
                 .unwrap_or_else(|| Path::new("slint_out"))
                 .with_extension("rs"),
         );
+
+    #[cfg(feature = "experimental-module-builds")]
+    if let Some(library_name) = config.config.library_name.clone() {
+        println!("cargo::metadata=SLINT_LIBRARY_NAME={}", library_name);
+        println!(
+            "cargo::metadata=SLINT_LIBRARY_PACKAGE={}",
+            std::env::var("CARGO_PKG_NAME").ok().unwrap_or_default()
+        );
+        println!("cargo::metadata=SLINT_LIBRARY_SOURCE={}", path.display());
+        if let Some(rust_module) = &config.config.rust_module {
+            println!("cargo::metadata=SLINT_LIBRARY_MODULE={}", rust_module);
+        }
+    }
+    // Cargo scans a directory dependency recursively, so this also catches an added language.
+    if let Some(bundle_path) = &config.config.translation_path_bundle {
+        println!("cargo:rerun-if-changed={}", bundle_path.display());
+    }
 
     let paths_dependencies =
         compile_with_output_path(path, absolute_rust_output_file_path.clone(), config)?;
@@ -442,7 +550,8 @@ pub fn compile_with_config(
     println!("cargo:rerun-if-env-changed=SLINT_ASSET_SECTION");
     println!("cargo:rerun-if-env-changed=SLINT_EMBED_RESOURCES");
     println!("cargo:rerun-if-env-changed=SLINT_EMIT_DEBUG_INFO");
-    println!("cargo:rerun-if-env-changed=SLINT_LIVE_RELOAD");
+    println!("cargo:rerun-if-env-changed=SLINT_LIVE_PREVIEW");
+    println!("cargo:rerun-if-env-changed=SLINT_BUNDLE_TRANSLATIONS");
 
     println!(
         "cargo:rustc-env=SLINT_INCLUDE_GENERATED={}",
@@ -516,11 +625,15 @@ pub fn compile_with_output_path(
     write!(code_formatter, "{generated}").map_err(CompileError::SaveError)?;
     dependencies.push(input_slint_file_path.as_ref().to_path_buf());
 
-    for resource in doc.embedded_file_resources.borrow().keys() {
-        if !resource.starts_with("builtin:") {
+    for er in doc.embedded_file_resources.borrow().iter() {
+        if let Some(resource) = er.path.as_deref()
+            && !resource.starts_with("builtin:")
+        {
             dependencies.push(Path::new(resource).to_path_buf());
         }
     }
+
+    code_formatter.sink.flush().map_err(CompileError::SaveError)?;
 
     Ok(dependencies)
 }
@@ -557,4 +670,51 @@ pub fn print_rustc_flags() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+fn root_path_prefix() -> std::path::PathBuf {
+    #[cfg(windows)]
+    return std::path::PathBuf::from("C:/");
+    #[cfg(not(windows))]
+    return std::path::PathBuf::from("/");
+}
+
+#[test]
+fn with_absolute_library_paths_test() {
+    use std::path::PathBuf;
+
+    let library_paths = std::collections::HashMap::from([
+        ("relative".to_string(), PathBuf::from("some/relative/path")),
+        ("absolute".to_string(), root_path_prefix().join("some/absolute/path")),
+    ]);
+    let config = CompilerConfiguration::new().with_library_paths(library_paths);
+
+    let manifest_path = root_path_prefix().join("path/to/manifest");
+    let absolute_config = config.clone().with_absolute_paths(&manifest_path);
+    let relative = &absolute_config.config.library_paths["relative"];
+    assert!(relative.is_absolute());
+    assert!(relative.starts_with(&manifest_path));
+
+    assert!(!absolute_config.config.library_paths["absolute"].starts_with(&manifest_path));
+}
+
+#[test]
+fn with_absolute_include_paths_test() {
+    use std::path::PathBuf;
+
+    let config = CompilerConfiguration::new().with_include_paths(Vec::from([
+        root_path_prefix().join("some/absolute/path"),
+        PathBuf::from("some/relative/path"),
+    ]));
+
+    let manifest_path = root_path_prefix().join("path/to/manifest");
+    let absolute_config = config.clone().with_absolute_paths(&manifest_path);
+    assert_eq!(
+        absolute_config.config.include_paths,
+        Vec::from([
+            root_path_prefix().join("some/absolute/path"),
+            manifest_path.join("some/relative/path"),
+        ])
+    )
 }

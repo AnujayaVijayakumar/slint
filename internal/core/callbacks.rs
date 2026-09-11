@@ -77,24 +77,23 @@ pub(crate) mod ffi {
     #![allow(unsafe_code)]
 
     use super::*;
+    use core::ffi::c_void;
 
-    #[allow(non_camel_case_types)]
-    type c_void = ();
     #[repr(C)]
     /// Has the same layout as Callback<_>
     pub struct CallbackOpaque(*const c_void, *const c_void);
 
-    static_assertions::assert_eq_align!(CallbackOpaque, Callback<()>);
-    static_assertions::assert_eq_size!(CallbackOpaque, Callback<()>);
-    static_assertions::assert_eq_align!(CallbackOpaque, Callback<(alloc::string::String,)>);
-    static_assertions::assert_eq_size!(CallbackOpaque, Callback<(alloc::string::String,)>);
+    static_assertions::assert_eq_align!(CallbackOpaque, Callback<(), c_void>);
+    static_assertions::assert_eq_size!(CallbackOpaque, Callback<(), c_void>);
+    static_assertions::assert_eq_align!(CallbackOpaque, Callback<(alloc::string::String,), c_void>);
+    static_assertions::assert_eq_size!(CallbackOpaque, Callback<(alloc::string::String,), c_void>);
 
     /// Initialize the callback.
     /// slint_callback_drop must be called.
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn slint_callback_init(out: *mut CallbackOpaque) {
         assert_eq!(core::mem::size_of::<CallbackOpaque>(), core::mem::size_of::<Callback<()>>());
-        core::ptr::write(out as *mut Callback<()>, Default::default());
+        unsafe { core::ptr::write(out as *mut Callback<()>, Default::default()) };
     }
 
     /// Emit the callback
@@ -104,11 +103,13 @@ pub(crate) mod ffi {
         arg: *const c_void,
         ret: *mut c_void,
     ) {
-        let sig = &*(sig as *const Callback<c_void>);
-        if let Some(mut h) = sig.handler.take() {
-            h(&*arg, &mut *ret);
-            assert!(sig.handler.take().is_none(), "Callback Handler set while called");
-            sig.handler.set(Some(h));
+        unsafe {
+            let sig = &*(sig as *const Callback<c_void, c_void>);
+            if let Some(mut h) = sig.handler.take() {
+                h(&*arg, &mut *ret);
+                assert!(sig.handler.take().is_none(), "Callback Handler set while called");
+                sig.handler.set(Some(h));
+            }
         }
     }
 
@@ -122,38 +123,39 @@ pub(crate) mod ffi {
         user_data: *mut c_void,
         drop_user_data: Option<extern "C" fn(*mut c_void)>,
     ) {
-        let sig = &mut *(sig as *mut Callback<c_void>);
+        unsafe {
+            let sig = &mut *(sig as *mut Callback<c_void, c_void>);
 
-        struct UserData {
-            user_data: *mut c_void,
-            drop_user_data: Option<extern "C" fn(*mut c_void)>,
-            binding: extern "C" fn(user_data: *mut c_void, arg: *const c_void, ret: *mut c_void),
-        }
+            struct UserData {
+                user_data: *mut c_void,
+                drop_user_data: Option<extern "C" fn(*mut c_void)>,
+                binding:
+                    extern "C" fn(user_data: *mut c_void, arg: *const c_void, ret: *mut c_void),
+            }
 
-        impl Drop for UserData {
-            fn drop(&mut self) {
-                if let Some(x) = self.drop_user_data {
-                    x(self.user_data)
+            impl Drop for UserData {
+                fn drop(&mut self) {
+                    if let Some(x) = self.drop_user_data {
+                        x(self.user_data)
+                    }
                 }
             }
-        }
 
-        impl UserData {
-            /// Safety: the arguments must be valid pointers
-            unsafe fn call(&self, arg: *const c_void, ret: *mut c_void) {
-                (self.binding)(self.user_data, arg, ret)
+            impl UserData {
+                /// Safety: the arguments must be valid pointers
+                unsafe fn call(&self, arg: *const c_void, ret: *mut c_void) {
+                    (self.binding)(self.user_data, arg, ret)
+                }
             }
-        }
 
-        let ud = UserData { user_data, drop_user_data, binding };
-        sig.handler.set(Some(Box::new(move |a: &(), r: &mut ()| {
-            ud.call(a as *const c_void, r as *mut c_void)
-        })));
+            let ud = UserData { user_data, drop_user_data, binding };
+            sig.handler.set(Some(Box::new(move |a, r| ud.call(a, r))));
+        }
     }
 
     /// Destroy callback
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn slint_callback_drop(handle: *mut CallbackOpaque) {
-        core::ptr::drop_in_place(handle as *mut Callback<()>);
+        unsafe { core::ptr::drop_in_place(handle as *mut Callback<c_void, c_void>) };
     }
 }

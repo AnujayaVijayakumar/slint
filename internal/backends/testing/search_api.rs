@@ -2,20 +2,99 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 use core::ops::ControlFlow;
+use i_slint_core::SharedString;
 use i_slint_core::accessibility::{AccessibilityAction, AccessibleStringProperty};
 use i_slint_core::api::{ComponentHandle, LogicalPosition};
 use i_slint_core::item_tree::{ItemTreeRc, ItemWeak, ParentItemTraversalMode};
-use i_slint_core::items::{ItemRc, Opacity};
+use i_slint_core::items::{ItemRc, Opacity, PointerEventButton};
+use i_slint_core::platform::WindowEvent;
 use i_slint_core::window::WindowInner;
-use i_slint_core::SharedString;
+use std::rc::Rc;
+use std::time::Duration;
+
+/// Delay in milliseconds between interpolated PointerMoved events during drag simulation
+/// (~one frame at 60 fps).
+const DRAG_STEP_DELAY_MS: u64 = 16;
+
+/// Distance in logical pixels between interpolated PointerMoved events during drag
+/// simulation. Chosen to be below the 8 px `DISTANCE_THRESHOLD` (see `flickable.rs`)
+/// so that every intermediate position is reported to the element.
+const DRAG_STEP_SIZE: f32 = 5.0;
+
+/// Synthesizes a drag from `start` to `end` against `window`: an initial
+/// `PointerMoved`+`PointerPressed`, interpolated `PointerMoved`s sized below the 8 px drag
+/// threshold (with `mock_elapsed_time` between each), and a final `PointerReleased`.
+///
+/// Exposed at module scope so that callers that don't have an `ElementHandle` (e.g. tests
+/// that drive raw window coordinates) can drive the same gesture as
+/// [`ElementHandle::mock_drag`].
+pub(crate) fn mock_drag_window(
+    window: &i_slint_core::api::Window,
+    start: LogicalPosition,
+    end: LogicalPosition,
+    button: PointerEventButton,
+) {
+    window.dispatch_event(WindowEvent::PointerMoved { position: start });
+    window.dispatch_event(WindowEvent::PointerPressed { position: start, button });
+
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let distance = (dx * dx + dy * dy).sqrt();
+
+    if distance > f32::EPSILON {
+        let steps = ((distance / DRAG_STEP_SIZE).ceil() as usize).max(2);
+
+        for i in 1..steps {
+            let t = i as f32 / steps as f32;
+            let pos = LogicalPosition::new(start.x + dx * t, start.y + dy * t);
+            crate::testing_backend::mock_elapsed_time(DRAG_STEP_DELAY_MS);
+            window.dispatch_event(WindowEvent::PointerMoved { position: pos });
+        }
+
+        crate::testing_backend::mock_elapsed_time(DRAG_STEP_DELAY_MS);
+        window.dispatch_event(WindowEvent::PointerMoved { position: end });
+    }
+
+    window.dispatch_event(WindowEvent::PointerReleased { position: end, button });
+}
+
+/// Shown when the application was built without element debug info.
+pub(crate) const MISSING_DEBUG_INFO_MESSAGE: &str = "The use of the ElementHandle API requires the presence of debug info in Slint compiler generated code. Set the `SLINT_EMIT_DEBUG_INFO=1` environment variable at application build time or use `compile_with_config` and `with_debug_info` with `slint_build`'s `CompilerConfiguration`";
 
 fn warn_missing_debug_info() {
-    i_slint_core::debug_log!("The use of the ElementHandle API requires the presence of debug info in Slint compiler generated code. Set the `SLINT_EMIT_DEBUG_INFO=1` environment variable at application build time or use `compile_with_config` and `with_debug_info` with `slint_build`'s `CompilerConfiguration`")
+    i_slint_core::debug_log!("{}", MISSING_DEBUG_INFO_MESSAGE)
 }
 
 mod internal {
     /// Used as base of another trait so it cannot be re-implemented
     pub trait Sealed {}
+}
+
+/// Describes the kind of layout an element represents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum LayoutKind {
+    /// A `HorizontalLayout`.
+    HorizontalLayout,
+    /// A `VerticalLayout`.
+    VerticalLayout,
+    /// A `GridLayout`.
+    GridLayout,
+    /// A flex box layout.
+    FlexboxLayout,
+}
+
+impl LayoutKind {
+    fn from_encoded(s: &str) -> Option<Self> {
+        match s {
+            "h-box" => Some(Self::HorizontalLayout),
+            "v-box" => Some(Self::VerticalLayout),
+            "grid" => Some(Self::GridLayout),
+            "flex-box" => Some(Self::FlexboxLayout),
+            _ => None,
+        }
+    }
 }
 
 pub(crate) use internal::Sealed;
@@ -26,7 +105,7 @@ pub trait ElementRoot: Sealed {
     fn item_tree(&self) -> ItemTreeRc;
     /// Returns the root of the element tree.
     fn root_element(&self) -> ElementHandle {
-        let item_rc = ItemRc::new(self.item_tree(), 0);
+        let item_rc = ItemRc::new_root(self.item_tree());
         ElementHandle { item: item_rc.downgrade(), element_index: 0 }
     }
 }
@@ -39,6 +118,7 @@ impl<T: ComponentHandle> ElementRoot for T {
 
 impl<T: ComponentHandle> Sealed for T {}
 
+#[allow(clippy::enum_variant_names)]
 enum SingleElementMatch {
     MatchById { id: String, root_base: Option<String> },
     MatchByTypeName(String),
@@ -98,7 +178,7 @@ impl ElementQueryInstruction {
 
         match query {
             ElementQueryInstruction::MatchDescendants => {
-                let mut results = vec![];
+                let mut results = Vec::new();
                 match element.visit_descendants_impl(
                     &mut |child| {
                         let (next_control_flow, sub_results) = Self::match_recursively(
@@ -117,7 +197,7 @@ impl ElementQueryInstruction {
                 }
             }
             ElementQueryInstruction::MatchSingleElement(criteria) => {
-                let mut results = vec![];
+                let mut results = Vec::new();
                 let control_flow = if criteria.matches(&element) {
                     let (next_control_flow, sub_results) = Self::match_recursively(
                         tail,
@@ -276,15 +356,14 @@ impl ElementHandle {
         let visit_attached_popups =
             |item_rc: &ItemRc, visitor: &mut dyn FnMut(ElementHandle) -> ControlFlow<R>| {
                 for (popup_elem, popup_item_tree) in active_popups {
-                    if popup_elem == item_rc {
-                        if let Some(result) = (ElementHandle {
-                            item: ItemRc::new(popup_item_tree.clone(), 0).downgrade(),
+                    if popup_elem == item_rc
+                        && let Some(result) = (ElementHandle {
+                            item: ItemRc::new_root(popup_item_tree.clone()).downgrade(),
                             element_index: 0,
                         })
                         .visit_descendants_impl(visitor, active_popups)
-                        {
-                            return Some(result);
-                        }
+                    {
+                        return Some(result);
                     }
                 }
                 None
@@ -310,6 +389,27 @@ impl ElementHandle {
             }
             ControlFlow::Continue(())
         })
+    }
+
+    /// Returns whether both handles refer to the same element of the same item.
+    #[cfg(any(feature = "system-testing", feature = "mcp"))]
+    pub(crate) fn is_same_element(&self, other: &ElementHandle) -> bool {
+        self.item == other.item && self.element_index == other.element_index
+    }
+
+    /// Returns a hashable value that equal elements share, for use as a lookup key.
+    /// Elements of different item trees can collide, so compare candidates with
+    /// [`Self::is_same_element`]. Returns None once the element is gone.
+    #[cfg(any(feature = "system-testing", feature = "mcp"))]
+    pub(crate) fn identity_hint(&self) -> Option<(u32, usize)> {
+        self.item.upgrade().map(|item| (item.index(), self.element_index))
+    }
+
+    /// Returns whether the compiler emitted the debug info that type names, ids and
+    /// descendant traversal need. See `MISSING_DEBUG_INFO_MESSAGE`.
+    #[cfg(any(feature = "system-testing", feature = "mcp"))]
+    pub(crate) fn has_debug_info(&self) -> bool {
+        self.item.upgrade().is_some_and(|item| item.element_count().is_some())
     }
 
     /// Creates a new [`ElementQuery`] to match any descendants of this element.
@@ -487,13 +587,18 @@ impl ElementHandle {
                 .skip(1)
                 .filter_map(
                     |(type_name, _)| {
-                        if !type_name.is_empty() {
-                            Some(type_name)
-                        } else {
-                            None
-                        }
+                        if !type_name.is_empty() { Some(type_name) } else { None }
                     },
                 )
+        })
+    }
+
+    /// Returns the layout kind if this element is a layout container;
+    /// None if the element is not a layout or is not valid anymore.
+    pub fn layout_kind(&self) -> Option<LayoutKind> {
+        self.item.upgrade().and_then(|item| {
+            item.element_layout_kind(self.element_index)
+                .and_then(|s| LayoutKind::from_encoded(s.as_str()))
         })
     }
 
@@ -560,6 +665,18 @@ impl ElementHandle {
         }
     }
 
+    /// Selects the text between two UTF-8 offsets, by invoking the element's
+    /// `accessible-action-set-selection-offsets` callback. Note that you can only do this if that callback
+    /// is declared in your Slint code.
+    pub fn set_accessible_selection_offsets(&self, anchor: i32, focus: i32) {
+        if self.element_index != 0 {
+            return;
+        }
+        if let Some(item) = self.item.upgrade() {
+            item.accessible_action(&AccessibilityAction::SetSelectionOffsets(anchor, focus))
+        }
+    }
+
     /// Returns the value of the element's `accessible-value-maximum` property, if present.
     pub fn accessible_value_maximum(&self) -> Option<f32> {
         if self.element_index != 0 {
@@ -622,6 +739,16 @@ impl ElementHandle {
         self.item
             .upgrade()
             .and_then(|item| item.accessible_string_property(AccessibleStringProperty::Description))
+    }
+
+    /// Returns the value of the `accessible-id` property, if present
+    pub fn accessible_id(&self) -> Option<SharedString> {
+        if self.element_index != 0 {
+            return None;
+        }
+        self.item
+            .upgrade()
+            .and_then(|item| item.accessible_string_property(AccessibleStringProperty::Id))
     }
 
     /// Returns the value of the `accessible-checked` property, if present
@@ -727,6 +854,28 @@ impl ElementHandle {
             .and_then(|item| item.parse().ok())
     }
 
+    /// Returns the value of the `accessible-orientation` property, if present.
+    pub fn accessible_orientation(&self) -> Option<crate::Orientation> {
+        if self.element_index != 0 {
+            return None;
+        }
+        self.item
+            .upgrade()
+            .and_then(|item| item.accessible_string_property(AccessibleStringProperty::Orientation))
+            .and_then(|s| s.parse().ok())
+    }
+
+    /// Returns the value of the `accessible-live-region` property, if present.
+    pub fn accessible_live_region(&self) -> Option<crate::AccessibleLiveness> {
+        if self.element_index != 0 {
+            return None;
+        }
+        self.item
+            .upgrade()
+            .and_then(|item| item.accessible_string_property(AccessibleStringProperty::LiveRegion))
+            .and_then(|s| s.parse().ok())
+    }
+
     /// Returns the size of the element in logical pixels. This corresponds to the value of the `width` and
     /// `height` properties in Slint code. Returns a zero size if the element is not valid.
     pub fn size(&self) -> i_slint_core::api::LogicalSize {
@@ -806,35 +955,60 @@ impl ElementHandle {
         }
     }
 
+    pub(crate) fn window_adapter(&self) -> Option<Rc<dyn i_slint_core::window::WindowAdapter>> {
+        self.item.upgrade().and_then(|item| item.window_adapter())
+    }
+
+    /// Move the mouse to the element center and press the pointer.
+    fn pointer_pressed(&self, button: PointerEventButton) {
+        let Some(window_adapter) = self.window_adapter() else {
+            return;
+        };
+        let window = window_adapter.window();
+        let position = self.absolute_center();
+
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerPressed { position, button });
+    }
+
+    /// Move the mouse to the element center and release the pointer.
+    fn pointer_released(&self, button: PointerEventButton) {
+        let Some(window_adapter) = self.window_adapter() else {
+            return;
+        };
+        let window = window_adapter.window();
+        let position = self.absolute_center();
+
+        window.dispatch_event(WindowEvent::PointerMoved { position });
+        window.dispatch_event(WindowEvent::PointerReleased { position, button });
+    }
+
     /// Simulates a single click (or touch tap) on the element at its center point with the
     /// specified button.
-    pub async fn single_click(&self, button: i_slint_core::platform::PointerEventButton) {
-        let Some(item) = self.item.upgrade() else { return };
-        let Some(window_adapter) = item.window_adapter() else { return };
-        let window = window_adapter.window();
+    pub async fn single_click(&self, button: PointerEventButton) {
+        self.pointer_pressed(button);
 
-        let item_pos = self.absolute_position();
-        let item_size = self.size();
-        let position = LogicalPosition::new(
-            item_pos.x + item_size.width / 2.,
-            item_pos.y + item_size.height / 2.,
-        );
+        wait_for(Duration::from_millis(50)).await;
 
-        window.dispatch_event(i_slint_core::platform::WindowEvent::PointerMoved { position });
-        window.dispatch_event(i_slint_core::platform::WindowEvent::PointerPressed {
-            position,
-            button,
-        });
+        self.pointer_released(button);
+    }
 
-        wait_for(std::time::Duration::from_millis(50)).await;
+    /// Simulates a single click (or touch tap) on the element at its center point with the
+    /// specified button.
+    ///
+    /// Compared to [Self::single_click()], this function uses mock time instead
+    /// of an actual timer, so that it can be used in our internal tests that do not have an event
+    /// loop.
+    pub fn mock_single_click(&self, button: PointerEventButton) {
+        self.pointer_pressed(button);
 
-        window_adapter.window().dispatch_event(
-            i_slint_core::platform::WindowEvent::PointerReleased { position, button },
-        );
+        crate::testing_backend::mock_elapsed_time(50);
+
+        self.pointer_released(button);
     }
 
     /// Simulates a double click (or touch tap) on the element at its center point.
-    pub async fn double_click(&self, button: i_slint_core::platform::PointerEventButton) {
+    pub async fn double_click(&self, button: PointerEventButton) {
         let Ok(click_interval) = i_slint_core::with_global_context(
             || Err(i_slint_core::platform::PlatformError::NoPlatform),
             |ctx| ctx.platform().click_interval(),
@@ -851,39 +1025,97 @@ impl ElementHandle {
             return;
         };
 
-        let Some(item) = self.item.upgrade() else { return };
-        let Some(window_adapter) = item.window_adapter() else { return };
+        self.pointer_pressed(button);
+
+        wait_for(single_click_duration).await;
+
+        self.pointer_released(button);
+        self.pointer_pressed(button);
+
+        wait_for(single_click_duration).await;
+
+        self.pointer_released(button);
+    }
+
+    /// Simulates a drag gesture from the element's center to the given target position.
+    ///
+    /// The sequence is:
+    /// 1. `PointerMoved` + `PointerPressed` at the element center
+    /// 2. Interpolated `PointerMoved` events from center to `target` (step size ~5 logical
+    ///    pixels, with a 16 ms delay between steps)
+    /// 3. `PointerMoved` + `PointerReleased` at `target`
+    ///
+    /// The step size is chosen to be smaller than the 8 px drag/flick detection threshold
+    /// so that intermediate positions are always reported.
+    pub async fn drag(&self, target: LogicalPosition, button: PointerEventButton) {
+        let Some(window_adapter) = self.window_adapter() else {
+            return;
+        };
+        let window = window_adapter.window();
+        let start = self.absolute_center();
+
+        // Press at element center.
+        window.dispatch_event(WindowEvent::PointerMoved { position: start });
+        window.dispatch_event(WindowEvent::PointerPressed { position: start, button });
+
+        // Interpolate intermediate moves.
+        let dx = target.x - start.x;
+        let dy = target.y - start.y;
+        let distance = (dx * dx + dy * dy).sqrt();
+
+        if distance > f32::EPSILON {
+            // At least 2 steps to guarantee the drag threshold is crossed.
+            let steps = ((distance / DRAG_STEP_SIZE).ceil() as usize).max(2);
+
+            for i in 1..steps {
+                let t = i as f32 / steps as f32;
+                let pos = LogicalPosition::new(start.x + dx * t, start.y + dy * t);
+                wait_for(Duration::from_millis(DRAG_STEP_DELAY_MS)).await;
+                window.dispatch_event(WindowEvent::PointerMoved { position: pos });
+            }
+
+            // Final move to exact target.
+            wait_for(Duration::from_millis(DRAG_STEP_DELAY_MS)).await;
+            window.dispatch_event(WindowEvent::PointerMoved { position: target });
+        }
+
+        window.dispatch_event(WindowEvent::PointerReleased { position: target, button });
+    }
+
+    /// Simulates a drag gesture from the element's center to the given target position.
+    ///
+    /// Compared to [Self::drag()], this function uses mock time instead
+    /// of an actual timer, so that it can be used in internal tests without an event loop.
+    pub fn mock_drag(&self, target: LogicalPosition, button: PointerEventButton) {
+        let Some(window_adapter) = self.window_adapter() else {
+            return;
+        };
+        mock_drag_window(window_adapter.window(), self.absolute_center(), target, button);
+    }
+
+    /// The center of the element in the coordinate system that input events are dispatched in.
+    /// Unlike [`Self::absolute_position()`] this includes the location of an enclosing popup that's
+    /// rendered inside the window, such as a menu.
+    pub(crate) fn absolute_center(&self) -> LogicalPosition {
+        let Some(item) = self.item.upgrade() else {
+            return Default::default();
+        };
+        // Map the center rather than mapping the origin and adding a local half-extent,
+        // which ignores any scale or rotation an ancestor applies (#13242).
+        i_slint_core::lengths::logical_position_to_api(
+            item.map_to_native_window(item.geometry().center()),
+        )
+    }
+
+    pub fn scroll(&self, delta_x: f32, delta_y: f32) {
+        let Some(window_adapter) = self.item.upgrade().and_then(|item| item.window_adapter())
+        else {
+            return;
+        };
         let window = window_adapter.window();
 
-        let item_pos = self.absolute_position();
-        let item_size = self.size();
-        let position = LogicalPosition::new(
-            item_pos.x + item_size.width / 2.,
-            item_pos.y + item_size.height / 2.,
-        );
-
-        window.dispatch_event(i_slint_core::platform::WindowEvent::PointerMoved { position });
-        window.dispatch_event(i_slint_core::platform::WindowEvent::PointerPressed {
-            position,
-            button,
-        });
-
-        wait_for(single_click_duration).await;
-
-        window.dispatch_event(i_slint_core::platform::WindowEvent::PointerReleased {
-            position,
-            button,
-        });
-        window.dispatch_event(i_slint_core::platform::WindowEvent::PointerPressed {
-            position,
-            button,
-        });
-
-        wait_for(single_click_duration).await;
-
-        window_adapter.window().dispatch_event(
-            i_slint_core::platform::WindowEvent::PointerReleased { position, button },
-        );
+        let center = self.absolute_center();
+        window.dispatch_event(WindowEvent::PointerScrolled { position: center, delta_x, delta_y });
     }
 
     fn active_popups(&self) -> Vec<(ItemRc, ItemTreeRc)> {
@@ -1077,13 +1309,14 @@ fn test_matches() {
 
     app.set_condition(true);
 
-    assert!(root
-        .query_descendants()
-        .match_id("App::visible-element")
-        .match_descendants()
-        .match_accessible_role(crate::AccessibleRole::Text)
-        .find_first()
-        .is_none());
+    assert!(
+        root.query_descendants()
+            .match_id("App::visible-element")
+            .match_descendants()
+            .match_accessible_role(crate::AccessibleRole::Text)
+            .find_first()
+            .is_none()
+    );
 
     let elems = root.query_descendants().match_id("App::dynamic-elem").find_all();
     assert_eq!(elems.len(), 1);
@@ -1139,20 +1372,22 @@ fn test_opacity() {
 
     use i_slint_core::graphics::euclid::approxeq::ApproxEq;
 
-    assert!(root
-        .query_descendants()
-        .match_id("App::translucent-label")
-        .find_first()
-        .unwrap()
-        .computed_opacity()
-        .approx_eq(&0.1));
-    assert!(root
-        .query_descendants()
-        .match_id("App::definitely-there")
-        .find_first()
-        .unwrap()
-        .computed_opacity()
-        .approx_eq(&1.0));
+    assert!(
+        root.query_descendants()
+            .match_id("App::translucent-label")
+            .find_first()
+            .unwrap()
+            .computed_opacity()
+            .approx_eq(&0.1)
+    );
+    assert!(
+        root.query_descendants()
+            .match_id("App::definitely-there")
+            .find_first()
+            .unwrap()
+            .computed_opacity()
+            .approx_eq(&1.0)
+    );
 }
 
 #[test]
@@ -1207,14 +1442,15 @@ fn test_popups() {
 
     let root = app.root_element();
 
-    assert!(root
-        .query_descendants()
-        .match_accessible_role(crate::AccessibleRole::Text)
-        .find_all()
-        .into_iter()
-        .filter_map(|elem| elem.accessible_label())
-        .collect::<Vec<_>>()
-        .is_empty());
+    assert!(
+        root.query_descendants()
+            .match_accessible_role(crate::AccessibleRole::Text)
+            .find_all()
+            .into_iter()
+            .filter_map(|elem| elem.accessible_label())
+            .collect::<Vec<_>>()
+            .is_empty()
+    );
 
     root.query_descendants()
         .match_id("App::first-button")
@@ -1247,4 +1483,86 @@ fn test_popups() {
             .collect::<Vec<_>>(),
         ["Nested", "Ok"]
     );
+}
+
+#[test]
+fn test_drag_touch_area() {
+    crate::init_no_event_loop();
+
+    slint::slint! {
+        export component App inherits Window {
+            width: 200px;
+            height: 200px;
+            out property <int> move-count: 0;
+            out property <float> last-x: 0;
+            out property <float> last-y: 0;
+            ta := TouchArea {
+                width: 100%;
+                height: 100%;
+                moved => {
+                    root.move-count += 1;
+                    root.last-x = self.mouse-x / 1px;
+                    root.last-y = self.mouse-y / 1px;
+                }
+            }
+        }
+    }
+
+    let app = App::new().unwrap();
+    let ta = ElementHandle::find_by_element_id(&app, "App::ta").next().unwrap();
+
+    // Drag from center (100,100) to (150,100) — 50px horizontal drag.
+    ta.mock_drag(LogicalPosition::new(150.0, 100.0), PointerEventButton::Left);
+
+    assert!(app.get_move_count() > 0, "moved callback should have fired");
+    // The last move should land at the target position (within the element, so
+    // target minus element origin = 150 - 0 = 150).
+    let last_x = app.get_last_x();
+    assert!((last_x - 150.0).abs() < 1.0, "last mouse-x should be near 150, got {last_x}");
+}
+
+#[test]
+fn test_drag_zero_distance() {
+    crate::init_no_event_loop();
+
+    slint::slint! {
+        export component App inherits Window {
+            width: 100px;
+            height: 100px;
+            out property <bool> was-pressed: false;
+            out property <bool> was-released: false;
+            out property <int> move-count: 0;
+            ta := TouchArea {
+                width: 100%;
+                height: 100%;
+                pointer-event(e) => {
+                    if e.kind == PointerEventKind.down {
+                        root.was-pressed = true;
+                    }
+                    if e.kind == PointerEventKind.up {
+                        root.was-released = true;
+                    }
+                }
+                moved => {
+                    root.move-count += 1;
+                }
+            }
+        }
+    }
+
+    let app = App::new().unwrap();
+    let ta = ElementHandle::find_by_element_id(&app, "App::ta").next().unwrap();
+
+    // Drag to the element's own center — zero distance.
+    let center = ta.absolute_position();
+    let sz = ta.size();
+    let target = LogicalPosition::new(center.x + sz.width / 2.0, center.y + sz.height / 2.0);
+    ta.mock_drag(target, PointerEventButton::Left);
+
+    assert!(app.get_was_pressed(), "press event should have fired");
+    assert!(app.get_was_released(), "release event should have fired");
+    // Zero-distance drag should skip interpolation — no moved events from the
+    // drag itself (the initial PointerMoved before press doesn't trigger `moved`
+    // because the button isn't down yet).
+    assert_eq!(app.get_move_count(), 0, "no moved events expected for zero-distance drag");
 }

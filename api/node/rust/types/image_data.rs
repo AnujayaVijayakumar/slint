@@ -4,12 +4,12 @@
 use std::vec;
 
 use i_slint_core::{
-    graphics::{Image, SharedImageBuffer, SharedPixelBuffer},
     ImageInner,
+    graphics::{Image, SharedImageBuffer, SharedPixelBuffer},
 };
 use napi::{
-    bindgen_prelude::{Buffer, External},
-    Env, JsUnknown,
+    Env,
+    bindgen_prelude::{Buffer, External, ToNapiValue, Unknown},
 };
 
 // This is needed for typedoc check JsImageData::image
@@ -18,7 +18,7 @@ pub type ImageData = Image;
 /// SlintPoint implements {@link ImageData}.
 #[napi]
 pub struct SlintImageData {
-    inner: Image,
+    pub(crate) inner: Image,
 }
 
 impl From<Image> for SlintImageData {
@@ -59,14 +59,14 @@ impl SlintImageData {
                     return Buffer::from(rgb_to_rgba(
                         buffer.as_bytes(),
                         (self.width() * self.height()) as usize,
-                    ))
+                    ));
                 }
                 SharedImageBuffer::RGBA8(buffer) => return Buffer::from(buffer.as_bytes()),
                 SharedImageBuffer::RGBA8Premultiplied(buffer) => {
                     return Buffer::from(rgb_to_rgba(
                         buffer.as_bytes(),
                         (self.width() * self.height()) as usize,
-                    ))
+                    ));
                 }
             }
         }
@@ -75,11 +75,11 @@ impl SlintImageData {
     }
 
     #[napi(getter)]
-    pub fn path(&self, env: Env) -> napi::Result<JsUnknown> {
-        self.inner.path().map_or_else(
-            || env.get_undefined().map(|v| v.into_unknown()),
-            |p| env.create_string(p.to_string_lossy().as_ref()).map(|v| v.into_unknown()),
-        )
+    pub fn path<'a>(&self, env: &'a Env) -> napi::Result<Unknown<'a>> {
+        match self.inner.path() {
+            None => ().into_unknown(env),
+            Some(p) => env.create_string(p.to_string_lossy().as_ref())?.into_unknown(env),
+        }
     }
 
     /// @hidden
@@ -90,7 +90,7 @@ impl SlintImageData {
 }
 
 fn rgb_to_rgba(bytes: &[u8], size: usize) -> Vec<u8> {
-    let mut rgba_bytes = vec![];
+    let mut rgba_bytes = Vec::new();
 
     for i in 0..size {
         if (i * 3) + 2 >= bytes.len() {

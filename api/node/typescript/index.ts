@@ -1,20 +1,28 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-import * as napi from "../rust-module.cjs";
+import * as napi from "../binding.cjs";
 export {
     Diagnostic,
     DiagnosticLevel,
     RgbaColor,
     Brush,
-} from "../rust-module.cjs";
+    DataTransfer,
+    StyledText,
+    Keys,
+} from "../binding.cjs";
 
 import { Model } from "./models";
 export { Model };
 
 export { ArrayModel } from "./models";
 
-import { Diagnostic } from "../rust-module.cjs";
+export { language } from "./generated/language";
+
+import * as platform from "./platform";
+export { platform };
+
+import { Diagnostic } from "../binding.cjs";
 
 import { fileURLToPath } from "node:url";
 
@@ -66,13 +74,13 @@ export interface Window {
     /** Gets or sets the physical size of the window on the screen, */
     physicalSize: Size;
 
-    /** Gets or sets the window's fullscreen state **/
+    /** Gets or sets the window's fullscreen state. */
     fullscreen: boolean;
 
-    /** Gets or sets the window's maximized state **/
+    /** Gets or sets the window's maximized state. */
     maximized: boolean;
 
-    /** Gets or sets the window's minimized state **/
+    /** Gets or sets the window's minimized state. */
     minimized: boolean;
 
     /**
@@ -92,6 +100,15 @@ export interface Window {
 
     /** Issues a request to the windowing system to re-render the contents of the window. */
     requestRedraw(): void;
+
+    /**
+     * Dispatches a window event to the scene.
+     *
+     * Returns whether the scene accepted the event or rejected it.
+     */
+    dispatchEvent(
+        event: platform.WindowEvent,
+    ): platform.WindowEventDispatchResult;
 }
 
 /**
@@ -130,7 +147,8 @@ export interface ImageData {
 export interface ComponentHandle {
     /**
      * Shows the window and runs the event loop. The returned promise is resolved when the event loop
-     * is terminated, for example when the last window was closed, or {@link quitEventLoop} was called.
+     * is terminated, for example when the last window is closed and the last visible system tray
+     * icon is hidden, or when {@link quitEventLoop} is called.
      *
      * This function is a convenience for calling {@link show}, followed by {@link runEventLoop}, and
      * {@link hide} when the event loop's promise is resolved.
@@ -140,16 +158,18 @@ export interface ComponentHandle {
     /**
      * Shows the component's window on the screen.
      */
-    show();
+    show(): void;
 
     /**
      * Hides the component's window, so that it is not visible anymore.
      */
-    hide();
+    hide(): void;
 
     /**
      * Returns the {@link Window} associated with this component instance.
      * The window API can be used to control different aspects of the integration into the windowing system, such as the position on the screen.
+     *
+     * Throws an error when accessed on non-windowed components such as ones inheriting from `SystemTrayIcon`.
      */
     get window(): Window;
 }
@@ -158,6 +178,7 @@ export interface ComponentHandle {
  * @hidden
  */
 class Component implements ComponentHandle {
+    [key: string]: unknown;
     #instance: napi.ComponentInstance;
 
     /**
@@ -184,11 +205,11 @@ class Component implements ComponentHandle {
         this.hide();
     }
 
-    show() {
+    show(): void {
         this.#instance.window().show();
     }
 
-    hide() {
+    hide(): void {
         this.#instance.window().hide();
     }
 }
@@ -375,13 +396,31 @@ function loadSlint(loadData: LoadData): Object {
                     );
                 }
 
+                // A `.slint` name may contain dashes, which JavaScript won't
+                // take as a plain identifier, so the properties and callbacks
+                // of a component are exposed under their translated name.
+                // Accept both spellings here, so that the object passed to the
+                // constructor reads like the component it initializes.
+                const componentDefinition = instance.definition();
+                const declaredName = new Map<string, string>();
+                for (const name of [
+                    ...componentDefinition.properties.map((prop) => prop.name),
+                    ...componentDefinition.callbacks,
+                ]) {
+                    declaredName.set(name, name);
+                    declaredName.set(translateName(name), name);
+                }
+
                 for (var key in properties) {
                     const value = properties[key];
+                    // Unknown names are passed through, to be reported by the
+                    // setter below.
+                    const name = declaredName.get(key) ?? key;
 
                     if (value instanceof Function) {
-                        instance.setCallback(key, value);
+                        instance.setCallback(name, value);
                     } else {
-                        instance.setProperty(key, properties[key]);
+                        instance.setProperty(name, properties[key]);
                     }
                 }
 
@@ -476,7 +515,7 @@ function loadSlint(loadData: LoadData): Object {
                         instance!
                             .definition()
                             .globalProperties(globalName)
-                            .forEach((prop) => {
+                            ?.forEach((prop) => {
                                 const propName = translateName(prop.name);
 
                                 if (globalObject[propName] !== undefined) {
@@ -513,7 +552,7 @@ function loadSlint(loadData: LoadData): Object {
                         instance!
                             .definition()
                             .globalCallbacks(globalName)
-                            .forEach((cb) => {
+                            ?.forEach((cb) => {
                                 const callbackName = translateName(cb);
 
                                 if (globalObject[callbackName] !== undefined) {
@@ -553,7 +592,7 @@ function loadSlint(loadData: LoadData): Object {
                         instance!
                             .definition()
                             .globalFunctions(globalName)
-                            .forEach((cb) => {
+                            ?.forEach((cb) => {
                                 const functionName = translateName(cb);
 
                                 if (globalObject[functionName] !== undefined) {
@@ -628,7 +667,7 @@ function loadSlint(loadData: LoadData): Object {
  * @returns Returns an object that is immutable and provides a constructor function for each exported Window component found in the `.slint` file.
  *          For instance, in the example above, a `Main` property is available, which can be used to create instances of the `Main` component using the `new` keyword.
  *          These instances offer properties and event handlers, adhering to the {@link ComponentHandle} interface.
- *          For further information on the available properties, refer to [Instantiating A Component](../index.html#instantiating-a-component).
+ *          For further information on the available properties, refer to [Instantiating A Component](/#instantiating-a-component).
  * @throws {@link CompileError} if errors occur during compilation.
  */
 export function loadFile(
@@ -668,7 +707,7 @@ export function loadFile(
  * @returns Returns an object that is immutable and provides a constructor function for each exported Window component found in the `.slint` file.
  *          For instance, in the example above, a `Main` property is available, which can be used to create instances of the `Main` component using the `new` keyword.
  *          These instances offer properties and event handlers, adhering to the {@link ComponentHandle} interface.
- *          For further information on the available properties, refer to [Instantiating A Component](../index.html#instantiating-a-component).
+ *          For further information on the available properties, refer to [Instantiating A Component](/#instantiating-a-component).
  * @throws {@link CompileError} if errors occur during compilation.
  */
 export function loadSource(
@@ -685,7 +724,7 @@ export function loadSource(
 class EventLoop {
     #quit_loop: boolean = false;
     #terminationPromise: Promise<unknown> | null = null;
-    #terminateResolveFn: ((_value: unknown) => void) | null;
+    #terminateResolveFn: ((_value: unknown) => void) | null = null;
 
     start(
         running_callback?: Function,
@@ -703,33 +742,57 @@ class EventLoop {
         napi.setQuitOnLastWindowClosed(quitOnLastWindowClosed);
 
         if (running_callback !== undefined) {
+            const cb = running_callback;
             napi.invokeFromEventLoop(() => {
-                running_callback();
+                cb();
                 running_callback = undefined;
             });
         }
 
-        // Give the nodejs event loop 16 ms to tick. This polling is sub-optimal, but it's the best we
-        // can do right now.
-        const nodejsPollInterval = 16;
-        const id = setInterval(() => {
-            if (
-                napi.processEvents() === napi.ProcessEventsResult.Exited ||
-                this.#quit_loop
-            ) {
-                clearInterval(id);
-                this.#terminateResolveFn!(undefined);
-                this.#terminateResolveFn = null;
-                this.#terminationPromise = null;
-                return;
+        if (napi.hasIntegratedEventLoop()) {
+            try {
+                // Register a uv_prepare handle that pumps Slint events
+                // on every libuv iteration.  The callback fires when the
+                // Slint event loop terminates.
+                napi.startIntegratedEventLoop(() => this.#resolve());
+                return this.#terminationPromise;
+            } catch {
+                // process_events not supported (e.g. testing backend) —
+                // fall through to the polling fallback.
             }
-        }, nodejsPollInterval);
+        }
+
+        // Fallback for Deno and runtimes where libuv's I/O source
+        // can't be watched.
+        {
+            const nodejsPollInterval = 16;
+            const id = setInterval(() => {
+                if (
+                    napi.processEvents() === napi.ProcessEventsResult.Exited ||
+                    this.#quit_loop
+                ) {
+                    clearInterval(id);
+                    this.#resolve();
+                    return;
+                }
+            }, nodejsPollInterval);
+        }
 
         return this.#terminationPromise;
     }
 
+    #resolve() {
+        if (this.#terminateResolveFn === null) {
+            return;
+        }
+        this.#terminateResolveFn(undefined);
+        this.#terminateResolveFn = null;
+        this.#terminationPromise = null;
+    }
+
     quit() {
         this.#quit_loop = true;
+        napi.quitEventLoop();
     }
 }
 
@@ -744,16 +807,21 @@ var globalEventLoop: EventLoop = new EventLoop();
  * @param args As Function it defines a callback that's invoked once when the event loop is running.
  * @param args.runningCallback Optional callback that's invoked once when the event loop is running.
  *                         The function's return value is ignored.
- * @param args.quitOnLastWindowClosed if set to `true` event loop is quit after last window is closed otherwise
- *                          it is closed after {@link quitEventLoop} is called.
- *                          This is useful for system tray applications where the application needs to stay alive even if no windows are visible.
- *                          (default true).
+ * @param args.quitOnLastWindowClosed if set to `true` the loop quits once the last window is closed
+ *                          and the last visible system tray icon is hidden; otherwise it runs until
+ *                          {@link quitEventLoop} is called. A visible SystemTrayIcon keeps the loop alive
+ *                          on its own under the default, so set this to `false` only when an
+ *                          application must run without any visible UI. (default true).
  *
- * Note that the event loop integration with Node.js is slightly imperfect. Due to conflicting
- * implementation details between Slint's and Node.js' event loop, the two loops are merged
- * by spinning one after the other, at 16 millisecond intervals. This means that when the
- * application is idle, it continues to consume a low amount of CPU cycles, checking if either
- * event loop has any pending events.
+ * On Linux, macOS, and Windows with Node.js,
+ * Slint uses an efficient event loop integration that watches libuv's
+ * I/O source from a background thread.
+ * This provides zero idle CPU usage and near-instant response to both UI and
+ * JavaScript events.
+ *
+ * On other runtimes (Deno),
+ * the integration falls back to polling at 16 millisecond intervals,
+ * which consumes a small amount of CPU when idle.
  */
 export function runEventLoop(
     args?:
@@ -1003,5 +1071,17 @@ export namespace private_api {
         component.component_instance.sendKeyboardStringSequence(s);
     }
 
+    export function send_key_combo(component: Component, keys: string[]) {
+        component.component_instance.sendKeyCombo(keys);
+    }
+
     export import initTesting = napi.initTesting;
+
+    /**
+     * Returns the optional capabilities that were compiled into the loaded
+     * native binary, e.g. `"testing"`, `"system-testing"` and `"mcp"`. When the
+     * default binary is loaded this is empty; when the "dev" binary is loaded
+     * it contains the additional features. See binding.cjs.
+     */
+    export import buildFeatures = napi.buildFeatures;
 }

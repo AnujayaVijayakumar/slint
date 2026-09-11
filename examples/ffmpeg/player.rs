@@ -1,9 +1,10 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: MIT
 
+// cSpell: ignore demuxer
 use std::path::PathBuf;
 
-use futures::{future::OptionFuture, FutureExt};
+use futures::{FutureExt, future::OptionFuture};
 
 mod audio;
 mod video;

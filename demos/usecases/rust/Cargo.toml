@@ -3,9 +3,9 @@
 
 [package]
 name = "usecases"
-version = "1.13.0"
+version = "1.18.0"
 authors = ["Slint Developers <info@slint.dev>"]
-edition = "2021"
+edition.workspace = true
 build = "build.rs"
 publish = false
 license = "MIT"
@@ -20,7 +20,7 @@ path = "src/main.rs"
 name = "usecases"
 
 [dependencies]
-slint = { path = "../../../api/rs/slint", features = ["serde", "backend-android-activity-06"] }
+slint = { path = "../../../api/rs/slint", default-features = false, features = ["compat-1-18", "std", "serde", "backend-android-activity-06"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
@@ -30,3 +30,6 @@ console_error_panic_hook = "0.1.5"
 
 [build-dependencies]
 slint-build = { path = "../../../api/rs/build" }
+
+[features]
+default = ["slint/default"]

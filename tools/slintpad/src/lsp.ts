@@ -23,14 +23,48 @@ export { Position as LspPosition } from "vscode-languageserver-types";
 import type { Position as LspPosition } from "vscode-languageserver-types";
 
 import slint_init, * as slint_preview from "@lsp/slint_lsp_wasm.js";
+import slint_lsp_wasm_url from "@lsp/slint_lsp_wasm_bg.wasm?url";
 
-import type { ResourceUrlMapperFunction } from "@lsp/slint_lsp_wasm.js";
-export { ResourceUrlMapperFunction };
+import { report_panic_dialog } from "./dialogs";
+
+import {
+    type ResourceUrlMapperFunction,
+    type InvokeSlintpadCallback,
+    SlintPadCallbackFunction,
+} from "@lsp/slint_lsp_wasm.js";
+export {
+    ResourceUrlMapperFunction,
+    InvokeSlintpadCallback,
+    SlintPadCallbackFunction,
+};
 
 export type ShowDocumentCallback = (
     _uri: string,
     _position: LspPosition,
 ) => boolean;
+
+function configuration_from_url(): Map<string, any>[] {
+    var obj = new Map<string, any>();
+    const params = new URLSearchParams(window.location.search);
+    const include_paths = params.getAll("include");
+    if (include_paths.length > 0) {
+        obj.set("includePaths", include_paths);
+    }
+    const library_paths = params.getAll("lib");
+    if (library_paths.length > 0) {
+        const lib_map = new Map<string, string>();
+        for (const lib of library_paths) {
+            const [name, url] = lib.split("=");
+            lib_map.set(name, url);
+        }
+        obj.set("libraryPaths", lib_map);
+    }
+    const experimental = params.get("EXPERIMENTAL");
+    if (experimental) {
+        obj.set("experimental", true);
+    }
+    return [obj];
+}
 
 function createLanguageClient(
     transports: MessageTransports,
@@ -45,6 +79,16 @@ function createLanguageClient(
                 error: () => ({ action: ErrorAction.Continue }),
                 closed: () => ({ action: CloseAction.DoNotRestart }),
             },
+            middleware: {
+                workspace: {
+                    configuration: (params, token, next) => {
+                        if (params.items[0].section === "slint") {
+                            return configuration_from_url();
+                        }
+                        return next(params, token);
+                    },
+                },
+            },
         },
         // create a language client connection to the server running in the web worker
         connectionProvider: {
@@ -58,26 +102,86 @@ function createLanguageClient(
 
 export type FileReader = (_url: string) => Promise<string>;
 
+export type LoadPhase =
+    | { kind: "downloading"; received: number; total: number }
+    | { kind: "compiling" }
+    | { kind: "initializing" };
+
+export type LoadProgressCallback = (phase: LoadPhase) => void;
+
 export class LspWaiter {
     #previewer_promise: Promise<slint_preview.InitOutput> | null;
     #lsp_promise: Promise<Worker> | null;
 
-    constructor() {
+    constructor(on_progress?: LoadProgressCallback) {
         const worker = new Worker(
             new URL("worker/lsp_worker.ts", import.meta.url),
             { type: "module" },
         );
         this.#lsp_promise = new Promise<Worker>((resolve) => {
-            worker.onmessage = (m) => {
+            worker.addEventListener("message", (m: MessageEvent) => {
+                const data = m.data;
                 // We cannot start sending messages to the client before we start listening which
                 // the server only does in a future after the wasm is loaded.
-                if (m.data === "OK") {
+                if (data === "OK") {
                     resolve(worker);
+                } else if (
+                    data &&
+                    typeof data === "object" &&
+                    data.type === "slintpad/panic"
+                ) {
+                    report_panic_dialog("lsp", data.message);
                 }
-            };
+            });
+        });
+        worker.addEventListener("error", (e: ErrorEvent) => {
+            report_panic_dialog(
+                "lsp",
+                e.message || "Uncaught error in LSP worker",
+            );
         });
 
-        this.#previewer_promise = slint_init({});
+        // Fetch and compile the LSP wasm once on the main thread and share the
+        // compiled module with the worker, so the browser does not have to
+        // download the same wasm twice. A cloned response is read in parallel
+        // so we can report byte-level download progress while compileStreaming
+        // consumes the original.
+        this.#previewer_promise = (async () => {
+            const response = await fetch(slint_lsp_wasm_url);
+            const compile_promise = WebAssembly.compileStreaming(response);
+            const progress_stream = response.clone();
+            const total =
+                Number(progress_stream.headers.get("Content-Length")) || 0;
+            on_progress?.({ kind: "downloading", received: 0, total });
+
+            const reader = progress_stream.body?.getReader();
+            if (reader) {
+                let received = 0;
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) {
+                        break;
+                    }
+                    if (value) {
+                        received += value.length;
+                        on_progress?.({
+                            kind: "downloading",
+                            received,
+                            total,
+                        });
+                    }
+                }
+            }
+
+            on_progress?.({ kind: "compiling" });
+            const wasm_module = await compile_promise;
+            worker.postMessage({
+                type: "slintpad/init_wasm",
+                module: wasm_module,
+            });
+            on_progress?.({ kind: "initializing" });
+            return await slint_init({ module_or_path: wasm_module });
+        })();
     }
 
     async wait_for_lsp(): Promise<Lsp> {
@@ -90,7 +194,11 @@ export class LspWaiter {
 
         const [_1, worker] = await Promise.all([pp, lp]);
 
-        return Promise.resolve(new Lsp(worker));
+        slint_preview.set_panic_hook((message: string) => {
+            report_panic_dialog("preview", message);
+        });
+
+        return new Lsp(worker);
     }
 }
 
@@ -164,6 +272,10 @@ export class Lsp {
 
                     return true;
                 }
+                if ((data as { type?: string }).type === "slintpad/panic") {
+                    // Panic messages are handled by the LspWaiter listener.
+                    return true;
+                }
                 return false;
             },
         );
@@ -220,12 +332,10 @@ export class Lsp {
     async previewer(
         resource_url_mapper: ResourceUrlMapperFunction,
         style: string,
+        slintpad_callback: InvokeSlintpadCallback,
     ): Promise<Previewer> {
         if (this.#preview_connector === null) {
             slint_preview.run_event_loop();
-
-            const params = new URLSearchParams(window.location.search);
-            const experimental = params.get("SLINT_EXPERIMENTAL_FEATURES");
 
             this.#preview_connector =
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -238,7 +348,7 @@ export class Lsp {
                     },
                     resource_url_mapper,
                     style,
-                    experimental === "1",
+                    slintpad_callback,
                 );
         }
         return new Previewer(this.#preview_connector);

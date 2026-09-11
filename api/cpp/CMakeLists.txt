@@ -1,28 +1,58 @@
 # Copyright © SixtyFPS GmbH <info@slint.dev>
 # SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+# cSpell: ignore bigobj buildroot CLANGCC CLANGCXX CROSSCOMPILING dlopening hostbuild IMPLIB javac libslint mbig MINSIZEREL NSIS RELWITHDEBINFO SONAME Yocto
 cmake_minimum_required(VERSION 3.21)
 # Select C++ and C as languages, as Corrosion needs ${CMAKE_C_COMPILER}
 # for linking
-project(Slint HOMEPAGE_URL "https://slint.dev/" LANGUAGES C CXX VERSION 1.13.0)
+project(Slint HOMEPAGE_URL "https://slint.dev/" LANGUAGES C CXX VERSION 1.18.0)
 
 include(FeatureSummary)
 include(CMakeDependentOption)
+# Included before the install rules below, so that they and the exported
+# package agree on where the library goes
+include(GNUInstallDirs)
 
-find_package(Corrosion QUIET 0.5)
+find_package(Corrosion QUIET 0.6)
 if (NOT Corrosion_FOUND)
     include(FetchContent)
     FetchContent_Declare(
         Corrosion
         GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
-        GIT_TAG v0.5.2
+        GIT_TAG v0.6.1
     )
 
     FetchContent_MakeAvailable(Corrosion)
-endif (NOT Corrosion_FOUND)
+endif ()
 
 list(PREPEND CMAKE_MODULE_PATH ${Corrosion_SOURCE_DIR}/cmake)
-find_package(Rust 1.85 REQUIRED MODULE)
+find_package(Rust 1.92 REQUIRED MODULE)
+
+# When building for Android (NDK toolchain sets CMAKE_SYSTEM_NAME to "Android"),
+# auto-configure the Rust target and pick platform-level defaults.
+# Feature defaults specific to Android live inline with their define_cargo_dependent_feature() calls below.
+if(ANDROID)
+    # Map Android ABI to Rust target triple
+    if(ANDROID_ABI STREQUAL "arm64-v8a")
+        set(Rust_CARGO_TARGET "aarch64-linux-android" CACHE STRING "" FORCE)
+    elseif(ANDROID_ABI STREQUAL "armeabi-v7a")
+        set(Rust_CARGO_TARGET "armv7-linux-androideabi" CACHE STRING "" FORCE)
+    elseif(ANDROID_ABI STREQUAL "x86_64")
+        set(Rust_CARGO_TARGET "x86_64-linux-android" CACHE STRING "" FORCE)
+    elseif(ANDROID_ABI STREQUAL "x86")
+        set(Rust_CARGO_TARGET "i686-linux-android" CACHE STRING "" FORCE)
+    else()
+        message(FATAL_ERROR "Unsupported ANDROID_ABI: ${ANDROID_ABI}")
+    endif()
+
+    # Android requires a shared library
+    set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
+
+    # Default to Material style on Android
+    if(NOT SLINT_STYLE)
+        set(SLINT_STYLE "material" CACHE STRING "" FORCE)
+    endif()
+endif()
 
 option(BUILD_SHARED_LIBS "Build Slint as shared library" ON)
 option(SLINT_FEATURE_COMPILER "Enable support for compiling .slint files to C++ ahead of time" ON)
@@ -36,89 +66,7 @@ set(SLINT_COMPILER "" CACHE STRING "Path to the slint-compiler executable. When 
 set(SLINT_LIBRARY_CARGO_FLAGS "" CACHE STRING
     "Flags to pass to cargo when building the Slint runtime library")
 
-function(define_cargo_feature cargo_feature description default)
-    # turn foo-bar into SLINT_FEATURE_FOO_BAR
-    string(TOUPPER "${cargo_feature}" cmake_option)
-    string(REPLACE "-" "_" cmake_option "${cmake_option}")
-    list(APPEND public_cmake_features ${cmake_option})
-    set(cmake_option "SLINT_FEATURE_${cmake_option}")
-    option("${cmake_option}" "${description}" ${default})
-
-    if(${cmake_option})
-        list(APPEND features ${cargo_feature})
-    endif()
-
-    set(features "${features}" PARENT_SCOPE)
-    set(public_cmake_features "${public_cmake_features}" PARENT_SCOPE)
-    add_feature_info(${cmake_option} ${cmake_option} ${description})
-endfunction()
-
-function(define_cargo_dependent_feature cargo_feature description default depends_condition)
-    # turn foo-bar into SLINT_FEATURE_FOO_BAR
-    string(TOUPPER "${cargo_feature}" cmake_option)
-    string(REPLACE "-" "_" cmake_option "${cmake_option}")
-    list(APPEND public_cmake_features ${cmake_option})
-    set(cmake_option "SLINT_FEATURE_${cmake_option}")
-    cmake_dependent_option("${cmake_option}" "${description}" ${default} ${depends_condition} OFF)
-
-    if(${cmake_option})
-        list(APPEND features ${cargo_feature})
-    endif()
-
-    set(features "${features}" PARENT_SCOPE)
-    set(public_cmake_features "${public_cmake_features}" PARENT_SCOPE)
-    add_feature_info(${cmake_option} ${cmake_option} ${description})
-endfunction()
-
-# Features that are mapped to features in the Rust crate. These and their
-# defaults need to be kept in sync with the Rust bit (cpp/Cargo.toml and cbindgen.rs)
-
-define_cargo_feature(freestanding "Enable use of freestanding environment. This is only for bare-metal systems. Most other features are incompatible with this one" OFF)
-
-# Compat options (must be declared after the STD feature, but before the other renderer features)
-function(define_renderer_winit_compat_option renderer)
-    string(TOUPPER "${renderer}" cmake_option)
-    string(REPLACE "-" "_" cmake_option "${cmake_option}")
-    cmake_dependent_option("SLINT_FEATURE_RENDERER_WINIT_${cmake_option}" "Compat option equivalent to SLINT_FEATURE_RENDERER_${cmake_option}" OFF "NOT SLINT_FEATURE_FREESTANDING" OFF)
-    if(SLINT_FEATURE_RENDERER_WINIT_${cmake_option})
-        set("SLINT_FEATURE_RENDERER_${cmake_option}" ON PARENT_SCOPE)
-        message("SLINT_FEATURE_RENDERER_WINIT_${cmake_option} is deprecated, use SLINT_FEATURE_RENDERER_${cmake_option} instead")
-    endif()
-endfunction()
-define_renderer_winit_compat_option(femtovg)
-define_renderer_winit_compat_option(skia)
-define_renderer_winit_compat_option(skia-opengl)
-define_renderer_winit_compat_option(skia-vulkan)
-define_renderer_winit_compat_option(software)
-
-define_cargo_dependent_feature(interpreter "Enable support for the Slint interpreter to load .slint files at run-time" ON "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(live-reload "Enable support for the Slint live-reload to re-load changed .slint files at run-time" OFF "SLINT_FEATURE_INTERPRETER")
-
-define_cargo_dependent_feature(backend-winit "Enable support for the winit crate to interaction with all windowing systems." ON "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(backend-winit-x11 "Enable support for the winit create to interact only with the X11 windowing system on Unix. Enable this option and turn off SLINT_FEATURE_BACKEND_WINIT for a smaller build with just X11 support on Unix." OFF "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(backend-winit-wayland "Enable support for the winit create to interact only with the wayland windowing system on Unix. Enable this option and turn off SLINT_FEATURE_BACKEND_WINIT for a smaller build with just wayland support." OFF "NOT SLINT_FEATURE_FREESTANDING")
-
-define_cargo_dependent_feature(renderer-femtovg "Enable support for the OpenGL ES 2.0 based FemtoVG rendering engine." ON "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(renderer-femtovg-wgpu "Enable support for the WGPU based FemtoVG rendering engine." OFF "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(renderer-skia "Enable support for the Skia based rendering engine." OFF "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(renderer-skia-opengl "Enable support for the Skia based rendering engine with its OpenGL backend." OFF "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(renderer-skia-vulkan "Enable support for the Skia based rendering engine with its Vulkan backend." OFF "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_feature(renderer-software "Enable support for the software renderer" OFF)
-
-set(SLINT_BACKEND_QT_DEFAULT OFF)
-if(${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-  set(SLINT_BACKEND_QT_DEFAULT ON)
-endif()
-define_cargo_dependent_feature(backend-qt "Enable Qt based rendering backend" ${SLINT_BACKEND_QT_DEFAULT} "NOT SLINT_FEATURE_FREESTANDING")
-
-define_cargo_dependent_feature(backend-linuxkms "Enable support for the backend that renders a single window fullscreen on Linux. Requires libseat. If you don't have libseat, select `backend-linuxkms-noseat` instead. (Experimental)" OFF "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(backend-linuxkms-noseat "Enable support for the backend that renders a single window fullscreen on Linux (Experimental)" OFF "NOT SLINT_FEATURE_FREESTANDING")
-
-define_cargo_dependent_feature(gettext "Enable support of translations using gettext" OFF "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(accessibility "Enable integration with operating system provided accessibility APIs" ON "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_dependent_feature(testing "Enable support for testing API (experimental)" ON "NOT SLINT_FEATURE_FREESTANDING")
-define_cargo_feature(experimental "Enable experimental features. (No backward compatibility guarantees)" OFF)
-define_cargo_dependent_feature(system-testing "Enable system testing support (experimental)" OFF "SLINT_FEATURE_EXPERIMENTAL AND NOT SLINT_FEATURE_FREESTANDING")
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/SlintFeatures.cmake)
 
 if (SLINT_BUILD_RUNTIME)
     if(SLINT_FEATURE_COMPILER AND NOT SLINT_COMPILER)
@@ -149,7 +97,15 @@ if(SLINT_FEATURE_COMPILER AND NOT SLINT_COMPILER)
         PROPERTY CORROSION_NO_DEFAULT_FEATURES
         ON
     )
-    list(APPEND slint_compiler_features "software-renderer")
+    list(APPEND slint_compiler_features "renderer-software" "image-default-formats" "bundle-translations" "cpp")
+
+    # Switch to dlopening fontconfig in the slint-compiler to avoid the issue that
+    # for example in Yocto environments, PKG_CONFIG_PATH will be set to the target only
+    # and pkg-config in PATH doesn't permit lookups in the hots.
+    if(CMAKE_CROSSCOMPILING)
+        list(APPEND slint_compiler_features "fontconfig-dlopen")
+    endif()
+
     if (SLINT_FEATURE_SDF_FONTS)
         list(APPEND slint_compiler_features "sdf-fonts")
     endif()
@@ -184,8 +140,12 @@ if (SLINT_BUILD_RUNTIME)
     add_library(Slint::Slint ALIAS Slint)
     target_link_libraries(Slint INTERFACE slint_cpp)
     target_compile_features(Slint INTERFACE cxx_std_20)
-    if (MSVC)
-        target_compile_options(Slint INTERFACE /bigobj)
+    if (WIN32)
+        target_compile_options(Slint INTERFACE
+            $<$<CXX_COMPILER_ID:MSVC>:/bigobj>
+            $<$<CXX_COMPILER_ID:Clang>:-Wa,-mbig-obj>
+            $<$<CXX_COMPILER_ID:GNU>:-Wa,-mbig-obj>
+        )
     endif()
 
     foreach(feature ${public_cmake_features})
@@ -202,7 +162,7 @@ if (SLINT_BUILD_RUNTIME)
     set_property(TARGET Slint APPEND PROPERTY EXPORT_PROPERTIES "SLINT_DISABLED_FEATURES")
 
     if (SLINT_FEATURE_FREESTANDING)
-        if (ESP_PLATFORM)
+        if (ESP_PLATFORM AND NOT IDF_TARGET STREQUAL "esp32p4")
             list(APPEND features "esp-backtrace/${IDF_TARGET}")
             list(APPEND features "esp-println/${IDF_TARGET}")
         endif()
@@ -259,26 +219,29 @@ if (SLINT_BUILD_RUNTIME)
         )
     endif()
 
-    if(SLINT_FEATURE_FREESTANDING)
-        set(SLINT_STYLE_DEFAULT "fluent")
-    elseif(ANDROID)
-        set(SLINT_STYLE_DEFAULT "material")
-    elseif(WIN32)
-        set(SLINT_STYLE_DEFAULT "fluent")
-    elseif(APPLE)
-        set(SLINT_STYLE_DEFAULT "cupertino")
-    elseif (SLINT_FEATURE_BACKEND_QT AND TARGET Qt::qmake)
-        set(SLINT_STYLE_DEFAULT "qt")
-    else ()
-        set(SLINT_STYLE_DEFAULT "fluent")
-    endif()
-
     set(SLINT_STYLE "" CACHE STRING "The Slint Widget Style")
 
-    if(SLINT_STYLE AND NOT SLINT_STYLE STREQUAL "native")
-        set_property(GLOBAL PROPERTY SLINT_STYLE ${SLINT_STYLE})
+    if(SLINT_STYLE)
+        if(SLINT_STYLE STREQUAL "native")
+            if(SLINT_FEATURE_FREESTANDING)
+                set(SLINT_NATIVE_STYLE "fluent")
+            elseif(ANDROID)
+                set(SLINT_NATIVE_STYLE "material")
+            elseif(WIN32)
+                set(SLINT_NATIVE_STYLE "fluent")
+            elseif(APPLE)
+                set(SLINT_NATIVE_STYLE "cupertino")
+            elseif (SLINT_FEATURE_BACKEND_QT AND TARGET Qt::qmake)
+                set(SLINT_NATIVE_STYLE "qt")
+            else ()
+                set(SLINT_NATIVE_STYLE "fluent")
+            endif()
+            set_property(GLOBAL PROPERTY SLINT_STYLE ${SLINT_NATIVE_STYLE})
+        else()
+            set_property(GLOBAL PROPERTY SLINT_STYLE ${SLINT_STYLE})
+        endif()
     else()
-        set_property(GLOBAL PROPERTY SLINT_STYLE ${SLINT_STYLE_DEFAULT})
+        set_property(GLOBAL PROPERTY SLINT_STYLE "fluent")
     endif()
 
     # Build environments such as buildroot set PKG_CONFIG_SYSROOT_DIR in their toolchain file
@@ -292,6 +255,47 @@ if (SLINT_BUILD_RUNTIME)
             PROPERTY CORROSION_ENVIRONMENT_VARIABLES
             "PKG_CONFIG_SYSROOT_DIR=$ENV{PKG_CONFIG_SYSROOT_DIR}"
         )
+    endif()
+
+    # Propagate Android NDK/SDK paths to the Rust build,
+    # so the android-activity backend can compile Java sources and produce DEX bytecode.
+    if(ANDROID)
+        # The android-activity backend invokes javac during cargo build.
+        # Catch a missing JDK at configure time rather than mid-build.
+        find_program(JAVAC_EXECUTABLE javac NO_CACHE)
+        if(NOT JAVAC_EXECUTABLE)
+            message(FATAL_ERROR "javac not found in PATH. The Slint Android backend needs a JDK (with javac) to compile its Java sources during cargo build. Install a JDK and ensure javac is on PATH (or set JAVA_HOME to a JDK with bin/javac).")
+        endif()
+        if(DEFINED ENV{ANDROID_NDK_ROOT})
+            set_property(
+                TARGET slint_cpp
+                APPEND
+                PROPERTY CORROSION_ENVIRONMENT_VARIABLES
+                "ANDROID_NDK_ROOT=$ENV{ANDROID_NDK_ROOT}"
+            )
+        elseif(CMAKE_ANDROID_NDK)
+            set_property(
+                TARGET slint_cpp
+                APPEND
+                PROPERTY CORROSION_ENVIRONMENT_VARIABLES
+                "ANDROID_NDK_ROOT=${CMAKE_ANDROID_NDK}"
+            )
+        endif()
+        if(DEFINED ENV{ANDROID_HOME})
+            set_property(
+                TARGET slint_cpp
+                APPEND
+                PROPERTY CORROSION_ENVIRONMENT_VARIABLES
+                "ANDROID_HOME=$ENV{ANDROID_HOME}"
+            )
+        elseif(CMAKE_ANDROID_SDK)
+            set_property(
+                TARGET slint_cpp
+                APPEND
+                PROPERTY CORROSION_ENVIRONMENT_VARIABLES
+                "ANDROID_HOME=${CMAKE_ANDROID_SDK}"
+            )
+        endif()
     endif()
 
     if(SLINT_FEATURE_RENDERER_SKIA OR SLINT_FEATURE_RENDERER_SKIA_OPENGL OR SLINT_FEATURE_RENDERER_SKIA_VULKAN)
@@ -358,36 +362,32 @@ if (SLINT_BUILD_RUNTIME)
     endforeach()
 
     set(generated_headers
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_brush_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_builtin_structs.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_builtin_structs_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_color_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_enums.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_enums_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_generated_public.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_image_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_pathdata_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_platform_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_properties_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_qt_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_sharedvector_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_string_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_timer_internal.h
-        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_events_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_brush_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_builtin_structs.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_builtin_structs_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_color_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_enums.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_enums_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_generated_public.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_image_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_pathdata_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_platform_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_properties_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_data_transfer_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_qt_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_sharedvector_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_string_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_timer_internal.h
+        ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_events_internal.h
     )
 
     if(SLINT_FEATURE_INTERPRETER)
         list(APPEND generated_headers
-            ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_interpreter_internal.h
-            ${CMAKE_CURRENT_BINARY_DIR}/generated_include/slint_interpreter_generated_public.h
+            ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_interpreter_internal.h
+            ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private/slint_interpreter_generated_public.h
         )
     endif()
-
-
-    foreach(header IN LISTS generated_headers)
-        set_property(TARGET Slint APPEND PROPERTY PUBLIC_HEADER ${header})
-    endforeach()
 
     target_include_directories(Slint INTERFACE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated_include>
@@ -403,9 +403,11 @@ if (SLINT_BUILD_RUNTIME)
 
     export(TARGETS Slint slint_cpp
         NAMESPACE Slint:: FILE "${CMAKE_BINARY_DIR}/lib/cmake/Slint/SlintTargets.cmake")
-    install(EXPORT SlintTargets NAMESPACE Slint:: DESTINATION lib/cmake/Slint)
+    install(EXPORT SlintTargets NAMESPACE Slint:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Slint)
     install(TARGETS Slint slint_cpp
-        EXPORT SlintTargets LIBRARY DESTINATION lib PUBLIC_HEADER DESTINATION include/slint)
+        EXPORT SlintTargets LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} PUBLIC_HEADER DESTINATION include/slint)
+    install(DIRECTORY include/private DESTINATION include/slint FILES_MATCHING PATTERN "*.h")
+    install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated_include/private DESTINATION include/slint FILES_MATCHING PATTERN "*.h")
 
     install(FILES $<TARGET_FILE:${slint_cpp_impl}> TYPE LIB)
 
@@ -416,7 +418,6 @@ if (SLINT_BUILD_RUNTIME)
 endif(SLINT_BUILD_RUNTIME)
 
 include(CMakePackageConfigHelpers)
-include(GNUInstallDirs)
 
 
 if(SLINT_FEATURE_COMPILER AND NOT SLINT_COMPILER)
@@ -459,7 +460,7 @@ if(SLINT_BUILD_RUNTIME)
             cmake_path(GET _slint_compiler_location FILENAME SLINT_COMPILER_FILE_NAME)
         endif()
 
-        configure_package_config_file("cmake/SlintConfig.cmake.in" "${CMAKE_CURRENT_BINARY_DIR}/lib/cmake/Slint/SlintConfig.cmake" INSTALL_DESTINATION lib/cmake/Slint)
+        configure_package_config_file("cmake/SlintConfig.cmake.in" "${CMAKE_CURRENT_BINARY_DIR}/lib/cmake/Slint/SlintConfig.cmake" INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Slint)
     endfunction()
 
     cmake_language(DEFER CALL _slint_write_configure_file)
@@ -474,7 +475,7 @@ if(SLINT_BUILD_RUNTIME)
         "${CMAKE_CURRENT_BINARY_DIR}/lib/cmake/Slint/SlintConfig.cmake"
         "${CMAKE_CURRENT_BINARY_DIR}/lib/cmake/Slint/SlintConfigVersion.cmake"
         "${CMAKE_CURRENT_LIST_DIR}/cmake/SlintMacro.cmake"
-        DESTINATION lib/cmake/Slint
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/Slint
     )
 
 endif(SLINT_BUILD_RUNTIME)

@@ -4,18 +4,16 @@
 use std::rc::{Rc, Weak};
 
 use crate::{
-    common,
+    editor_preview,
     preview::{properties, ui},
 };
 
 use lsp_types::Url;
 
 use i_slint_compiler::{expression_tree, langtype, object_tree};
-use slint::{ComponentHandle, Model, ModelRc, SharedString};
+use slint::{Model, ModelRc, SharedString};
 
-pub fn setup(ui: &ui::PreviewUi) {
-    let api = ui.global::<ui::Api>();
-
+pub fn setup(api: &ui::Api<'_>) {
     api.on_filter_palettes(filter_palettes);
     api.on_is_css_color(is_css_color);
 }
@@ -26,7 +24,7 @@ pub fn setup(ui: &ui::PreviewUi) {
 /// and the result will be cached
 struct PaletteModel {
     palette: std::cell::OnceCell<Vec<ui::PaletteEntry>>,
-    document_cache: Rc<common::DocumentCache>,
+    document_cache: Rc<editor_preview::DocumentCache>,
     document_uri: Url,
     window_adapter: Weak<dyn slint::platform::WindowAdapter>,
 }
@@ -61,7 +59,7 @@ impl Model for PaletteModel {
 }
 
 pub fn collect_palette(
-    document_cache: &Rc<common::DocumentCache>,
+    document_cache: &Rc<editor_preview::DocumentCache>,
     document_uri: &Url,
     window_adapter: &Rc<dyn slint::platform::WindowAdapter>,
 ) -> ModelRc<ui::PaletteEntry> {
@@ -74,8 +72,7 @@ pub fn collect_palette(
     ModelRc::new(model)
 }
 
-pub fn set_palette(ui: &ui::PreviewUi, values: ModelRc<ui::PaletteEntry>) {
-    let api = ui.global::<ui::Api>();
+pub fn set_palette(api: &ui::Api<'_>, values: ModelRc<ui::PaletteEntry>) {
     api.set_palettes(values);
 }
 
@@ -104,21 +101,32 @@ fn collect_colors_palette() -> Vec<ui::PaletteEntry> {
 fn find_binding_expression(
     element: &object_tree::ElementRc,
     property_name: &str,
-) -> Option<expression_tree::BindingExpression> {
+) -> Option<expression_tree::Expression> {
     let property_name = smol_str::SmolStr::from(property_name);
 
     let elem = element.borrow();
-    let be = elem.bindings.get(&property_name).map(|be| be.borrow().clone())?;
+    let be = elem.binding_cell_including_synthetic(&property_name).map(|be| be.borrow().clone())?;
     if matches!(be.expression, expression_tree::Expression::Invalid) {
-        for nr in &be.two_way_bindings {
-            if let Some(be) = find_binding_expression(&nr.element(), nr.name().as_str()) {
-                return Some(be);
+        for twb in &be.two_way_bindings {
+            let expression_tree::TwoWayBinding::Property { property, field_access } = twb else {
+                continue;
+            };
+            if let Some(mut e) =
+                find_binding_expression(&property.element(), property.name().as_str())
+            {
+                for f in field_access {
+                    e = expression_tree::Expression::StructFieldAccess {
+                        base: e.into(),
+                        name: f.clone(),
+                    };
+                }
+                return Some(e);
             }
         }
 
         None
     } else {
-        Some(be)
+        Some(be.expression)
     }
 }
 
@@ -173,7 +181,6 @@ pub fn evaluate_property(
     window_adapter: Option<&Rc<dyn slint::platform::WindowAdapter>>,
 ) -> ui::PropertyValue {
     let value = find_binding_expression(element, property_name)
-        .map(|be| be.expression)
         .or(default_value.clone())
         .as_ref()
         .and_then(|element| {
@@ -193,18 +200,15 @@ fn handle_type(
 ) {
     let full_accessor = format!("{global_name}.{property_name}");
 
-    let value = find_binding_expression(element, property_name)
-        .map(|be| be.expression)
-        .as_ref()
-        .and_then(|element| {
-            crate::preview::eval::fully_eval_expression_tree_expression(element, window_adapter)
-        });
+    let value = find_binding_expression(element, property_name).as_ref().and_then(|element| {
+        crate::preview::eval::fully_eval_expression_tree_expression(element, window_adapter)
+    });
 
     handle_type_impl(&full_accessor, value, ty, values);
 }
 
 fn collect_palette_from_globals(
-    document_cache: &common::DocumentCache,
+    document_cache: &editor_preview::DocumentCache,
     document_uri: &Url,
     mut values: Vec<ui::PaletteEntry>,
     window_adapter: Option<&Rc<dyn slint::platform::WindowAdapter>>,
@@ -221,7 +225,7 @@ fn collect_palette_from_globals(
         }
 
         let properties = properties::get_properties(
-            &common::ElementRcNode { element: global.clone(), debug_index: 0 },
+            &editor_preview::ElementRcNode { element: global.clone(), debug_index: 0 },
             properties::LayoutKind::None,
         );
 
@@ -253,7 +257,7 @@ fn filter_palettes(
     pattern: slint::SharedString,
 ) -> slint::ModelRc<ui::PaletteEntry> {
     let pattern = pattern.to_string();
-    std::rc::Rc::new(slint::VecModel::from(common::fuzzy_filter_iter(
+    std::rc::Rc::new(slint::VecModel::from(super::fuzzy_filter_iter(
         &mut input.iter(),
         |p| {
             format!(
@@ -295,15 +299,15 @@ mod tests {
         });
     }
 
-    fn compile(source: &str) -> (common::DocumentCache, lsp_types::Url) {
+    fn compile(source: &str) -> (editor_preview::DocumentCache, lsp_types::Url) {
         let (dc, url, diag) = crate::test::loaded_document_cache(source.to_string());
         for (u, diag) in diag.iter() {
             if diag.is_empty() {
                 continue;
             }
-            eprintln!("Diags for {u}");
+            tracing::debug!("Diags for {u}");
             for d in diag {
-                eprintln!("{d:#?}");
+                tracing::debug!("{d:#?}");
                 assert!(!matches!(d.severity, Some(lsp_types::DiagnosticSeverity::ERROR)));
             }
         }
@@ -324,7 +328,7 @@ mod tests {
 
     #[track_caller]
     fn compare_brush(entry: &PaletteEntry, name: &str, brush: &slint::Brush) {
-        eprintln!("\n\n\n{name}:\n{entry:#?}");
+        tracing::debug!("\n\n\n{name}:\n{entry:#?}");
         assert_eq!(entry.name, name);
         assert_eq!(entry.value.display_string, name);
         assert_eq!(entry.value.code, name);
@@ -366,13 +370,16 @@ global Test {
     out property <color> color3 <=> Other.color3;
     in property <color> color4;
     out property <color> color5: index == 0 ? Other.color1 : Other.color2;
+
+    in-out property <{x: int, y: color}> struct: { x: 0, y: #789 };
+    in-out property color6 <=> struct.y;
 }
 
 export component Main { }
             "#,
         );
         let result = collect_palette_from_globals(&dc, &url, Vec::new(), None);
-        assert_eq!(result.len(), 7);
+        assert_eq!(result.len(), 10);
 
         compare(&result[0], "Other.color1", 0x11, 0xff, 0xff);
         compare(&result[1], "Other.color2", 0x22, 0xff, 0xff);
@@ -382,6 +389,9 @@ export component Main { }
         compare(&result[4], "Test.color2", 0x22, 0xff, 0xff);
         compare(&result[5], "Test.color3", 0x33, 0xff, 0xff);
         compare(&result[6], "Test.color5", 0x11, 0xff, 0xff);
+        compare(&result[7], "Test.color6", 0x77, 0x88, 0x99);
+        assert_eq!(result[8].name, "Test.struct.x"); // not a color
+        compare(&result[9], "Test.struct.y", 0x77, 0x88, 0x99);
     }
 
     #[test]
@@ -589,12 +599,14 @@ export component Main { }
         ];
 
         for (style, border) in cases {
-            let mut config = crate::common::document_cache::CompilerConfiguration::default();
-            config.style = Some(style.to_string());
-            let mut dc = common::DocumentCache::new(config);
-            let (url, _) = crate::language::test::load(
-                None,
-                &mut dc,
+            let config = editor_preview::document_cache::CompilerConfiguration {
+                style: Some(style.to_string()),
+                ..Default::default()
+            };
+            let mut session =
+                editor_preview::test::session_with(editor_preview::DocumentCache::new(config));
+            let (url, _) = editor_preview::test::load(
+                &mut session,
                 &std::env::temp_dir().join("xxx/test.slint"),
                 r#"
                     import { Palette } from "std-widgets.slint";
@@ -602,7 +614,8 @@ export component Main { }
                 "#,
             );
 
-            let result = collect_palette_from_globals(&dc, &url, Vec::new(), None);
+            let result =
+                collect_palette_from_globals(&session.document_cache, &url, Vec::new(), None);
             let r =
                 result.iter().find(|entry| entry.name == "Palette.border").expect("Palette.border");
             let color = i_slint_core::Color::from_argb_u8(
@@ -656,12 +669,14 @@ export component Main { }
         assert!(reds.row_count() >= 6);
         assert!(reds.row_count() <= 12);
 
+        // cspell:disable - CSS color names in string literals
         assert_eq!(reds.row_data(0).unwrap().name, "Colors.red");
         assert_eq!(reds.row_data(1).unwrap().name, "Colors.darkred");
         assert_eq!(reds.row_data(2).unwrap().name, "Colors.indianred");
         assert_eq!(reds.row_data(3).unwrap().name, "Colors.mediumvioletred");
         assert_eq!(reds.row_data(4).unwrap().name, "Colors.orangered");
         assert_eq!(reds.row_data(5).unwrap().name, "Colors.palevioletred");
+        // cspell:enable
     }
 
     #[test]

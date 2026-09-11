@@ -7,7 +7,7 @@ use float_cmp::ApproxEq;
 
 use std::collections::HashMap;
 
-use derive_more::*;
+use derive_more::{Add, AddAssign, Neg, Sub, SubAssign};
 use serde::Deserialize;
 use smart_default::SmartDefault;
 
@@ -75,7 +75,7 @@ impl Color {
     }
 }
 
-// Sometimes figma is having null for coordinate for some reason, just ignore that and consider it is tempty
+// Sometimes figma is having null for coordinate for some reason, just ignore that and consider it is the empty value
 fn deserialize_or_default<'de, T: Default + Deserialize<'de>, D: serde::Deserializer<'de>>(
     de: D,
 ) -> Result<T, D::Error> {
@@ -141,11 +141,12 @@ pub struct LayoutGrid {
     pub count: f32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
 pub struct Effect {
     pub r#type: String,
     pub visible: bool,
-    pub radius: f32,
+    pub radius: Option<f32>,
     pub color: Option<Color>,
     pub blendMode: Option<BlendMode>,
     pub offset: Option<Vector>,
@@ -278,6 +279,7 @@ pub struct VectorNode {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
+#[allow(clippy::large_enum_variant)]
 pub enum Node {
     DOCUMENT(NodeCommon),
     CANVAS {

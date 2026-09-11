@@ -7,6 +7,7 @@ import { StatusLineApi } from "../components/status-line.slint";
 import { EditorSizeSettings, Icons, EditorSpaceSettings } from "../components/styling.slint";
 import { PropertyValueWidget } from "../components/property-widgets.slint";
 import { TableData } from "../windowglobal.slint";
+import { NameLabel } from "widgets/basics.slint";
 
 export struct CellData {
     property-group-id: string,
@@ -54,6 +55,11 @@ export component EditWindow inherits PopupWindow {
             padding: EditorSpaceSettings.default-padding;
             padding-left: EditorSpaceSettings.default-padding;
             width: is-brush(root.current-table.values[root.current-cell-data.row][root.current-cell-data.col]) ? 220px : self.preferred-width;
+
+            NameLabel {
+                property-name: pvw.property-name;
+                property-value: pvw.property-value;
+            }
 
             pvw := PropertyValueWidget {
                 property-value: root.current-table.values[root.current-cell-data.row][root.current-cell-data.col];
@@ -182,7 +188,7 @@ component Cell inherits Rectangle {
         }
 
         Text {
-            font-weight: is-header ? 700 : 400;
+            font-weight: is-header ? FontWeight.bold : FontWeight.normal;
             width: root.width - EditorSpaceSettings.default-padding;
             height: root.height;
             horizontal-alignment: TextHorizontalAlignment.left;
@@ -262,7 +268,7 @@ export component Spreadsheet {
                 show-menu: root.current-table.is-array;
 
                 ta := TouchArea {
-                    visible: root.current-table.is-array;
+                    enabled: root.current-table.is-array;
                     clicked => {
                         root.selection-x = self.x;
                         root.selection-y = self.y;
@@ -283,7 +289,6 @@ export component Spreadsheet {
                     root.current-cell-data = {
                         property-group-id: root.property-group-id,
                         property-name: preview-data.name,
-                        property-value: root.current-table.values[row][col],
                         row: row,
                         col: col,
                         x: self.x,
@@ -335,6 +340,8 @@ export component Spreadsheet {
 
     row_menu := ContextMenuArea {
         in-out property <int> row-number;
+        enabled: false;
+
         Menu {
             MenuItem {
                 title: "Add Row Above";

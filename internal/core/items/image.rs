@@ -12,7 +12,7 @@ use super::{
     ItemConsts, ItemRc, RenderingResult,
 };
 use crate::input::{
-    FocusEvent, FocusEventResult, InputEventFilterResult, InputEventResult, KeyEvent,
+    FocusEvent, FocusEventResult, InputEventFilterResult, InputEventResult, InternalKeyEvent,
     KeyEventResult, MouseEvent,
 };
 use crate::item_rendering::ItemRenderer;
@@ -45,9 +45,12 @@ pub struct ImageItem {
 impl Item for ImageItem {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {}
 
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
+
     fn layout_info(
         self: Pin<&Self>,
         orientation: Orientation,
+        cross_axis_constraint: Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> LayoutInfo {
@@ -57,9 +60,16 @@ impl Item for ImageItem {
                 _ if natural_size.width == 0 || natural_size.height == 0 => 0 as Coord,
                 Orientation::Horizontal => natural_size.width as Coord,
                 Orientation::Vertical => {
-                    natural_size.height as Coord * self.width().get() / natural_size.width as Coord
+                    let w = if cross_axis_constraint >= 0 as Coord {
+                        cross_axis_constraint
+                    } else {
+                        self.width().get()
+                    };
+                    natural_size.height as Coord * w / natural_size.width as Coord
                 }
             },
+            // The compiler's single-cell box layout lowering relies on image items
+            // keeping the default stretch of 0 in their layout info.
             ..Default::default()
         }
     }
@@ -69,6 +79,7 @@ impl Item for ImageItem {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursorInner,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardAndIgnore
     }
@@ -78,13 +89,23 @@ impl Item for ImageItem {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursorInner,
     ) -> InputEventResult {
         InputEventResult::EventIgnored
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> KeyEventResult {
+        KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        _: &KeyEvent,
+        _: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
@@ -162,7 +183,7 @@ impl ItemConsts for ImageItem {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<
         ImageItem,
         CachedRenderingData,
-    > = ImageItem::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+    > = ImageItem::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
 }
 
 #[repr(C)]
@@ -192,9 +213,12 @@ pub struct ClippedImage {
 impl Item for ClippedImage {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {}
 
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
+
     fn layout_info(
         self: Pin<&Self>,
         orientation: Orientation,
+        cross_axis_constraint: Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> LayoutInfo {
@@ -206,8 +230,12 @@ impl Item for ClippedImage {
                     if source_clip_width == 0 {
                         0 as Coord
                     } else {
-                        self.source_clip_height() as Coord * self.width().get()
-                            / source_clip_width as Coord
+                        let w = if cross_axis_constraint >= 0 as Coord {
+                            cross_axis_constraint
+                        } else {
+                            self.width().get()
+                        };
+                        self.source_clip_height() as Coord * w / source_clip_width as Coord
                     }
                 }
             },
@@ -220,6 +248,7 @@ impl Item for ClippedImage {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursorInner,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardAndIgnore
     }
@@ -229,13 +258,23 @@ impl Item for ClippedImage {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursorInner,
     ) -> InputEventResult {
         InputEventResult::EventIgnored
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> KeyEventResult {
+        KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        _: &KeyEvent,
+        _: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
@@ -318,5 +357,5 @@ impl ItemConsts for ClippedImage {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<
         ClippedImage,
         CachedRenderingData,
-    > = ClippedImage::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+    > = ClippedImage::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
 }

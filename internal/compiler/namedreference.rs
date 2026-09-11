@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::rc::{Rc, Weak};
 
-use crate::langtype::{ElementType, Type};
+use crate::expression_tree::Expression;
+use crate::langtype::{ElementType, PropertyLookupMode, Type};
 use crate::object_tree::{Element, ElementRc, PropertyAnalysis, PropertyVisibility};
 
 /// Reference to a property or callback of a given name within an element.
@@ -50,10 +51,26 @@ impl NamedReference {
     }
     #[track_caller]
     pub fn element(&self) -> ElementRc {
-        self.0.element.upgrade().expect("NamedReference to a dead element")
+        self.0
+            .element
+            .upgrade()
+            .unwrap_or_else(|| panic!("{}: NamedReference to a dead element", self.0.name))
     }
     pub fn ty(&self) -> Type {
-        self.element().borrow().lookup_property(self.name()).property_type
+        self.element()
+            .borrow()
+            .lookup_property(self.name(), PropertyLookupMode::InternalName)
+            .property_type
+    }
+
+    /// The name the member is declared under, un-mangled. [`Self::name`] is the internal name,
+    /// mangled for a member that shadows an inherited one — use this for anything user-facing.
+    pub fn declared_name(&self) -> SmolStr {
+        let elem = self.element();
+        let elem = elem.borrow();
+        elem.property_declarations
+            .get(self.name())
+            .map_or_else(|| self.name().clone(), |d| d.declared_name(self.name()).clone())
     }
 
     /// return true if the property has a constant value for the lifetime of the program
@@ -70,13 +87,19 @@ impl NamedReference {
     fn is_constant_impl(&self, mut check_binding: bool) -> bool {
         let mut elem = self.element();
         let e = elem.borrow();
-        if let Some(decl) = e.property_declarations.get(self.name()) {
-            if decl.expose_in_public_api && decl.visibility != PropertyVisibility::Input {
-                // could be set by the public API
-                return false;
-            }
+        if let Some(decl) = e.property_declarations.get(self.name())
+            && decl.expose_in_public_api
+            && decl.visibility != PropertyVisibility::Input
+        {
+            // could be set by the public API
+            return false;
         }
         if e.property_analysis.borrow().get(self.name()).is_some_and(|a| a.is_set_externally) {
+            return false;
+        }
+        if e.binding_cell_including_synthetic(self.name()).is_some_and(|binding| {
+            matches!(binding.borrow().expression, Expression::DebugHook { .. })
+        }) {
             return false;
         }
         drop(e);
@@ -88,11 +111,11 @@ impl NamedReference {
                 return false;
             }
 
-            if let Some(b) = e.bindings.get(self.name()) {
-                if check_binding && !b.borrow().analysis.as_ref().is_some_and(|a| a.is_const) {
+            if let Some(binding) = e.binding(self.name()) {
+                if check_binding && !binding.analysis.as_ref().is_some_and(|a| a.is_const) {
                     return false;
                 }
-                if !b.borrow().two_way_bindings.iter().all(|n| n.is_constant()) {
+                if !binding.two_way_bindings.iter().all(|n| n.is_constant()) {
                     return false;
                 }
                 check_binding = false;
@@ -111,13 +134,15 @@ impl NamedReference {
                     continue;
                 }
                 ElementType::Builtin(b) => {
-                    return b.properties.get(self.name()).map_or(true, |pi| !pi.is_native_output())
+                    return b.properties.get(self.name()).is_none_or(|pi| !pi.is_native_output());
                 }
                 ElementType::Native(n) => {
-                    return n.properties.get(self.name()).map_or(true, |pi| !pi.is_native_output())
+                    return n.properties.get(self.name()).is_none_or(|pi| !pi.is_native_output());
                 }
-                crate::langtype::ElementType::Error | crate::langtype::ElementType::Global => {
-                    return true
+                crate::langtype::ElementType::Error
+                | crate::langtype::ElementType::Global
+                | crate::langtype::ElementType::Interface => {
+                    return true;
                 }
             }
         }
@@ -231,13 +256,13 @@ pub(crate) fn mark_property_set_derived_in_base(mut element: ElementRc, name: &s
                 return;
             };
             match c.root_element.borrow().property_analysis.borrow_mut().entry(name.into()) {
-                std::collections::hash_map::Entry::Occupied(e) if e.get().is_set_externally => {
+                std::collections::btree_map::Entry::Occupied(e) if e.get().is_set_externally => {
                     return;
                 }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
                     e.get_mut().is_set_externally = true;
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
+                std::collections::btree_map::Entry::Vacant(e) => {
                     e.insert(PropertyAnalysis { is_set_externally: true, ..Default::default() });
                 }
             }
@@ -257,13 +282,13 @@ pub(crate) fn mark_property_read_derived_in_base(mut element: ElementRc, name: &
                 return;
             };
             match c.root_element.borrow().property_analysis.borrow_mut().entry(name.into()) {
-                std::collections::hash_map::Entry::Occupied(e) if e.get().is_read_externally => {
+                std::collections::btree_map::Entry::Occupied(e) if e.get().is_read_externally => {
                     return;
                 }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
+                std::collections::btree_map::Entry::Occupied(mut e) => {
                     e.get_mut().is_read_externally = true;
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
+                std::collections::btree_map::Entry::Vacant(e) => {
                     e.insert(PropertyAnalysis { is_read_externally: true, ..Default::default() });
                 }
             }

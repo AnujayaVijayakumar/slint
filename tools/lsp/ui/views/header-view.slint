@@ -4,19 +4,27 @@
 import { Button, HorizontalBox, Switch, Palette, ComboBox } from "std-widgets.slint";
 import { BodyText } from "../components/body-text.slint";
 import { HeaderText } from "../components/header-text.slint";
-import { Api, ComponentItem } from "../api.slint";
-import { EditorSpaceSettings, Icons } from "../components/styling.slint";
+import { Api, ComponentItem, PreviewMode } from "../api.slint";
+import { EditorSpaceSettings, Icons, ConsoleStyles } from "../components/styling.slint";
 
 
 export component HeaderView {
-    in-out property <bool> show-left-sidebar <=> left-panel-button.checked;
-    in-out property <bool> show-right-sidebar <=> right-panel-button.checked;
     in-out property <bool> edit-mode <=> interaction-switch.checked;
-    in-out property <string> current-style <=> style-combobox.current-value;
+    in-out property <int> current-style-index <=> style-combobox.current-index;
     in property <[string]> known-styles <=> style-combobox.model;
+    in-out property <PreviewMode> preview-mode: PreviewMode.Local;
+    in property <bool> remote-mode;
+    in-out property <bool> library-widget <=> shortcut-library.checked;
+    in-out property <bool> properties-widget <=> shortcut-properties.checked;
+    in-out property <bool> outline-widget <=> shortcut-outline.checked;
+    in-out property <bool> data-widget <=> shortcut-simulator-data.checked;
 
     callback style-selected();
-    callback edit-mode-toggled();
+    callback preview-mode-selected(PreviewMode);
+
+    changed preview-mode => {
+        mode-combobox.current-index = root.preview-mode == PreviewMode.Remote ? 1 : 0;
+    }
 
     background-layer := Rectangle {
         background: Palette.alternate-background;
@@ -37,13 +45,19 @@ export component HeaderView {
                     }
                 }
 
-                HeaderText {
+                label := Text {
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    color: ConsoleStyles.text-color;
+                    font-family: "Inter";
+                    font-size: 12px;
                     text: @tr("Preview");
                 }
             }
 
             HorizontalLayout {
-                alignment: start;
+                visible: !root.remote-mode;
+                alignment: center;
                 spacing: EditorSpaceSettings.default-spacing;
 
                 HorizontalLayout {
@@ -57,43 +71,58 @@ export component HeaderView {
 
                     interaction-switch := Switch {
                         checked: true;
-                        toggled => {
-                            root.edit-mode-toggled();
-                        }
                     }
 
                     BodyText {
                         text: @tr("Edit");
                     }
                 }
+
                 @children
+                HorizontalLayout {
+                    spacing: EditorSpaceSettings.default-spacing / 2;
+                    shortcut-library := Button {
+                        horizontal-stretch: 0;
+                        checkable: true;
+                        icon: Icons.library;
+                        colorize-icon: !self.checked;
+                        primary: self.checked;
+                    }
 
-                left-panel-button := Button {
-                    horizontal-stretch: 0;
+                    shortcut-properties := Button {
+                        horizontal-stretch: 0;
+                        checkable: true;
+                        icon: Icons.properties;
+                        colorize-icon: !self.checked;
+                        primary: self.checked;
+                    }
 
-                    checkable: true;
-                    icon: self.checked ? Icons.sidebar-left : Icons.sidebar-left-off;
-                    colorize-icon: true;
-                }
+                    shortcut-outline := Button {
+                        horizontal-stretch: 0;
+                        checkable: true;
+                        icon: Icons.outline;
+                        colorize-icon: !self.checked;
+                        primary: self.checked;
+                    }
 
-                right-panel-button := Button {
-                    horizontal-stretch: 0;
-
-                    checkable: true;
-                    icon: self.checked ? Icons.sidebar-right : Icons.sidebar-right-off;
-                    colorize-icon: true;
-                    // visible: root.edit-mode;
+                    shortcut-simulator-data := Button {
+                        horizontal-stretch: 0;
+                        checkable: true;
+                        icon: Icons.simulator;
+                        colorize-icon: !self.checked;
+                        primary: self.checked;
+                    }
                 }
             }
 
             HorizontalLayout {
                 alignment: end;
-                spacing:4px;
+                spacing: 4px;
 
                 BodyText {
                     horizontal-stretch: 0;
 
-                    visible: Api.uses-widgets;
+                    visible: !root.remote-mode && Api.uses-widgets;
                     horizontal-alignment: right;
                     text: @tr("Style");
                 }
@@ -101,10 +130,26 @@ export component HeaderView {
                 style-combobox := ComboBox {
                     horizontal-stretch: 0;
 
-                    visible: Api.uses-widgets;
+                    visible: !root.remote-mode && Api.uses-widgets;
 
                     selected => {
                         root.style-selected();
+                    }
+                }
+
+                mode-combobox := ComboBox {
+                    horizontal-stretch: 0;
+                    visible: !Api.runs-in-slintpad;
+                    current-index: root.preview-mode == PreviewMode.Remote ? 1 : 0;
+                    model: [@tr("Local"), @tr("Remote")];
+                    selected => {
+                        if self.current-index == 1 {
+                            root.preview-mode = PreviewMode.Remote;
+                            root.preview-mode-selected(PreviewMode.Remote);
+                        } else {
+                            root.preview-mode = PreviewMode.Local;
+                            root.preview-mode-selected(PreviewMode.Local);
+                        }
                     }
                 }
             }

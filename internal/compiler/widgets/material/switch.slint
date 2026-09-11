@@ -30,8 +30,10 @@ export component Switch {
     accessible-checked <=> root.checked;
     accessible-role: switch;
     accessible-action-default => {
-        root.checked = !root.checked;
-        root.toggled();
+        if(root.enabled) {
+            root.checked = !root.checked;
+            root.toggled();
+        }
     }
 
     states [
@@ -148,6 +150,7 @@ export component Switch {
                 vertical-stretch: 0;
                 font-size: MaterialFontSettings.title-small.font-size;
                 font-weight: MaterialFontSettings.title-small.font-weight;
+                accessible-role: none;
             }
         }
     }

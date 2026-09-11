@@ -8,25 +8,32 @@ When adding an item or a property, it needs to be kept in sync with different pl
 Lookup the [`crate::items`] module documentation.
 */
 
-use super::{FillRule, Item, ItemConsts, ItemRc, ItemRendererRef, LineCap, RenderingResult};
-use crate::graphics::{Brush, PathData, PathDataIterator};
+use super::{
+    FillRule, Item, ItemConsts, ItemRc, ItemRendererRef, LineCap, LineJoin, RenderingResult,
+};
+use crate::graphics::{Brush, FittedPath, PathData, PathDataIterator};
 use crate::input::{
-    FocusEvent, FocusEventResult, InputEventFilterResult, InputEventResult, KeyEvent,
+    FocusEvent, FocusEventResult, InputEventFilterResult, InputEventResult, InternalKeyEvent,
     KeyEventResult, MouseEvent,
 };
 use crate::item_rendering::CachedRenderingData;
 
+use crate::items::ImageFit;
 use crate::layout::{LayoutInfo, Orientation};
 use crate::lengths::{
-    LogicalBorderRadius, LogicalLength, LogicalRect, LogicalSize, LogicalVector, RectLengths,
+    LogicalBorderRadius, LogicalLength, LogicalPx, LogicalRect, LogicalSize, LogicalVector,
+    RectLengths,
 };
 #[cfg(feature = "rtti")]
 use crate::rtti::*;
 use crate::window::WindowAdapter;
 use crate::{Coord, Property};
+use alloc::boxed::Box;
 use alloc::rc::Rc;
 use const_field_offset::FieldOffsets;
+use core::cell::RefCell;
 use core::pin::Pin;
+use euclid::Point2D;
 use euclid::num::Zero;
 use i_slint_core_macros::*;
 
@@ -41,21 +48,29 @@ pub struct Path {
     pub stroke: Property<Brush>,
     pub stroke_width: Property<LogicalLength>,
     pub stroke_line_cap: Property<LineCap>,
+    pub stroke_line_join: Property<LineJoin>,
+    pub stroke_miter_limit: Property<f32>,
     pub viewbox_x: Property<f32>,
     pub viewbox_y: Property<f32>,
     pub viewbox_width: Property<f32>,
     pub viewbox_height: Property<f32>,
+    pub fit: Property<ImageFit>,
     pub clip: Property<bool>,
     pub anti_alias: Property<bool>,
     pub cached_rendering_data: CachedRenderingData,
+    fitted_path: FittedPathBox,
+    tracker: crate::properties::PropertyTracker,
 }
 
 impl Item for Path {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {}
 
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
+
     fn layout_info(
         self: Pin<&Self>,
         _orientation: Orientation,
+        _cross_axis_constraint: Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> LayoutInfo {
@@ -67,6 +82,7 @@ impl Item for Path {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursorInner,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardAndIgnore
     }
@@ -76,13 +92,23 @@ impl Item for Path {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut super::MouseCursorInner,
     ) -> InputEventResult {
         InputEventResult::EventIgnored
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> KeyEventResult {
+        KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        _: &KeyEvent,
+        _: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
@@ -107,11 +133,7 @@ impl Item for Path {
         let clip = self.clip();
         if clip {
             (*backend).save_state();
-            (*backend).combine_clip(
-                size.into(),
-                LogicalBorderRadius::zero(),
-                LogicalLength::zero(),
-            );
+            (*backend).combine_clip(size.into(), LogicalBorderRadius::zero());
         }
         (*backend).draw_path(self, self_rc, size);
         if clip {
@@ -144,6 +166,11 @@ impl Path {
     ) -> Option<(LogicalVector, PathDataIterator)> {
         let mut elements_iter = self.elements().iter()?;
 
+        let fit = self.fit();
+        if fit == ImageFit::Preserve {
+            return (LogicalVector::zero(), elements_iter).into();
+        }
+
         let stroke_width = self.stroke_width();
         let geometry = self_rc.geometry();
         let bounds_width = (geometry.width_length() - stroke_width).max(LogicalLength::zero());
@@ -163,12 +190,112 @@ impl Path {
             None
         };
 
-        elements_iter.fit(bounds_width.get() as _, bounds_height.get() as _, maybe_viewbox);
+        elements_iter.fit(bounds_width.get() as _, bounds_height.get() as _, maybe_viewbox, fit);
         (offset, elements_iter).into()
+    }
+
+    fn sample_at(
+        self: Pin<&Self>,
+        self_rc: &ItemRc,
+        t: f32,
+    ) -> Option<(Point2D<f32, LogicalPx>, f32)> {
+        if let Some(new_path) =
+            Path::FIELD_OFFSETS.tracker().apply_pin(self).evaluate_if_dirty(|| {
+                let (offset, elements_iter) = self.fitted_path_events(self_rc)?;
+                Some(elements_iter.to_fitted_path(offset))
+            })
+        {
+            *self.fitted_path.borrow_mut() = new_path;
+        }
+        self.fitted_path.borrow().as_ref()?.sample_at(t)
+    }
+
+    pub fn point_at(self: Pin<&Self>, self_rc: &ItemRc, t: f32) -> Point2D<f32, LogicalPx> {
+        self.sample_at(self_rc, t).map(|(pos, _)| pos).unwrap_or_default()
+    }
+    pub fn angle_at(self: Pin<&Self>, self_rc: &ItemRc, t: f32) -> f32 {
+        self.sample_at(self_rc, t).map(|(_, tangent)| tangent).unwrap_or_default()
     }
 }
 
 impl ItemConsts for Path {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<Path, CachedRenderingData> =
-        Path::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+        Path::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
+}
+
+struct FittedPathInner(RefCell<Option<FittedPath>>);
+
+/// Opaque box holding the FittedPath, allocated lazily on first use
+#[repr(C)]
+pub struct FittedPathBox(core::cell::Cell<*mut FittedPathInner>);
+
+impl Default for FittedPathBox {
+    fn default() -> Self {
+        FittedPathBox(core::cell::Cell::new(core::ptr::null_mut()))
+    }
+}
+impl FittedPathBox {
+    fn get_or_init(&self) -> &FittedPathInner {
+        if self.0.get().is_null() {
+            self.0.set(Box::leak(Box::new(FittedPathInner(Default::default()))));
+        }
+        // Safety: the pointer is guaranteed non-null above, and was created from a Box::leak
+        unsafe { &*self.0.get() }
+    }
+}
+impl Drop for FittedPathBox {
+    fn drop(&mut self) {
+        let ptr = self.0.get();
+        if !ptr.is_null() {
+            // Safety: ptr was constructed from a Box::leak in get_or_init
+            drop(unsafe { Box::from_raw(ptr) });
+        }
+    }
+}
+impl core::ops::Deref for FittedPathBox {
+    type Target = RefCell<Option<FittedPath>>;
+    fn deref(&self) -> &Self::Target {
+        &self.get_or_init().0
+    }
+}
+
+/// # Safety
+/// This must be called using a non-null pointer pointing to a chunk of memory big enough to
+/// hold a FittedPathBox
+#[cfg(feature = "ffi")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slint_path_fitted_cache_init(cache: *mut FittedPathBox) {
+    unsafe { core::ptr::write(cache, FittedPathBox::default()) };
+}
+
+/// # Safety
+/// This must be called using a non-null pointer pointing to an initialized FittedPathBox
+#[cfg(feature = "ffi")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slint_path_fitted_cache_free(cache: *mut FittedPathBox) {
+    unsafe {
+        core::ptr::drop_in_place(cache);
+    }
+}
+
+#[cfg(feature = "ffi")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slint_path_point_at(
+    self_component: &vtable::VRc<crate::item_tree::ItemTreeVTable>,
+    self_index: u32,
+    t: f32,
+) -> crate::lengths::LogicalPoint {
+    let self_rc = ItemRc::new(self_component.clone(), self_index);
+    self_rc.downcast::<Path>().unwrap().as_pin_ref().point_at(&self_rc, t)
+}
+
+#[cfg(feature = "ffi")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn slint_path_angle_at(
+    self_component: &vtable::VRc<crate::item_tree::ItemTreeVTable>,
+    self_index: u32,
+    t: f32,
+) -> f32 {
+    let self_rc = ItemRc::new(self_component.clone(), self_index);
+    self_rc.downcast::<Path>().unwrap().as_pin_ref().angle_at(&self_rc, t)
 }

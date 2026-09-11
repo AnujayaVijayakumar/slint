@@ -24,7 +24,7 @@ export component Switch {
         root.toggled();
     }
 
-    min-width: 26px;
+    min-width: max(26px, i-layout.min-width);
     min-height: max(15px, i-layout.min-height);
     vertical-stretch: 0;
     horizontal-stretch: 0;
@@ -34,8 +34,10 @@ export component Switch {
     accessible-checked <=> root.checked;
     accessible-role: switch;
     accessible-action-default => {
-        root.checked = !root.checked;
-        root.toggled();
+        if (root.enabled) {
+           root.checked = !root.checked;
+           root.toggled();
+        }
     }
     forward-focus: i-focus-scope;
 
@@ -102,10 +104,9 @@ export component Switch {
         if (root.text != "") : Text {
             text: root.text;
             color: root.text-color;
-            font-size: CupertinoFontSettings.body.font-size;
-            font-weight: CupertinoFontSettings.body.font-weight;
             vertical-alignment: center;
             horizontal-alignment: left;
+            accessible-role: none;
         }
     }
 

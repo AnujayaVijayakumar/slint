@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore fboid
 use std::num::NonZeroU32;
 use std::{cell::RefCell, sync::Arc};
 
@@ -13,25 +14,55 @@ use glutin::{
 };
 use i_slint_core::api::{GraphicsAPI, PhysicalSize as PhysicalWindowSize, Window};
 use i_slint_core::graphics::{BorrowedOpenGLTexture, RequestedGraphicsAPI, RequestedOpenGLVersion};
-use i_slint_core::item_rendering::DirtyRegion;
+use i_slint_core::partial_renderer::DirtyRegion;
 use i_slint_core::platform::PlatformError;
+use i_slint_core::renderer::DrawOutcome;
 
 use crate::SkiaSharedContext;
+
+/// Wraps a [`glutin::context::PossiblyCurrentContext`] and makes it not-current on drop,
+/// so that no stale thread-local state remains after the context is destroyed.
+struct GlutinContext(Option<glutin::context::PossiblyCurrentContext>);
+
+impl GlutinContext {
+    fn new(context: glutin::context::PossiblyCurrentContext) -> Self {
+        Self(Some(context))
+    }
+}
+
+impl std::ops::Deref for GlutinContext {
+    type Target = glutin::context::PossiblyCurrentContext;
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl Drop for GlutinContext {
+    fn drop(&mut self) {
+        if let Some(context) = self.0.take()
+            && let Err(e) = context.make_not_current()
+        {
+            i_slint_core::debug_log!(
+                "Skia OpenGL Renderer: Failed to make context not current: {e}"
+            );
+        }
+    }
+}
 
 /// This surface type renders into the given window with OpenGL, using glutin and glow libraries.
 pub struct OpenGLSurface {
     fb_info: skia_safe::gpu::gl::FramebufferInfo,
     surface: RefCell<skia_safe::Surface>,
     gr_context: RefCell<skia_safe::gpu::DirectContext>,
-    glutin_context: glutin::context::PossiblyCurrentContext,
+    glutin_context: GlutinContext,
     glutin_surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
 }
 
 impl super::Surface for OpenGLSurface {
     fn new(
         _shared_context: &SkiaSharedContext,
-        window_handle: Arc<dyn raw_window_handle::HasWindowHandle>,
-        display_handle: Arc<dyn raw_window_handle::HasDisplayHandle>,
+        window_handle: Arc<dyn raw_window_handle::HasWindowHandle + Send + Sync>,
+        display_handle: Arc<dyn raw_window_handle::HasDisplayHandle + Send + Sync>,
         size: PhysicalWindowSize,
         requested_graphics_api: Option<RequestedGraphicsAPI>,
     ) -> Result<Self, PlatformError> {
@@ -39,7 +70,7 @@ impl super::Surface for OpenGLSurface {
             window_handle,
             display_handle,
             size,
-            requested_graphics_api.map(TryInto::try_into).transpose()?,
+            requested_graphics_api.as_ref().map(TryInto::try_into).transpose()?,
             glutin::config::ConfigTemplateBuilder::new(),
             None,
         )
@@ -47,14 +78,6 @@ impl super::Surface for OpenGLSurface {
 
     fn name(&self) -> &'static str {
         "opengl"
-    }
-
-    fn supports_graphics_api() -> bool {
-        true
-    }
-
-    fn supports_graphics_api_with_self(&self) -> bool {
-        true
     }
 
     fn with_graphics_api(&self, callback: &mut dyn FnMut(GraphicsAPI<'_>)) {
@@ -82,7 +105,7 @@ impl super::Surface for OpenGLSurface {
             u8,
         ) -> Option<DirtyRegion>,
         pre_present_callback: &RefCell<Option<Box<dyn FnMut()>>>,
-    ) -> Result<(), PlatformError> {
+    ) -> Result<DrawOutcome, PlatformError> {
         self.ensure_context_current()?;
 
         let current_context = &self.glutin_context;
@@ -94,16 +117,16 @@ impl super::Surface for OpenGLSurface {
         let width = size.width.try_into().ok();
         let height = size.height.try_into().ok();
 
-        if let Some((width, height)) = width.zip(height) {
-            if width != surface.width() || height != surface.height() {
-                *surface = Self::create_internal_surface(
-                    self.fb_info,
-                    current_context,
-                    gr_context,
-                    width,
-                    height,
-                )?;
-            }
+        if let Some((width, height)) = width.zip(height)
+            && (width != surface.width() || height != surface.height())
+        {
+            *surface = Self::create_internal_surface(
+                self.fb_info,
+                current_context,
+                gr_context,
+                width,
+                height,
+            )?;
         }
 
         let skia_canvas = surface.canvas();
@@ -120,9 +143,11 @@ impl super::Surface for OpenGLSurface {
             pre_present_callback();
         }
 
-        self.glutin_surface.swap_buffers(current_context).map_err(|glutin_error| {
-            format!("Skia OpenGL Renderer: Error swapping buffers: {glutin_error}").into()
-        })
+        self.glutin_surface.swap_buffers(current_context).map(|_| DrawOutcome::Success).map_err(
+            |glutin_error| {
+                format!("Skia OpenGL Renderer: Error swapping buffers: {glutin_error}").into()
+            },
+        )
     }
 
     fn resize_event(&self, size: PhysicalWindowSize) -> Result<(), PlatformError> {
@@ -141,11 +166,11 @@ impl super::Surface for OpenGLSurface {
             Some(glutin::config::ColorBufferType::Rgb { r_size, g_size, b_size }) => {
                 r_size + g_size + b_size
             }
-            other @ _ => {
+            other => {
                 return Err(format!(
                     "Skia OpenGL Renderer: unsupported color buffer {other:?} encountered"
                 )
-                .into())
+                .into());
             }
         };
         Ok(rgb_bits + config.alpha_size())
@@ -184,7 +209,7 @@ impl super::Surface for OpenGLSurface {
                 },
                 skia_safe::ColorType::RGBA8888,
                 skia_safe::AlphaType::Unpremul,
-                None,
+                crate::sampled_texture_color_space(crate::TextureEncoding::Unorm),
             )
         }
     }
@@ -279,7 +304,7 @@ impl OpenGLSurface {
             fb_info,
             surface,
             gr_context: RefCell::new(gr_context),
-            glutin_context: current_glutin_context,
+            glutin_context: GlutinContext::new(current_glutin_context),
             glutin_surface,
         })
     }
@@ -341,7 +366,7 @@ impl OpenGLSurface {
             gl_display
                 .find_configs(config_template)
                 .map_err(|e| format!("Could not find valid OpenGL display configurations: {e}"))?
-                .filter(|config| config_filter.as_ref().map_or(true, |filter_fn| filter_fn(config)))
+                .filter(|config| config_filter.as_ref().is_none_or(|filter_fn| filter_fn(config)))
                 .reduce(|accum, config| {
                     let transparency_check = config.supports_transparency().unwrap_or(false)
                         & !accum.supports_transparency().unwrap_or(false);
@@ -408,7 +433,7 @@ impl OpenGLSurface {
 
         let context = not_current_gl_context.make_current(&surface)
             .map_err(|glutin_error: glutin::error::Error| -> PlatformError {
-                format!("FemtoVG Renderer: Failed to make newly created OpenGL context current: {glutin_error}")
+                format!("Skia Renderer: Failed to make newly created OpenGL context current: {glutin_error}")
                 .into()
         })?;
 
@@ -421,11 +446,7 @@ impl OpenGLSurface {
         }) = _window_handle.as_raw()
         {
             let ns_view: &objc2_app_kit::NSView = unsafe { ns_view.cast().as_ref() };
-            unsafe {
-                ns_view.setLayerContentsPlacement(
-                    objc2_app_kit::NSViewLayerContentsPlacement::TopLeft,
-                );
-            }
+            ns_view.setLayerContentsPlacement(objc2_app_kit::NSViewLayerContentsPlacement::TopLeft);
         }
 
         // Sanity check, as all this might succeed on Windows without working GL drivers, but this will fail:
@@ -472,7 +493,7 @@ impl OpenGLSurface {
             &backend_render_target,
             skia_safe::gpu::SurfaceOrigin::BottomLeft,
             skia_safe::ColorType::RGBA8888,
-            None,
+            crate::attachment_color_space(crate::TextureEncoding::Unorm),
             None,
         ) {
             Some(surface) => Ok(surface),
@@ -501,7 +522,9 @@ impl Drop for OpenGLSurface {
         // In the event that this fails for some reason (lost GL context), convey that to Skia so that it doesn't try to call
         // glDelete***
         if self.ensure_context_current().is_err() {
-            i_slint_core::debug_log!("Skia OpenGL Renderer warning: Failed to make context current for destruction - considering context abandoned.");
+            i_slint_core::debug_log!(
+                "Skia OpenGL Renderer warning: Failed to make context current for destruction - considering context abandoned."
+            );
             self.gr_context.borrow_mut().abandon();
         }
     }

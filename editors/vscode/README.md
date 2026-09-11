@@ -1,4 +1,3 @@
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0 -->
 
 # Slint for Visual Studio Code
 
@@ -11,6 +10,9 @@ This extension for VS Code adds support for the [Slint](https://slint.dev) desig
 -   Live Preview of a .slint file
 -   Completion of properties
 -   Jump to definition (currently, only definition of Component)
+-   Rename refactoring across `.slint` files.
+    When renaming a public property, callback, or function, the LSP can search and replace matching generated Rust/C++ accessor identifiers in workspace Rust and C++ source files.
+    The search is textual and includes comments and strings; inspect the resulting changes with source control.
 
 ## Installation
 
@@ -29,7 +31,7 @@ visible, it is not necessary to save the file.
 
 ## Reporting Issues
 
-Issues should be reported in the [Slint issue tracker](https://github.com/slint-ui/slint/labels/vscode-extension).
+Issues should be reported in the [Slint issue tracker](https://github.com/slint-ui/slint/labels/a:editor%20integration).
 
 <!-- lines below this marker are stripped from the release -->
 

@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore figmatypes
 #![allow(non_snake_case)]
 #![allow(non_camel_case_types)]
 #![allow(clippy::upper_case_acronyms)]
@@ -103,6 +104,12 @@ async fn load_from_network(opt: &Opt) -> Result<figmatypes::File, Box<dyn std::e
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // reqwest's rustls is compiled without any crypto provider (see Cargo.toml);
+    // register ring as the process-wide provider before the first Client is built.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install the rustls crypto provider");
+
     let opt = Opt::parse();
 
     let r = if !opt.read_from_cache {
@@ -116,20 +123,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fill_hash(&mut nodeHash, &r.document);
     let doc = rendered::Document { nodeHash };
 
-    if let figmatypes::Node::DOCUMENT(document) = &r.document {
-        if let figmatypes::Node::CANVAS { node, prototypeStartNodeID, backgroundColor, .. } =
+    if let figmatypes::Node::DOCUMENT(document) = &r.document
+        && let figmatypes::Node::CANVAS { node, prototypeStartNodeID, backgroundColor, .. } =
             &document.children[0]
-        {
-            let render_node = if let Some(node_id) = &opt.node_id {
-                doc.nodeHash
-                    .get(node_id.as_str())
-                    .ok_or_else(|| Error(format!("Could not find node id {node_id}")))?
-            } else if let Some(child_index) = opt.child_index {
-                node.children
-                    .get(child_index)
-                    .ok_or_else(|| Error(format!("The index {child_index} does not exist")))?
-            } else {
-                doc.nodeHash
+    {
+        let render_node = if let Some(node_id) = &opt.node_id {
+            doc.nodeHash
+                .get(node_id.as_str())
+                .ok_or_else(|| Error(format!("Could not find node id {node_id}")))?
+        } else if let Some(child_index) = opt.child_index {
+            node.children
+                .get(child_index)
+                .ok_or_else(|| Error(format!("The index {child_index} does not exist")))?
+        } else {
+            doc.nodeHash
                     .get(
                         prototypeStartNodeID
                             .as_ref()
@@ -137,11 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .as_str(),
                     )
                     .ok_or_else(|| Error("Start node not found".into()))?
-            };
-            let result = rendered::render(node.name.as_str(), render_node, *backgroundColor, &doc)?;
+        };
+        let result = rendered::render(node.name.as_str(), render_node, *backgroundColor, &doc)?;
 
-            std::fs::write("figma_output/main.slint", result)?;
-        }
+        std::fs::write("figma_output/main.slint", result)?;
     }
 
     Ok(())

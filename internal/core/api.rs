@@ -7,13 +7,22 @@ This module contains types that are public and re-exported in the slint-rs as we
 
 #![warn(missing_docs)]
 
-#[cfg(target_has_atomic = "ptr")]
-pub use crate::future::*;
-use crate::graphics::{Rgba8Pixel, SharedPixelBuffer};
-use crate::input::{KeyEventType, MouseEvent};
+use crate::input::{BackendMouseEvent, InternalKeyEvent, KeyEventType, MouseEvent, TouchPhase};
+use crate::platform::WindowEventDispatchResult;
 use crate::window::{WindowAdapter, WindowInner};
 use alloc::boxed::Box;
 use alloc::string::String;
+
+pub use crate::data_transfer::DataTransfer;
+#[cfg(target_has_atomic = "ptr")]
+pub use crate::future::*;
+pub use crate::graphics::{
+    Brush, Color, Image, LoadImageError, OklchColor, Rgb8Pixel, Rgba8Pixel, RgbaColor,
+    SharedPixelBuffer,
+};
+pub use crate::input::Keys;
+pub use crate::sharedvector::SharedVector;
+pub use crate::{format, string::SharedString, string::ToSharedString};
 
 /// A position represented in the coordinate space of logical pixels. That is the space before applying
 /// a display device specific scale factor.
@@ -85,7 +94,7 @@ impl PhysicalPosition {
     }
 
     #[cfg(feature = "ffi")]
-    pub(crate) fn to_euclid(&self) -> crate::graphics::euclid::default::Point2D<i32> {
+    pub(crate) fn to_euclid(self) -> crate::graphics::euclid::default::Point2D<i32> {
         [self.x, self.y].into()
     }
 
@@ -192,7 +201,7 @@ impl PhysicalSize {
     }
 
     #[cfg(feature = "ffi")]
-    pub(crate) fn to_euclid(&self) -> crate::graphics::euclid::default::Size2D<u32> {
+    pub(crate) fn to_euclid(self) -> crate::graphics::euclid::default::Size2D<u32> {
         [self.width, self.height].into()
     }
 }
@@ -268,22 +277,39 @@ pub enum GraphicsAPI<'a> {
         /// `getContext` function on the HTML Canvas element.
         context_type: &'a str,
     },
-    /// The rendering is based on WGPU 25.x. Use the provided fields to submit commits to the provided
+    /// The rendering is based on WGPU 29.x. Use the provided fields to submit commits to the provided
     /// WGPU command queue.
     ///
-    /// *Note*: This function is behind the [`unstable-wgpu-25` feature flag](slint:rust:slint/docs/cargo_features/#backends)
+    /// *Note*: This function is behind the [`unstable-wgpu-29` feature flag](slint:rust:slint/docs/cargo_features/#backends)
     ///         and may be removed or changed in future minor releases, as new major WGPU releases become available.
     ///
-    /// See also the [`slint::wgpu_25`](slint:rust:slint/wgpu_25) module.
-    #[cfg(feature = "unstable-wgpu-25")]
+    /// See also the [`slint::wgpu_29`](slint:rust:slint/wgpu_29) module.
+    #[cfg(feature = "unstable-wgpu-29")]
     #[non_exhaustive]
-    WGPU25 {
+    WGPU29 {
         /// The WGPU instance used for rendering.
-        instance: wgpu_25::Instance,
+        instance: wgpu_29::Instance,
         /// The WGPU device used for rendering.
-        device: wgpu_25::Device,
+        device: wgpu_29::Device,
         /// The WGPU queue for used for command submission.
-        queue: wgpu_25::Queue,
+        queue: wgpu_29::Queue,
+    },
+    /// The rendering is based on WGPU 30.x. Use the provided fields to submit commits to the provided
+    /// WGPU command queue.
+    ///
+    /// *Note*: This function is behind the [`unstable-wgpu-30` feature flag](slint:rust:slint/docs/cargo_features/#backends)
+    ///         and may be removed or changed in future minor releases, as new major WGPU releases become available.
+    ///
+    /// See also the [`slint::wgpu_30`](slint:rust:slint/wgpu_30) module.
+    #[cfg(feature = "unstable-wgpu-30")]
+    #[non_exhaustive]
+    WGPU30 {
+        /// The WGPU instance used for rendering.
+        instance: wgpu_30::Instance,
+        /// The WGPU device used for rendering.
+        device: wgpu_30::Device,
+        /// The WGPU queue for used for command submission.
+        queue: wgpu_30::Queue,
     },
 }
 
@@ -294,8 +320,10 @@ impl core::fmt::Debug for GraphicsAPI<'_> {
             GraphicsAPI::WebGL { context_type, .. } => {
                 write!(f, "GraphicsAPI::WebGL(context_type = {context_type})")
             }
-            #[cfg(feature = "unstable-wgpu-25")]
-            GraphicsAPI::WGPU25 { .. } => write!(f, "GraphicsAPI::WGPU25"),
+            #[cfg(feature = "unstable-wgpu-29")]
+            GraphicsAPI::WGPU29 { .. } => write!(f, "GraphicsAPI::WGPU29"),
+            #[cfg(feature = "unstable-wgpu-30")]
+            GraphicsAPI::WGPU30 { .. } => write!(f, "GraphicsAPI::WGPU30"),
         }
     }
 }
@@ -566,9 +594,30 @@ impl Window {
         self.0.is_minimized()
     }
 
-    /// Minimize or unminimze the window.
+    /// Minimize or unminimize the window.
     pub fn set_minimized(&self, minimized: bool) {
         self.0.set_minimized(minimized);
+    }
+
+    /// The area of the window covered by the software keyboard is changing (animated).
+    #[doc(hidden)]
+    pub fn set_virtual_keyboard(
+        &self,
+        origin: LogicalPosition,
+        size: LogicalSize,
+        _: crate::InternalToken,
+    ) {
+        self.0.set_window_item_virtual_keyboard(origin.to_euclid(), size.to_euclid());
+    }
+
+    #[doc(hidden)]
+    pub fn virtual_keyboard(
+        &self,
+        _: crate::InternalToken,
+    ) -> Option<(LogicalPosition, LogicalSize)> {
+        self.0.window_item_virtual_keyboard().map(|(origin, size)| {
+            (LogicalPosition::from_euclid(origin), LogicalSize::from_euclid(size))
+        })
     }
 
     /// Dispatch a window event to the scene.
@@ -579,10 +628,10 @@ impl Window {
     /// the top left corner of the window.
     ///
     /// This function panics if there is an error processing the event.
-    /// Use [`Self::try_dispatch_event()`] to handle the error.
+    /// Use [`Self::dispatch_event_with_result()`] to handle the error.
     #[track_caller]
     pub fn dispatch_event(&self, event: crate::platform::WindowEvent) {
-        self.try_dispatch_event(event).unwrap()
+        self.dispatch_event_with_result(event).unwrap();
     }
 
     /// Dispatch a window event to the scene.
@@ -591,79 +640,152 @@ impl Window {
     ///
     /// Any position fields in the event must be in the logical pixel coordinate system relative to
     /// the top left corner of the window.
+    #[deprecated(note = "use `dispatch_event_with_result` instead")]
     pub fn try_dispatch_event(
         &self,
         event: crate::platform::WindowEvent,
     ) -> Result<(), PlatformError> {
-        match event {
-            crate::platform::WindowEvent::PointerPressed { position, button } => {
-                self.0.process_mouse_input(MouseEvent::Pressed {
+        self.dispatch_event_with_result(event).map(|_| ())
+    }
+
+    /// Dispatch a window event to the scene.
+    ///
+    /// Use this when you're implementing your own backend and want to forward user input events.
+    ///
+    /// Any position fields in the event must be in the logical pixel coordinate system relative to
+    /// the top left corner of the window.
+    ///
+    /// Returns a [`WindowEventDispatchResult`] indicating how the event was handled.
+    pub fn dispatch_event_with_result(
+        &self,
+        event: crate::platform::WindowEvent,
+    ) -> Result<WindowEventDispatchResult, PlatformError> {
+        // Only clone the event when a hook is installed to avoid allocation on the hot path.
+        // Events a backend delivers in the internal representation are reported as the public
+        // event they correspond to, if there is one.
+        let hook_installed =
+            self.0.try_context().is_some_and(|ctx| ctx.0.window_event_hook.borrow().is_some());
+        let event_for_hook = hook_installed
+            .then(|| match &event {
+                crate::platform::WindowEvent::Internal(event) => event.public_representation(),
+                event => Some(event.clone()),
+            })
+            .flatten();
+        let dispatch_result = match event {
+            crate::platform::WindowEvent::PointerPressed { position, button } => self
+                .0
+                .process_mouse_input(MouseEvent::Pressed {
                     position: position.to_euclid().cast(),
                     button,
                     click_count: 0,
-                });
-            }
-            crate::platform::WindowEvent::PointerReleased { position, button } => {
-                self.0.process_mouse_input(MouseEvent::Released {
+                    touch_finger_id: 0,
+                })
+                .into(),
+            crate::platform::WindowEvent::PointerReleased { position, button } => self
+                .0
+                .process_mouse_input(MouseEvent::Released {
                     position: position.to_euclid().cast(),
                     button,
                     click_count: 0,
-                });
-            }
-            crate::platform::WindowEvent::PointerMoved { position } => {
-                self.0.process_mouse_input(MouseEvent::Moved {
+                    touch_finger_id: 0,
+                })
+                .into(),
+            crate::platform::WindowEvent::PointerMoved { position } => self
+                .0
+                .process_mouse_input(MouseEvent::Moved {
                     position: position.to_euclid().cast(),
-                });
-            }
-            crate::platform::WindowEvent::PointerScrolled { position, delta_x, delta_y } => {
-                self.0.process_mouse_input(MouseEvent::Wheel {
+                    touch_finger_id: 0,
+                })
+                .into(),
+            crate::platform::WindowEvent::PointerScrolled { position, delta_x, delta_y } => self
+                .0
+                .process_mouse_input(MouseEvent::Wheel {
                     position: position.to_euclid().cast(),
                     delta_x: delta_x as _,
                     delta_y: delta_y as _,
-                });
-            }
+                    phase: TouchPhase::Cancelled,
+                })
+                .into(),
             crate::platform::WindowEvent::PointerExited => {
-                self.0.process_mouse_input(MouseEvent::Exit)
+                // Teardown event — the runtime always acts on it (clears hover/grab state
+                // and dispatches Exit to the item stack), so report Accepted unconditionally
+                // rather than asking the hit-test whether anything consumed it.
+                self.0.process_mouse_input(MouseEvent::Exit);
+                WindowEventDispatchResult::Accepted
             }
 
-            crate::platform::WindowEvent::KeyPressed { text } => {
-                self.0.process_key_input(crate::input::KeyEvent {
-                    text,
-                    repeat: false,
+            crate::platform::WindowEvent::KeyPressed { text } => self
+                .0
+                .process_key_input(InternalKeyEvent {
                     event_type: KeyEventType::KeyPressed,
+                    key_event: crate::input::KeyEvent { text, ..Default::default() },
                     ..Default::default()
                 })
-            }
-            crate::platform::WindowEvent::KeyPressRepeated { text } => {
-                self.0.process_key_input(crate::input::KeyEvent {
-                    text,
-                    repeat: true,
+                .into(),
+            crate::platform::WindowEvent::KeyPressRepeated { text } => self
+                .0
+                .process_key_input(InternalKeyEvent {
                     event_type: KeyEventType::KeyPressed,
+                    key_event: crate::input::KeyEvent { text, repeat: true, ..Default::default() },
                     ..Default::default()
                 })
-            }
-            crate::platform::WindowEvent::KeyReleased { text } => {
-                self.0.process_key_input(crate::input::KeyEvent {
-                    text,
+                .into(),
+            crate::platform::WindowEvent::KeyReleased { text } => self
+                .0
+                .process_key_input(InternalKeyEvent {
                     event_type: KeyEventType::KeyReleased,
+                    key_event: crate::input::KeyEvent { text, ..Default::default() },
                     ..Default::default()
                 })
-            }
+                .into(),
             crate::platform::WindowEvent::ScaleFactorChanged { scale_factor } => {
                 self.0.set_scale_factor(scale_factor);
+                WindowEventDispatchResult::Accepted
             }
             crate::platform::WindowEvent::Resized { size } => {
                 self.0.set_window_item_geometry(size.to_euclid());
                 self.0.window_adapter().renderer().resize(size.to_physical(self.scale_factor()))?;
+                if let Some(item_rc) = self.0.focus_item.borrow().upgrade() {
+                    item_rc.try_scroll_into_visible();
+                }
+                WindowEventDispatchResult::Accepted
             }
             crate::platform::WindowEvent::CloseRequested => {
                 if self.0.request_close() {
                     self.hide()?;
+                    WindowEventDispatchResult::Accepted
+                } else {
+                    WindowEventDispatchResult::Rejected
                 }
             }
-            crate::platform::WindowEvent::WindowActiveChanged(bool) => self.0.set_active(bool),
+            crate::platform::WindowEvent::WindowActiveChanged(bool) => {
+                self.0.set_active(bool);
+                WindowEventDispatchResult::Accepted
+            }
+            crate::platform::WindowEvent::Internal(event) => match event.into_inner() {
+                crate::platform::InternalEvent::Mouse(BackendMouseEvent::Exit) => {
+                    // Teardown event, always accepted like `WindowEvent::PointerExited`.
+                    self.0.process_mouse_input(MouseEvent::Exit);
+                    WindowEventDispatchResult::Accepted
+                }
+                crate::platform::InternalEvent::Mouse(event) => {
+                    self.0.process_mouse_input(event.into()).into()
+                }
+                crate::platform::InternalEvent::Key(event) => {
+                    self.0.process_key_input(event).into()
+                }
+                crate::platform::InternalEvent::Touch { id, position, phase } => {
+                    self.0.process_touch_input(id, position, phase).into()
+                }
+            },
         };
-        Ok(())
+        if let Some(event_for_hook) = event_for_hook
+            && let Some(ctx) = self.0.try_context()
+            && let Some(hook) = ctx.0.window_event_hook.borrow().as_ref()
+        {
+            hook(&self.0.window_adapter(), &event_for_hook, dispatch_result.clone());
+        }
+        Ok(dispatch_result)
     }
 
     /// Returns true if there is an animation currently active on any property in the Window; false otherwise.
@@ -679,7 +801,14 @@ impl Window {
     }
 
     /// Returns a struct that implements the raw window handle traits to access the windowing system specific window
-    /// and display handles. This function is only accessible if you enable the `raw-window-handle-06` crate feature.
+    /// and display handles.
+    ///
+    /// Note that the window handle may only become available after the window has been created by the window manager,
+    /// which typically occurs after at least one iteration of the event loop following a call to `show()`.
+    ///
+    /// Support for this function depends on the platform backend.
+    ///
+    /// This function is only accessible if you enable the `raw-window-handle-06` crate feature.
     #[cfg(feature = "raw-window-handle-06")]
     pub fn window_handle(&self) -> WindowHandle {
         let adapter = self.0.window_adapter();
@@ -703,12 +832,13 @@ impl Window {
     /// Takes a snapshot of the window contents and returns it as RGBA8 encoded pixel buffer.
     ///
     /// Note that this function may be slow to call as it may need to re-render the scene.
+    ///
+    /// Only available with the `std` feature.
+    #[cfg(feature = "std")]
     pub fn take_snapshot(&self) -> Result<SharedPixelBuffer<Rgba8Pixel>, PlatformError> {
         self.0.window_adapter().renderer().take_snapshot()
     }
 }
-
-pub use crate::SharedString;
 
 #[i_slint_core_macros::slint_doc]
 /// This trait is used to obtain references to global singletons exported in `.slint`
@@ -747,21 +877,203 @@ pub use crate::SharedString;
 ///
 /// **Note:** Only globals that are exported or re-exported from the main .slint file will
 /// be exposed in the API
+///
+/// # Storing References to Globals
+///
+/// Globals are strong references to the window they are attached to, unless stored in a `Weak`
+/// reference (see the [`StrongHandle`] trait).
+/// This means that if you store a reference to a global, it will keep the entire window alive
+/// and prevent it from being dropped.
+///
+/// To make this less error-prone, when accessing a global from a window, it is initially bound to
+/// the lifetime of the Window it belongs to.
+/// This prevents you from accidentally capturing the global in a callback closure, which
+/// would result in the window never being dropped.
+///
+/// To store references to a global in a callback or Rust struct, you can convert it into
+/// a weak reference using the [`Global::as_weak`] function.
+/// This will also extend the lifetime of the global to `'static`.
+///
+/// Once the window is dropped, upgrading the weak reference will return `None`.
+///
+/// ## Example
+///
+/// ```rust
+/// # i_slint_backend_testing::init_no_event_loop();
+/// slint::slint!{
+/// export global Palette {
+///     in property<color> foreground-color;
+///     in property<color> background-color;
+/// }
+///
+/// export component App inherits Window {
+///    background: Palette.background-color;
+///    // ...
+/// }
+/// }
+///
+/// struct PaletteBackend {
+///     global: slint::Weak<Palette<'static>>,
+/// }
+///
+/// impl PaletteBackend {
+///     fn global(&self) -> Palette<'static> {
+///         self.global.upgrade().expect("The window was dropped, the global is no longer available")
+///     }
+/// }
+///
+/// let app = App::new().unwrap();
+///
+/// let palette_backend = PaletteBackend { global: app.global::<Palette>().as_weak() };
+/// ```
 pub trait Global<'a, Component> {
-    /// Returns a reference that's tied to the life time of the provided component.
+    /// The `Self` type, with a `'static` lifetime.
+    type StaticSelf: 'static + StrongHandle;
+
+    /// Returns a reference to the global.
     fn get(component: &'a Component) -> Self;
+
+    /// Convert this Global reference into a weak reference.
+    ///
+    /// This will also extend the lifetime of this global to `'static`, to allow storing
+    /// the Weak reference in a struct that does not have a lifetime itself.
+    fn as_weak(&self) -> Weak<Self::StaticSelf>;
 }
 
-/// This trait describes the common public API of a strongly referenced Slint component.
-/// It allows creating strongly-referenced clones, a conversion into/ a weak pointer as well
-/// as other convenience functions.
+/// This trait marks types that hold a strong reference to a Slint component.
 ///
-/// This trait is implemented by the [generated component](index.html#generated-components)
-pub trait ComponentHandle {
+/// The Slint compiler automatically implements this trait for [generated components](index.html#generated-components) and the `'static` variant of [generated Globals](index.html#exported-global-singletons).
+/// Do not try to implement it manually.
+///
+/// All types that implement this trait can be used in a [`Weak`] reference.
+///
+/// > ⚠️ Strong references should not be captured by a lambda given to a callback,
+/// > as this would produce a reference loop and leak the component.
+/// > Instead, the callback function should capture a [`Weak`] reference.
+///
+/// **Example:**
+/// ```
+/// # i_slint_backend_testing::init_no_event_loop();
+/// slint::slint!{
+///     export component App inherits Window {
+///         in-out property <int> counter: 0;
+///         callback do_something;
+///     }
+/// }
+///
+/// let app = App::new().unwrap();
+/// // ⚠️ Incorrect: This will capture a strong reference to the app in the closure,
+/// // which will never be released and leak the app!
+/// app.on_do_something({
+///     let app = app.clone_strong();
+///     move || {
+///         app.set_counter(app.get_counter() + 1);
+///     }
+/// });
+///
+/// // Correct: Use a weak reference to the app, which will be released
+/// // when the app is dropped.
+/// app.on_do_something({
+///     let app = app.as_weak();
+///     move || {
+///         let Some(app) = app.upgrade() else {
+///             return;
+///         };
+///         app.set_counter(app.get_counter() + 1);
+///     }
+/// });
+/// ```
+///
+/// # Common issues
+///
+/// To use a global with a [`Weak`] reference, you need to use the `'static` variant of the Global.
+///
+/// **Example:**
+/// ```
+/// # i_slint_backend_testing::init_no_event_loop();
+/// slint::slint!{
+///    export global MyGlobal {}
+///
+///    export component App inherits Window {}
+/// }
+/// struct MyStruct {
+///    // Use the 'static variant of MyGlobal, which implements
+///    // StrongHandle and can be used in a Weak reference.
+///    global: slint::Weak<MyGlobal<'static>>,
+/// }
+///
+/// let app = App::new().unwrap();
+/// let my_global: MyGlobal = app.global();
+///
+/// let my_struct = MyStruct {
+///     // Calling as_weak() on the global automatically converts it to 'static
+///     global: my_global.as_weak()
+/// };
+/// ```
+///
+/// Otherwise you may encounter issues like this:
+///
+/// ```text
+/// error[E0106]: missing lifetime specifier
+///   --> /path/to/file.rs:10:19
+///    |
+/// 10 |         global: Weak<MyGlobal>,
+///    |                      ^^^^^^^^ expected named lifetime parameter
+///    |
+/// help: consider introducing a named lifetime parameter
+///    |
+///  9 ~     struct MyStruct<'a> {
+/// 10 ~         global: Weak<MyGlobal<'a>>,
+/// ```
+///
+/// The compiler suggests to introduce a lifetime parameter for the struct,
+/// This is not correct - use a `'static` lifetime instead!
+///
+/// Otherwise you will run into the following error:
+///
+/// ```text
+/// error: incompatible lifetime on type
+///   --> /path/to/file.rs:9:10
+///    |
+///  9 |     global: slint::Weak<MyGlobal<'a>>,
+///    |             ^^^^^^^^^^^^^^^^^^^^^^^^^
+///    |
+///note: because this has an unmet lifetime requirement
+///   --> slint/internal/core/api.rs:954:24
+///    |
+///954 |     pub struct Weak<T: StrongHandle> {
+///    |                        ^^^^^^^^^^^^ introduces a `'static` lifetime requirement
+///note: the lifetime `'a` as defined here...
+///   --> /path/to/file.rs:8:17
+///    |
+///  8 | struct MyStruct<'a> {
+///    |                 ^^
+///note: ...does not necessarily outlive the static lifetime introduced by the compatible `impl`
+///   --> /path/to/file.rs:246:6
+///    |
+///246 |      impl slint :: StrongHandle for r#MyGlobal < 'static > {
+/// ```
+pub trait StrongHandle {
     /// The internal Inner type for `Weak<Self>::inner`.
     #[doc(hidden)]
     type WeakInner: Clone + Default;
+
+    /// Internal function used when upgrading a weak reference to a strong one.
+    #[doc(hidden)]
+    fn upgrade_from_weak_inner(_: &Self::WeakInner) -> Option<Self>
+    where
+        Self: Sized;
+}
+
+/// This trait describes the common public API of a strongly referenced Slint component.
+/// It allows creating strongly-referenced clones, a conversion into a weak pointer as well
+/// as other convenience functions.
+///
+/// This trait is implemented by the [generated component](index.html#generated-components)
+pub trait ComponentHandle: StrongHandle {
     /// Returns a new weak pointer.
+    // Note: It would be great if we could move this function into the StrongHandle trait. But
+    // that would be a backwards-incompatible change.
     fn as_weak(&self) -> Weak<Self>
     where
         Self: Sized;
@@ -769,12 +1081,6 @@ pub trait ComponentHandle {
     /// Returns a clone of this handle that's a strong reference.
     #[must_use]
     fn clone_strong(&self) -> Self;
-
-    /// Internal function used when upgrading a weak reference to a strong one.
-    #[doc(hidden)]
-    fn upgrade_from_weak_inner(_: &Self::WeakInner) -> Option<Self>
-    where
-        Self: Sized;
 
     /// Convenience function for [`crate::Window::show()`](struct.Window.html#method.show).
     /// This shows the window on the screen and maintains an extra strong reference while
@@ -808,9 +1114,10 @@ mod weak_handle {
 
     use super::*;
 
-    /// Struct that's used to hold weak references of a [Slint component](index.html#generated-components)
+    /// Struct that's used to hold weak references of a [Slint component or global](index.html#generated-components)
     ///
-    /// In order to create a Weak, you should use [`ComponentHandle::as_weak`].
+    /// In order to create a Weak, you should use [`ComponentHandle::as_weak`] or
+    /// [`Global::as_weak`].
     ///
     /// Strong references should not be captured by the functions given to a lambda,
     /// as this would produce a reference loop and leak the component.
@@ -820,13 +1127,13 @@ mod weak_handle {
     /// but the upgrade function will only return a valid component from the same thread
     /// as the one it has been created from.
     /// This is useful to use with [`invoke_from_event_loop()`] or [`Self::upgrade_in_event_loop()`].
-    pub struct Weak<T: ComponentHandle> {
+    pub struct Weak<T: StrongHandle> {
         inner: T::WeakInner,
         #[cfg(feature = "std")]
         thread: std::thread::ThreadId,
     }
 
-    impl<T: ComponentHandle> Default for Weak<T> {
+    impl<T: StrongHandle> Default for Weak<T> {
         fn default() -> Self {
             Self {
                 inner: T::WeakInner::default(),
@@ -836,7 +1143,7 @@ mod weak_handle {
         }
     }
 
-    impl<T: ComponentHandle> Clone for Weak<T> {
+    impl<T: StrongHandle> Clone for Weak<T> {
         fn clone(&self) -> Self {
             Self {
                 inner: self.inner.clone(),
@@ -846,7 +1153,7 @@ mod weak_handle {
         }
     }
 
-    impl<T: ComponentHandle> Weak<T> {
+    impl<T: StrongHandle> Weak<T> {
         #[doc(hidden)]
         pub fn new(inner: T::WeakInner) -> Self {
             Self {
@@ -861,10 +1168,7 @@ mod weak_handle {
         ///
         /// This also returns None if the current thread is not the thread that created
         /// the component
-        pub fn upgrade(&self) -> Option<T>
-        where
-            T: ComponentHandle,
-        {
+        pub fn upgrade(&self) -> Option<T> {
             #[cfg(feature = "std")]
             if std::thread::current().id() != self.thread {
                 return None;
@@ -940,19 +1244,19 @@ mod weak_handle {
     // and the VWeak only use atomic pointer so it is safe to clone and drop in another thread
     #[allow(unsafe_code)]
     #[cfg(any(feature = "std", feature = "unsafe-single-threaded"))]
-    unsafe impl<T: ComponentHandle> Send for Weak<T> {}
+    unsafe impl<T: StrongHandle> Send for Weak<T> {}
     #[allow(unsafe_code)]
     #[cfg(any(feature = "std", feature = "unsafe-single-threaded"))]
-    unsafe impl<T: ComponentHandle> Sync for Weak<T> {}
+    unsafe impl<T: StrongHandle> Sync for Weak<T> {}
 }
 
 pub use weak_handle::*;
 
 /// Adds the specified function to an internal queue, notifies the event loop to wake up.
-/// Once woken up, any queued up functors will be invoked.
+/// Once woken up, any queued up functions will be invoked.
 ///
 /// This function is thread-safe and can be called from any thread, including the one
-/// running the event loop. The provided functors will only be invoked from the thread
+/// running the event loop. The provided functions will only be invoked from the thread
 /// that started the event loop.
 ///
 /// You can use this to set properties or use any other Slint APIs from other threads,
@@ -995,7 +1299,7 @@ pub fn invoke_from_event_loop(func: impl FnOnce() + Send + 'static) -> Result<()
 /// This function can be called from any thread
 ///
 /// Any previously queued events may or may not be processed before the loop terminates.
-/// This is platform dependent behaviour.
+/// This is platform dependent behavior.
 pub fn quit_event_loop() -> Result<(), EventLoopError> {
     crate::platform::with_event_loop_proxy(|proxy| {
         proxy.ok_or(EventLoopError::NoEventLoopProvider)?.quit_event_loop()
@@ -1046,6 +1350,7 @@ pub enum PlatformError {
     /// or call [`platform::set_platform()`](crate::platform::set_platform)
     /// before running the event loop
     NoPlatform,
+
     /// The Slint Platform does not provide an event loop.
     ///
     /// The [`Platform::run_event_loop`](crate::platform::Platform::run_event_loop)
@@ -1055,11 +1360,14 @@ pub enum PlatformError {
     /// There is already a platform set from another thread.
     SetPlatformError(crate::platform::SetPlatformError),
 
+    /// The operation is not supported by the current platform.
+    Unsupported,
+
     /// Another platform-specific error occurred
     Other(String),
+
     /// Another platform-specific error occurred.
-    #[cfg(feature = "std")]
-    OtherError(Box<dyn std::error::Error + Send + Sync>),
+    OtherError(Box<dyn core::error::Error + Send + Sync>),
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -1087,8 +1395,10 @@ impl core::fmt::Display for PlatformError {
             PlatformError::SetPlatformError(_) => {
                 f.write_str("The Slint platform was initialized in another thread")
             }
+            PlatformError::Unsupported => {
+                f.write_str("The operation is not supported by the current platform")
+            }
             PlatformError::Other(str) => f.write_str(str),
-            #[cfg(feature = "std")]
             PlatformError::OtherError(error) => error.fmt(f),
         }
     }

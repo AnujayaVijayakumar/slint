@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 #include "slint.h"
-#include "slint_testing_internal.h"
+#include "private/slint_testing_internal.h"
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -18,7 +18,7 @@
 /// CMake options.
 namespace slint::testing {
 
-using slint::cbindgen_private::AccessibleRole;
+using slint::cbindgen_private::LayoutKind;
 
 /// Init the testing backend.
 /// Should be called before any other Slint function that can access the platform.
@@ -95,10 +95,7 @@ public:
     static SharedVector<ElementHandle> find_by_accessible_label(const ComponentHandle<T> &component,
                                                                 std::string_view label)
     {
-        cbindgen_private::Slice<uint8_t> label_view {
-            const_cast<unsigned char *>(reinterpret_cast<const unsigned char *>(label.data())),
-            label.size()
-        };
+        cbindgen_private::Slice<uint8_t> label_view = private_api::string_to_slice(label);
         auto vrc = component.into_dyn();
         SharedVector<ElementHandle> result;
         cbindgen_private::slint_testing_element_find_by_accessible_label(
@@ -112,10 +109,7 @@ public:
     static SharedVector<ElementHandle> find_by_element_id(const ComponentHandle<T> &component,
                                                           std::string_view element_id)
     {
-        cbindgen_private::Slice<uint8_t> element_id_view {
-            const_cast<unsigned char *>(reinterpret_cast<const unsigned char *>(element_id.data())),
-            element_id.size()
-        };
+        cbindgen_private::Slice<uint8_t> element_id_view = private_api::string_to_slice(element_id);
         auto vrc = component.into_dyn();
         SharedVector<ElementHandle> result;
         cbindgen_private::slint_testing_element_find_by_element_id(
@@ -129,10 +123,8 @@ public:
     static SharedVector<ElementHandle>
     find_by_element_type_name(const ComponentHandle<T> &component, std::string_view type_name)
     {
-        cbindgen_private::Slice<uint8_t> element_type_name_view {
-            const_cast<unsigned char *>(reinterpret_cast<const unsigned char *>(type_name.data())),
-            type_name.size()
-        };
+        cbindgen_private::Slice<uint8_t> element_type_name_view =
+                private_api::string_to_slice(type_name);
         auto vrc = component.into_dyn();
         SharedVector<ElementHandle> result;
         cbindgen_private::slint_testing_element_find_by_element_type_name(
@@ -214,9 +206,21 @@ public:
         }
     }
 
+    /// Returns the layout kind if this element is a layout container;
+    /// std::nullopt if the element is not a layout or is not valid anymore.
+    std::optional<slint::testing::LayoutKind> layout_kind() const
+    {
+        LayoutKind kind {};
+        if (cbindgen_private::slint_testing_element_layout_kind(&inner, &kind)) {
+            return kind;
+        } else {
+            return std::nullopt;
+        }
+    }
+
     /// Returns the value of the element's `accessible-role` property, if present. Use this property
     /// to locate elements by their type/role, i.e. buttons, checkboxes, etc.
-    std::optional<slint::testing::AccessibleRole> accessible_role() const
+    std::optional<slint::language::AccessibleRole> accessible_role() const
     {
         if (inner.element_index != 0)
             return std::nullopt;
@@ -256,6 +260,12 @@ public:
     {
         return get_accessible_string_property(
                 cbindgen_private::AccessibleStringProperty::Description);
+    }
+
+    /// Returns the accessible-id of that element, if any.
+    std::optional<SharedString> accessible_id() const
+    {
+        return get_accessible_string_property(cbindgen_private::AccessibleStringProperty::Id);
     }
 
     /// Returns the accessible-value-maximum of that element, if any.
@@ -365,6 +375,62 @@ public:
     std::optional<bool> accessible_read_only() const
     {
         return get_accessible_bool_property(cbindgen_private::AccessibleStringProperty::ReadOnly);
+    }
+
+    /// Returns the accessible-orientation of that element, if any.
+    std::optional<slint::language::Orientation> accessible_orientation() const
+    {
+        using slint::language::Orientation;
+        if (auto str = get_accessible_string_property(
+                    cbindgen_private::AccessibleStringProperty::Orientation)) {
+            if (*str == "horizontal")
+                return Orientation::Horizontal;
+            if (*str == "vertical")
+                return Orientation::Vertical;
+        }
+        return std::nullopt;
+    }
+
+    /// Returns the accessible-live-region of that element, if any.
+    std::optional<slint::language::AccessibleLiveness> accessible_live_region() const
+    {
+        using slint::language::AccessibleLiveness;
+        if (auto str = get_accessible_string_property(
+                    cbindgen_private::AccessibleStringProperty::LiveRegion)) {
+            if (*str == "off")
+                return AccessibleLiveness::Off;
+            if (*str == "polite")
+                return AccessibleLiveness::Polite;
+            if (*str == "assertive")
+                return AccessibleLiveness::Assertive;
+        }
+        return std::nullopt;
+    }
+
+    /// Selects the text between two UTF-8 offsets.
+    ///
+    /// This will invoke the `accessible-action-set-selection-offsets` callback.
+    void set_accessible_selection_offsets(int anchor, int focus) const
+    {
+        if (inner.element_index != 0)
+            return;
+        if (auto item = private_api::upgrade_item_weak(inner.item)) {
+            union SetSelectionOffsetsHelper {
+                cbindgen_private::AccessibilityAction action;
+                SetSelectionOffsetsHelper(int anchor, int focus)
+                {
+                    new (&action.set_selection_offsets)
+                            cbindgen_private::AccessibilityAction::SetSelectionOffsets_Body {
+                                cbindgen_private::AccessibilityAction::Tag::SetSelectionOffsets,
+                                anchor, focus
+                            };
+                }
+                ~SetSelectionOffsetsHelper() { }
+
+            } action(anchor, focus);
+            item->item_tree.vtable()->accessibility_action(item->item_tree.borrow(), item->index,
+                                                           &action.action);
+        }
     }
 
     /// Invokes the expand accessibility action of that element
@@ -490,12 +556,12 @@ public:
     LogicalPosition absolute_position() const
     {
         if (auto item = private_api::upgrade_item_weak(inner.item)) {
-            cbindgen_private::LogicalRect rect =
-                    item->item_tree.vtable()->item_geometry(item->item_tree.borrow(), item->index);
+            // `slint_item_absolute_position` already returns the element's own absolute
+            // position (it maps the element's geometry origin through the ancestor transforms).
             cbindgen_private::LogicalPoint abs =
                     slint::cbindgen_private::slint_item_absolute_position(&item->item_tree,
                                                                           item->index);
-            return LogicalPosition({ abs.x + rect.x, abs.y + rect.y });
+            return LogicalPosition({ abs.x, abs.y });
         }
         return LogicalPosition({ 0, 0 });
     }

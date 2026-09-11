@@ -16,9 +16,9 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+pub use i_slint_core::SlintContext;
 use i_slint_core::platform::Platform;
 use i_slint_core::platform::PlatformError;
-use i_slint_core::SlintContext;
 
 #[cfg(all(feature = "i-slint-backend-qt", not(no_qt), not(target_os = "android")))]
 fn create_qt_backend() -> Result<Box<dyn Platform + 'static>, PlatformError> {
@@ -32,7 +32,18 @@ fn create_winit_backend() -> Result<Box<dyn Platform + 'static>, PlatformError> 
 
 #[cfg(all(feature = "i-slint-backend-linuxkms", target_os = "linux"))]
 fn create_linuxkms_backend() -> Result<Box<dyn Platform + 'static>, PlatformError> {
-    Ok(Box::new(i_slint_backend_linuxkms::Backend::new()?))
+    Ok(Box::new(i_slint_backend_linuxkms::BackendBuilder::default().build()?))
+}
+
+#[cfg(all(feature = "mcp", supports_headless))]
+fn create_headless_backend(renderer: &str) -> Result<Box<dyn Platform + 'static>, PlatformError> {
+    Ok(Box::new(i_slint_backend_testing::TestingBackend::new(
+        i_slint_backend_testing::TestingBackendOptions {
+            mock_time: false,
+            threading: true,
+            renderer_name: Some(renderer.into()),
+        },
+    )))
 }
 
 cfg_if::cfg_if! {
@@ -68,6 +79,10 @@ cfg_if::cfg_if! {
                 ("Winit", create_winit_backend as fn() -> Result<Box<(dyn Platform + 'static)>, PlatformError>),
                 #[cfg(all(feature = "i-slint-backend-linuxkms", target_os = "linux"))]
                 ("LinuxKMS", create_linuxkms_backend as fn() -> Result<Box<(dyn Platform + 'static)>, PlatformError>),
+                // Last-resort headless fallback so the MCP server keeps
+                // working when no display is available.
+                #[cfg(all(feature = "mcp", supports_headless))]
+                ("Headless", (|| create_headless_backend("")) as fn() -> Result<Box<(dyn Platform + 'static)>, PlatformError>),
                 ("", || Err(PlatformError::NoPlatform)),
             ];
 
@@ -101,7 +116,19 @@ cfg_if::cfg_if! {
                 #[cfg(feature = "i-slint-backend-winit")]
                 "winit" => return i_slint_backend_winit::Backend::new_with_renderer_by_name((!_renderer.is_empty()).then_some(_renderer)).map(|b| Box::new(b) as Box<dyn Platform + 'static>),
                 #[cfg(all(feature = "i-slint-backend-linuxkms", target_os = "linux"))]
-                "linuxkms" => return i_slint_backend_linuxkms::Backend::new_with_renderer_by_name((!_renderer.is_empty()).then(|| _renderer)).map(|b| Box::new(b) as Box<dyn Platform + 'static>),
+                "linuxkms" => {
+                    let mut builder = i_slint_backend_linuxkms::BackendBuilder::default();
+                    if !_renderer.is_empty() {
+                        builder = builder.with_renderer_name(_renderer.into());
+                    }
+                    return builder.build().map(|b| Box::new(b) as Box<dyn Platform + 'static>)
+                },
+                #[cfg(feature = "backend-testing")]
+                "testing" => return Ok(Box::new(i_slint_backend_testing::TestingBackend::new(
+                    i_slint_backend_testing::TestingBackendOptions { mock_time: false, threading: true, ..Default::default() },
+                ))),
+                #[cfg(all(feature = "mcp", supports_headless))]
+                "headless" => return create_headless_backend(_renderer),
                 _ => {},
             }
 
@@ -111,7 +138,7 @@ cfg_if::cfg_if! {
             create_default_backend()
         }
         pub use default_backend::{
-            native_widgets, Backend, NativeGlobals, NativeWidgets, HAS_NATIVE_STYLE,
+            native_widgets, NativeGlobals, NativeWidgets, HAS_NATIVE_STYLE,
         };
     } else {
         pub fn create_backend() -> Result<Box<dyn Platform + 'static>, PlatformError> {
@@ -131,9 +158,25 @@ pub fn parse_backend_env_var(backend_config: &str) -> (&str, &str) {
         "femtovg" => ("winit", "femtovg"),
         "skia" => ("winit", "skia"),
         "sw" | "software" => ("winit", "software"),
+        "vello" => ("winit", "vello"),
         "linuxkms" => ("linuxkms", ""),
         x => (x, ""),
     })
+}
+
+/// Start the system-testing and MCP servers if their features are enabled.
+/// Also called by the bindings that install a platform with `set_platform()`, bypassing the selector.
+#[cfg(any(feature = "system-testing", feature = "mcp"))]
+pub fn init_testing_backends() {
+    #[cfg(feature = "system-testing")]
+    if let Err(e) = i_slint_backend_testing::systest::init() {
+        i_slint_core::debug_log!("System testing init failed: {e:?}");
+    }
+
+    #[cfg(feature = "mcp")]
+    if let Err(e) = i_slint_backend_testing::mcp_server::init() {
+        i_slint_core::debug_log!("MCP server init failed: {e:?}");
+    }
 }
 
 /// Run the callback with the platform abstraction.
@@ -157,9 +200,9 @@ pub fn with_global_context<R>(f: impl FnOnce(&SlintContext) -> R) -> Result<R, P
         f,
     );
 
-    #[cfg(feature = "system-testing")]
+    #[cfg(any(feature = "system-testing", feature = "mcp"))]
     if result.is_ok() && platform_created {
-        i_slint_backend_testing::systest::init();
+        init_testing_backends();
     }
 
     result

@@ -52,11 +52,13 @@ export component MenuItem {
     callback clear-current <=> base.clear-current;
     callback activate <=> base.activate;
 
-    min-height: max(40px, base.min-height);
+    min-height: entry.is-separator ? 1px : max(40px, base.min-height);
+    max-height: entry.is-separator ? 1px : base.max-height;
 
     HorizontalLayout {
         base := MenuItemBase {
             default-foreground: MaterialPalette.foreground;
+            alternate-foreground: MaterialPalette.alternate-foreground;
             current-foreground: MaterialPalette.foreground;
             current-background: MaterialPalette.surface-container-highest;
             separator-color: MaterialPalette.border;

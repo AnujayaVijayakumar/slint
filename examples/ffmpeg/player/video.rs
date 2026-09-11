@@ -1,7 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: MIT
 
-use futures::{future::OptionFuture, FutureExt};
+use futures::{FutureExt, future::OptionFuture};
 
 use super::ControlCommand;
 
@@ -86,8 +86,8 @@ impl VideoPlaybackThread {
 
     pub async fn receive_packet(&self, packet: ffmpeg_next::codec::packet::packet::Packet) -> bool {
         match self.packet_sender.send(packet).await {
-            Ok(_) => return true,
-            Err(smol::channel::SendError(_)) => return false,
+            Ok(_) => true,
+            Err(smol::channel::SendError(_)) => false,
         }
     }
 

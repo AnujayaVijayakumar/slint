@@ -1,12 +1,19 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: MIT
 
+// cSpell: ignore Timelike
 use chrono::{Datelike, Local, Timelike};
 use slint::{Timer, TimerMode};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
 
+#[cfg(feature = "sw-renderer")]
+slint::slint! {
+    export { Api, AppWindow } from "../ui/demo-sw-renderer.slint";
+}
+
+#[cfg(not(feature = "sw-renderer"))]
 slint::slint! {
     export { Api, AppWindow } from "../ui/demo.slint";
 }
@@ -26,19 +33,24 @@ pub fn main() {
         if let Some(app) = app_weak.upgrade() {
             let api = app.global::<Api>();
             let now = Local::now();
-            let mut date = Date::default();
-            date.year = now.year() as i32;
-            date.month = now.month() as i32;
-            date.day = now.day() as i32;
+            let date = Date { year: now.year(), month: now.month() as i32, day: now.day() as i32 };
             api.set_current_date(date);
 
-            let mut time = Time::default();
-            time.hour = now.hour() as i32;
-            time.minute = now.minute() as i32;
-            time.second = now.second() as i32;
+            let time = Time {
+                hour: now.hour() as i32,
+                minute: now.minute() as i32,
+                second: now.second() as i32,
+            };
             api.set_current_time(time);
         }
     });
 
     app.run().expect("AppWindow::run() failed");
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+fn android_main(android_app: slint::android::AndroidApp) {
+    slint::android::init(android_app).unwrap();
+    main();
 }

@@ -11,7 +11,7 @@ updates:
     directory: /
     schedule:
       interval: weekly
-      time: "04:00"
+      time: "01:00"
     groups:
       github-actions:
         patterns:
@@ -20,12 +20,42 @@ updates:
       - dependency-name: "lukka/run-cmake"
 
 
+  # ruff and ty are pinned exactly in the dev dependency group of each of these
+  # projects, so CI runs a known version rather than whatever was released last.
+  - package-ecosystem: "uv"
+    open-pull-requests-limit: 5
+    directories:
+      - "/api/python/slint"
+      - "/api/python/briefcase"
+      - "/docs/python"
+    schedule:
+      interval: "weekly"
+      time: "01:00"
+    ignore:
+      # Pinned to match the slint version and kept in sync by
+      # upgrade_version.yaml, so Dependabot must not touch it.
+      - dependency-name: "slint-dev"
+    groups:
+      # The linters change what CI rejects, so keep them in their own pull
+      # request rather than mixed in with the runtime and test dependencies.
+      python-tooling:
+        patterns:
+          - "ruff"
+          - "ty"
+      python-deps:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "ruff"
+          - "ty"
+
+
   - package-ecosystem: "npm" # See documentation for possible values
     open-pull-requests-limit: 20
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
-      time: "04:00"
+      time: "01:00"
     ignore:
       - dependency-name: "@types/node"
       - dependency-name: "@types/vscode"
@@ -35,30 +65,20 @@ updates:
       - dependency-name: "@codingame/monaco-vscode-languages-service-override"
       - dependency-name: "@codingame/monaco-vscode-model-service-override"
       - dependency-name: "@codingame/monaco-vscode-storage-service-override"
+      - dependency-name: "@codingame/monaco-vscode-api"
+      - dependency-name: "@codingame/monaco-vscode-editor-api"
+      - dependency-name: "@codingame/monaco-vscode-editor-service-override"
+      - dependency-name: "monaco-editor-wrapper"
+      - dependency-name: "monaco-languageclient"
+      - dependency-name: "vscode-languageserver"
+      - dependency-name: "vscode-languageclient"
+      - dependency-name: "js-yaml"
+      - dependency-name: "tailwindcss"
 
     groups:
-      codingame:
-        patterns:
-          - "@codingame*"
-      vscode:
-        patterns:
-          - "vscode*"
-      starlight_astro:
-        patterns:
-          - "astro"
-          - "@astro*"
-          - "starlight*"
-          - "@expressive-code/plugin-line-numbers"
-      playwright:
-        patterns:
-          - "playwright*"
-          - "@playwright*"
-      react:
-        patterns:
-          - "react"
-          - "react-dom"
-          - "@types/react"
-          - "@types/react-dom"
-      lumino:
-        patterns:
-          - "@lumino/*"
+      npm-major-updates:
+        update-types: ["major"]
+      npm-minor-updates:
+        update-types: ["minor"]
+      npm-patch-updates:
+        update-types: ["patch"]

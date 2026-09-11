@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 use std::borrow::Cow;
+use std::fs;
 
 #[derive(Clone)]
 pub struct VirtualFile {
@@ -76,6 +77,20 @@ fn test_load_file() {
     assert_eq!(abs_cargo_toml.canon_path, rel_cargo_toml.canon_path);
 }
 
+/// Writes a buffer into a file, but only if the content differs from the file content
+///
+/// Tries to read the destination file first, and only writes the new content if
+/// the file didn't exist or the file content differs from the content to write.
+/// This avoids unnecessary mtime modification of the file, which caused build
+/// systems like Ninja to rebuild other things even though the output of
+/// slint-compiler didn't change.
+pub fn write_file_if_changed(path: &std::path::Path, content: &[u8]) -> std::io::Result<()> {
+    if fs::read(path).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
+    fs::write(path, content)
+}
+
 mod builtin_library {
     include!(env!("SLINT_WIDGETS_LIBRARY"));
 
@@ -114,7 +129,7 @@ mod builtin_library {
     }
 
     pub(crate) fn load_builtin_file(builtin_path: &std::path::Path) -> Option<VirtualFile> {
-        let mut components = vec![];
+        let mut components = Vec::new();
         for part in builtin_path.iter() {
             if part == ".." {
                 components.pop();
@@ -122,10 +137,10 @@ mod builtin_library {
                 components.push(part);
             }
         }
-        if let Some(f) = components.first_mut() {
-            if let Some((_, x)) = ALIASES.iter().find(|x| x.0 == *f) {
-                *f = std::ffi::OsStr::new(x);
-            }
+        if let Some(f) = components.first_mut()
+            && let Some((_, x)) = ALIASES.iter().find(|x| x.0 == *f)
+        {
+            *f = std::ffi::OsStr::new(x);
         }
         if let &[folder, file] = components.as_slice() {
             let library = widget_library().iter().find(|x| x.0 == folder)?.1;

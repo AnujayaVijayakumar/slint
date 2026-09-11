@@ -1,7 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 /*!
 # Slint interpreter library
@@ -72,24 +72,33 @@ instance.run().unwrap();
 #![warn(missing_docs)]
 #![doc(html_logo_url = "https://slint.dev/logo/slint-logo-square-light.svg")]
 
-#[cfg(not(feature = "compat-1-2"))]
+#[cfg(not(feature = "compat-1-18"))]
 compile_error!(
-    "The feature `compat-1-2` must be enabled to ensure \
+    "The feature `compat-1-18` must be enabled to ensure \
     forward compatibility with future version of this crate"
 );
 
 mod api;
-mod dynamic_item_tree;
-mod dynamic_type;
+mod bindings;
+mod component;
+mod debug_hook;
+mod erased;
 mod eval;
 mod eval_layout;
-mod global_component;
+#[cfg(feature = "ffi")]
+#[doc(hidden)]
+pub mod ffi;
+mod globals;
 #[cfg(feature = "internal-highlight")]
 pub mod highlight;
+mod instance;
+mod item_holder;
+mod item_registry;
+mod item_tree_vtable;
 #[cfg(feature = "internal-json")]
 pub mod json;
-#[cfg(feature = "internal-live-reload")]
-pub mod live_reload;
+mod popup;
+mod public_api;
 mod value_model;
 
 #[doc(inline)]
@@ -97,11 +106,7 @@ pub use api::*;
 
 #[cfg(feature = "internal")]
 #[doc(hidden)]
-pub use eval::default_value_for_type;
-
-/// (Re-export from corelib.)
-#[doc(inline)]
-pub use i_slint_core::{Brush, Color, SharedString, SharedVector};
+pub use eval::{default_value_for_struct_field, default_value_for_type};
 
 #[cfg(test)]
 mod tests;

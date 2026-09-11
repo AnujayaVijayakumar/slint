@@ -6,44 +6,70 @@
 // cspell:ignore accesskit borderless corelib nesw webgl winit winsys xlib
 
 use core::cell::{Cell, RefCell};
-use core::pin::Pin;
+#[cfg(target_os = "macos")]
+use std::cell::OnceCell;
 use std::rc::Rc;
 use std::rc::Weak;
 use std::sync::Arc;
 
+use euclid::approxeq::ApproxEq;
+
+#[cfg(muda)]
+use i_slint_core::api::LogicalPosition;
+use i_slint_core::cursor::{MouseCursorInner, scaled_hotspot};
 use i_slint_core::lengths::{PhysicalPx, ScaleFactor};
+#[cfg(muda)]
+use i_slint_core::menus::MenuVTable;
+use i_slint_core::renderer::DrawOutcome;
 use winit::event_loop::ActiveEventLoop;
 #[cfg(target_arch = "wasm32")]
 use winit::platform::web::WindowExtWebSys;
 #[cfg(target_family = "windows")]
 use winit::platform::windows::WindowExtWindows;
 
+use crate::drag_resize_window::{handle_cursor_move_for_resize, handle_resize};
+#[cfg(muda)]
+use crate::muda::MudaType;
 use crate::renderer::WinitCompatibleRenderer;
+use crate::winit_compat::WindowSurfaceSizeExt;
 
+use corelib::SharedString;
+use corelib::input::{BackendMouseEvent, InternalKeyEvent, KeyEvent, KeyEventType};
 use corelib::item_tree::ItemTreeRc;
 #[cfg(enable_accesskit)]
-use corelib::item_tree::ItemTreeRef;
-use corelib::items::{ColorScheme, MouseCursor};
+use corelib::item_tree::{ItemTreeRef, ItemTreeRefPin};
+use corelib::items::{BuiltInMouseCursor, ColorScheme, PointerEventButton};
 #[cfg(enable_accesskit)]
 use corelib::items::{ItemRc, ItemRef};
 
 #[cfg(any(enable_accesskit, muda))]
 use crate::SlintEvent;
-use crate::{SharedBackendData, WinitWindowEventResult};
+use crate::{EventResult, SharedBackendData};
 use corelib::api::PhysicalSize;
 use corelib::layout::Orientation;
-use corelib::lengths::LogicalLength;
+use corelib::lengths::{LogicalLength, LogicalPoint};
 use corelib::platform::{PlatformError, WindowEvent};
 use corelib::window::{WindowAdapter, WindowAdapterInternal, WindowInner};
-use corelib::Property;
-use corelib::{graphics::*, Coord};
-use i_slint_core::{self as corelib, graphics::RequestedGraphicsAPI};
-use std::cell::OnceCell;
+use corelib::{Coord, graphics::*};
+use i_slint_core::{self as corelib};
+use winit::event::WindowEvent as WinitWindowEvent;
 #[cfg(any(enable_accesskit, muda))]
 use winit::event_loop::EventLoopProxy;
-use winit::window::{WindowAttributes, WindowButtons};
+use winit::keyboard::Key;
+use winit::window::{
+    CustomCursor, CustomCursorSource, ResizeDirection, WindowAttributes, WindowButtons,
+};
 
-fn position_to_winit(pos: &corelib::api::WindowPosition) -> winit::dpi::Position {
+fn winit_touch_phase(phase: winit::event::TouchPhase) -> corelib::input::TouchPhase {
+    match phase {
+        winit::event::TouchPhase::Started => corelib::input::TouchPhase::Started,
+        winit::event::TouchPhase::Moved => corelib::input::TouchPhase::Moved,
+        winit::event::TouchPhase::Ended => corelib::input::TouchPhase::Ended,
+        winit::event::TouchPhase::Cancelled => corelib::input::TouchPhase::Cancelled,
+    }
+}
+
+pub(crate) fn position_to_winit(pos: &corelib::api::WindowPosition) -> winit::dpi::Position {
     match pos {
         corelib::api::WindowPosition::Logical(pos) => {
             winit::dpi::Position::new(winit::dpi::LogicalPosition::new(pos.x, pos.y))
@@ -77,6 +103,62 @@ fn physical_size_to_winit(size: PhysicalSize) -> winit::dpi::PhysicalSize<u32> {
     winit::dpi::PhysicalSize::new(size.width, size.height)
 }
 
+fn filter_out_zero_width_or_height(
+    size: winit::dpi::LogicalSize<f64>,
+) -> winit::dpi::LogicalSize<f64> {
+    fn filter(v: f64) -> f64 {
+        if v.approx_eq(&0.) {
+            // Some width or height is better than zero
+            10.
+        } else {
+            v
+        }
+    }
+    winit::dpi::LogicalSize { width: filter(size.width), height: filter(size.height) }
+}
+
+/// The smallest integer logical size whose physical size is at least
+/// `logical * scale_factor`.
+///
+/// A requested logical size materializes as `round(logical * scale_factor)`
+/// physical pixels: winit converts logical sizes that way on every platform,
+/// and Wayland only accepts integer logical sizes in the first place. With a
+/// fractional scale factor the rounding can land below
+/// `logical * scale_factor`, making the window slightly smaller than requested
+/// and cutting off content measured to fit exactly.
+fn round_up_logical(logical: f64, scale_factor: f64) -> f64 {
+    // For positive x, round(x) = floor(x + 0.5), so the physical size reaches
+    // the target integer ceil(target) once result * scale_factor >= ceil(target) - 0.5.
+    let target = logical * scale_factor;
+    let result = logical.ceil().max(((target.ceil() - 0.5) / scale_factor).ceil());
+    // The division can land an ulp below the exact quotient, making the outer
+    // ceil() undershoot by one; verify against the actual rounding.
+    if (result * scale_factor).round() < target { result + 1. } else { result }
+}
+
+#[test]
+fn test_round_up_logical() {
+    assert_eq!(round_up_logical(228., 1.), 228.);
+    // 228 * 1.3 = 296.4 rounds down to 296 = 227.7 logical; 229 * 1.3 = 297.7
+    // rounds to 298 = 229.2 logical.
+    assert_eq!(round_up_logical(228., 1.3), 229.);
+    // 227.5 * 2 is exact after the ceil.
+    assert_eq!(round_up_logical(227.5, 2.), 228.);
+    // 12 * 0.2 = 2.4 rounds down to 2 physical; 13 * 0.2 = 2.6 rounds to 3.
+    assert_eq!(round_up_logical(12., 0.2), 13.);
+    // 21..=24 all round to 2 physical at scale 0.1; 25 * 0.1 = 2.5 rounds to 3.
+    assert_eq!(round_up_logical(21., 0.1), 25.);
+}
+
+/// Whether the platform assigns the window its size, so requesting one is pointless.
+///
+/// On iOS and friends the window covers whatever the system hands it, and winit's UIKit
+/// backend ignores resize requests but turns an initial size into the UIWindow's frame,
+/// confining the app to a corner of the screen.
+fn platform_dictates_window_size() -> bool {
+    cfg!(ios_and_friends)
+}
+
 fn apply_scale_factor_to_logical_sizes_in_attributes(
     attributes: &mut WindowAttributes,
     scale_factor: f64,
@@ -99,9 +181,7 @@ fn icon_to_winit(
 ) -> Option<winit::window::Icon> {
     let image_inner: &ImageInner = (&icon).into();
 
-    let Some(pixel_buffer) = image_inner.render_to_buffer(Some(size.cast())) else {
-        return None;
-    };
+    let pixel_buffer = image_inner.render_to_buffer(Some(size.cast()))?;
 
     // This could become a method in SharedPixelBuffer...
     let rgba_pixels: Vec<u8> = match &pixel_buffer {
@@ -142,13 +222,23 @@ fn window_is_resizable(
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum WinitWindowOrNone {
     HasWindow {
         window: Arc<winit::window::Window>,
+        frame_throttle: Box<dyn crate::frame_throttle::FrameThrottle>,
         #[cfg(enable_accesskit)]
         accesskit_adapter: RefCell<crate::accesskit::AccessKitAdapter>,
         #[cfg(muda)]
         muda_adapter: RefCell<Option<crate::muda::MudaAdapter>>,
+        #[cfg(muda)]
+        context_menu_muda_adapter: RefCell<Option<crate::muda::MudaAdapter>>,
+        #[cfg(target_os = "ios")]
+        keyboard_curve_sampler: super::ios::KeyboardCurveSampler,
+        #[cfg(target_os = "ios")]
+        _color_scheme_observer: Option<super::ios::TraitChangeObserver>,
+        #[cfg(target_os = "ios")]
+        _font_size_observer: Option<super::ios::TraitChangeObserver>,
     },
     None(RefCell<WindowAttributes>),
 }
@@ -276,7 +366,7 @@ impl WinitWindowOrNone {
 }
 
 #[derive(Default, PartialEq, Clone, Copy)]
-enum WindowVisibility {
+pub(crate) enum WindowVisibility {
     #[default]
     Hidden,
     /// This implies that we might resize the window the first time it's shown.
@@ -288,10 +378,9 @@ enum WindowVisibility {
 /// typically instantiated by entry factory functions of the different graphics back ends.
 pub struct WinitWindowAdapter {
     pub shared_backend_data: Rc<SharedBackendData>,
-    window: OnceCell<corelib::api::Window>,
-    self_weak: Weak<Self>,
+    window: corelib::api::Window,
+    pub(crate) self_weak: Weak<Self>,
     pending_redraw: Cell<bool>,
-    color_scheme: OnceCell<Pin<Box<Property<ColorScheme>>>>,
     constraints: Cell<corelib::window::LayoutConstraints>,
     /// Indicates if the window is shown, from the perspective of the API user.
     shown: Cell<WindowVisibility>,
@@ -301,12 +390,16 @@ pub struct WinitWindowAdapter {
     fullscreen: Cell<bool>,
 
     pub(crate) renderer: Box<dyn WinitCompatibleRenderer>,
-    requested_graphics_api: Option<RequestedGraphicsAPI>,
     /// We cache the size because winit_window.inner_size() can return different value between calls (eg, on X11)
     /// And we wan see the newer value before the Resized event was received, leading to inconsistencies
     size: Cell<PhysicalSize>,
     /// We requested a size to be set, but we didn't get the resize event from winit yet
     pending_requested_size: Cell<Option<winit::dpi::Size>>,
+    /// A physical size requested before the window exists. Winit resolves it against the
+    /// scale factor it knows at creation, which on Wayland is 1 until the window is mapped,
+    /// so the size is applied again when the scale factor changes. A newer request or a
+    /// resize to another size drops it.
+    physical_size_before_scale_factor: Cell<Option<winit::dpi::PhysicalSize<u32>>>,
 
     /// Whether the size has been set explicitly via `set_size`.
     /// If that's the case, we should't resize to the preferred size in set_visible
@@ -322,23 +415,24 @@ pub struct WinitWindowAdapter {
     event_loop_proxy: EventLoopProxy<SlintEvent>,
 
     pub(crate) window_event_filter: Cell<
-        Option<
-            Box<
-                dyn FnMut(
-                    &corelib::api::Window,
-                    &winit::event::WindowEvent,
-                ) -> WinitWindowEventResult,
-            >,
-        >,
+        Option<Box<dyn FnMut(&corelib::api::Window, &winit::event::WindowEvent) -> EventResult>>,
     >,
 
     winit_window_or_none: RefCell<WinitWindowOrNone>,
+    window_existence_wakers: RefCell<Vec<core::task::Waker>>,
 
-    #[cfg(not(use_winit_theme))]
-    xdg_settings_watcher: RefCell<Option<i_slint_core::future::JoinHandle<()>>>,
+    #[cfg(target_os = "macos")]
+    macos_color_observer: OnceCell<
+        objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2::runtime::NSObjectProtocol>>,
+    >,
+
+    // The component owns the menu item tree, which reaches this adapter through the globals. Holding
+    // it weakly here keeps the adapter out of that ownership cycle.
+    #[cfg(muda)]
+    menubar_weak: RefCell<Option<vtable::VWeak<MenuVTable>>>,
 
     #[cfg(muda)]
-    menubar: RefCell<Option<vtable::VBox<i_slint_core::menus::MenuVTable>>>,
+    context_menu: RefCell<Option<vtable::VRc<MenuVTable>>>,
 
     #[cfg(all(muda, target_os = "macos"))]
     muda_enable_default_menu_bar: bool,
@@ -347,7 +441,17 @@ pub struct WinitWindowAdapter {
     /// the same as a previously set one, so keep track of that here.
     window_icon_cache_key: RefCell<Option<ImageCacheKey>>,
 
-    frame_throttle: Box<dyn crate::frame_throttle::FrameThrottle>,
+    custom_cursor_source: Cell<Option<CustomCursorSource>>,
+
+    /// Last seen cursor position.
+    cursor_pos: Cell<LogicalPoint>,
+    /// Whether a *mouse* button is currently pressed. Touch input is handled
+    /// separately via `process_touch_input` and does not affect this flag.
+    pressed: Cell<bool>,
+    current_resize_direction: Cell<Option<ResizeDirection>>,
+    /// Allocates small i32 finger ids for iOS's pointer-valued touch ids.
+    #[cfg(target_os = "ios")]
+    touch_finger_ids: RefCell<crate::ios::TouchFingerIdAllocator>,
 }
 
 impl WinitWindowAdapter {
@@ -356,16 +460,14 @@ impl WinitWindowAdapter {
         shared_backend_data: Rc<SharedBackendData>,
         renderer: Box<dyn WinitCompatibleRenderer>,
         window_attributes: winit::window::WindowAttributes,
-        requested_graphics_api: Option<RequestedGraphicsAPI>,
         #[cfg(any(enable_accesskit, muda))] proxy: EventLoopProxy<SlintEvent>,
         #[cfg(all(muda, target_os = "macos"))] muda_enable_default_menu_bar: bool,
-    ) -> Result<Rc<Self>, PlatformError> {
+    ) -> Rc<Self> {
         let self_rc = Rc::new_cyclic(|self_weak| Self {
             shared_backend_data: shared_backend_data.clone(),
-            window: OnceCell::from(corelib::api::Window::new(self_weak.clone() as _)),
+            window: corelib::api::Window::new(self_weak.clone() as _),
             self_weak: self_weak.clone(),
             pending_redraw: Default::default(),
-            color_scheme: Default::default(),
             constraints: Default::default(),
             shown: Default::default(),
             window_level: Default::default(),
@@ -373,37 +475,72 @@ impl WinitWindowAdapter {
             minimized: Cell::default(),
             fullscreen: Cell::default(),
             winit_window_or_none: RefCell::new(WinitWindowOrNone::None(window_attributes.into())),
+            window_existence_wakers: RefCell::new(Vec::default()),
             size: Cell::default(),
             pending_requested_size: Cell::new(None),
+            physical_size_before_scale_factor: Cell::new(None),
             has_explicit_size: Default::default(),
             pending_resize_event_after_show: Default::default(),
             renderer,
-            requested_graphics_api,
             #[cfg(target_arch = "wasm32")]
             virtual_keyboard_helper: Default::default(),
             #[cfg(any(enable_accesskit, muda))]
             event_loop_proxy: proxy,
             window_event_filter: Cell::new(None),
-            #[cfg(not(use_winit_theme))]
-            xdg_settings_watcher: Default::default(),
+            #[cfg(target_os = "macos")]
+            macos_color_observer: OnceCell::new(),
             #[cfg(muda)]
-            menubar: Default::default(),
+            menubar_weak: Default::default(),
+            #[cfg(muda)]
+            context_menu: Default::default(),
             #[cfg(all(muda, target_os = "macos"))]
             muda_enable_default_menu_bar,
             window_icon_cache_key: Default::default(),
-            frame_throttle: crate::frame_throttle::create_frame_throttle(
-                self_weak.clone(),
-                shared_backend_data.is_wayland,
-            ),
+            custom_cursor_source: Cell::new(None),
+            cursor_pos: Default::default(),
+            pressed: Default::default(),
+            current_resize_direction: Default::default(),
+            #[cfg(target_os = "ios")]
+            touch_finger_ids: Default::default(),
         });
 
         self_rc.shared_backend_data.register_inactive_window((self_rc.clone()) as _);
 
-        Ok(self_rc)
+        self_rc
     }
 
-    fn renderer(&self) -> &dyn WinitCompatibleRenderer {
+    pub(crate) fn renderer(&self) -> &dyn WinitCompatibleRenderer {
         self.renderer.as_ref()
+    }
+
+    /// The preferred logical size of the component, or None if it has no positive preferred size.
+    ///
+    /// The size is rounded up so that the physical window cannot end up smaller
+    /// than the component's preferred logical size (see [`round_up_logical`]):
+    /// content measured to fit it exactly (e.g. a wrapping FlexboxLayout whose
+    /// preferred width is precisely its one-line width) would get cut off.
+    fn preferred_size(&self) -> Option<winit::dpi::LogicalSize<Coord>> {
+        let runtime_window = WindowInner::from_pub(self.window());
+        let component_rc = runtime_window.try_component()?;
+        let component = ItemTreeRc::borrow_pin(&component_rc);
+        let scale_factor = runtime_window.scale_factor() as f64;
+        let layout_info_h = component.as_ref().layout_info(Orientation::Horizontal);
+        let width = round_up_logical(layout_info_h.preferred_bounded() as f64, scale_factor);
+        let layout_info_v = match runtime_window.window_item() {
+            // The height may depend on the width, so query it at the preferred width. Restore
+            // the width afterwards: it may hold a size set explicitly before the window is shown.
+            Some(window_item) => {
+                let current_width = window_item.as_pin_ref().width();
+                window_item.width.set(LogicalLength::new(width as Coord));
+                let layout_info_v = component.as_ref().layout_info(Orientation::Vertical);
+                window_item.width.set(current_width);
+                layout_info_v
+            }
+            None => component.as_ref().layout_info(Orientation::Vertical),
+        };
+        let height = round_up_logical(layout_info_v.preferred_bounded() as f64, scale_factor);
+        let size = winit::dpi::LogicalSize::new(width as Coord, height as Coord);
+        (size.width > 0 as Coord && size.height > 0 as Coord).then_some(size)
     }
 
     pub fn ensure_window(
@@ -432,8 +569,6 @@ impl WinitWindowAdapter {
             }
         }
 
-        let mut winit_window_or_none = self.winit_window_or_none.borrow_mut();
-
         // Never show the window right away, as we
         //  a) need to compute the correct size based on the scale factor before it's shown on the screen (handled by set_visible)
         //  b) need to create the accesskit adapter before it's shown on the screen, as required by accesskit.
@@ -449,18 +584,93 @@ impl WinitWindowAdapter {
             apply_scale_factor_to_logical_sizes_in_attributes(&mut window_attributes, sf as f64)
         }
 
-        let winit_window = self.renderer.resume(
-            active_event_loop,
-            window_attributes,
-            self.requested_graphics_api.clone(),
-        )?;
+        // Work around issue with menu bar appearing translucent in fullscreen (#8793)
+        #[cfg(all(muda, target_os = "windows"))]
+        if self.menubar().is_some() {
+            window_attributes = window_attributes.with_transparent(false);
+        }
+
+        // Create the window at its preferred size: the renderer's surface is created together
+        // with the window, and on Wayland resizing it afterwards only takes effect after the
+        // next present, so the first frame would be rendered at the pre-show size.
+        if !platform_dictates_window_size()
+            && !self.has_explicit_size.get()
+            && window_attributes.fullscreen.is_none()
+            && let Some(preferred_size) = self.preferred_size()
+        {
+            window_attributes.inner_size = Some(preferred_size.into());
+        }
+
+        let winit_window =
+            self.renderer.resume(active_event_loop, window_attributes, self.self_weak.clone())?;
+
+        // Push the host shell's color scheme and accent color to the SlintContext.
+        // With `xdg_desktop_settings` the backend-wide portal watcher (spawned in
+        // `Backend::bind_context`) is responsible for that; we only echo the
+        // current scheme to this fresh winit window so its CSDs render correctly.
+        // Otherwise winit exposes the system Light/Dark setting directly on the
+        // new window, and the OS-specific query yields the accent color.
+        cfg_if::cfg_if! {
+            if #[cfg(xdg_desktop_settings)] {
+                let scheme = WindowInner::from_pub(self.window()).context().color_scheme(None);
+                winit_window.set_theme(match scheme {
+                    ColorScheme::Dark => Some(winit::window::Theme::Dark),
+                    ColorScheme::Light => Some(winit::window::Theme::Light),
+                    ColorScheme::Unknown => None,
+                    _ => None,
+                });
+            } else {
+                let initial_scheme = winit_window.theme().map_or(ColorScheme::Unknown, |theme| match theme {
+                    winit::window::Theme::Dark => ColorScheme::Dark,
+                    winit::window::Theme::Light => ColorScheme::Light,
+                });
+                self.set_color_scheme(initial_scheme);
+                #[cfg(target_os = "macos")]
+                self.setup_macos_color_observer();
+                self.set_accent_color(Self::query_system_accent_color());
+            }
+        }
 
         let scale_factor =
             overriding_scale_factor.unwrap_or_else(|| winit_window.scale_factor() as f32);
-        self.window().try_dispatch_event(WindowEvent::ScaleFactorChanged { scale_factor })?;
+        self.window()
+            .dispatch_event_with_result(WindowEvent::ScaleFactorChanged { scale_factor })?;
 
-        *winit_window_or_none = WinitWindowOrNone::HasWindow {
+        #[cfg(target_os = "ios")]
+        let (content_view, keyboard_curve_self) = {
+            use objc2::Message as _;
+            use raw_window_handle::HasWindowHandle as _;
+
+            let raw_window_handle::RawWindowHandle::UiKit(window_handle) =
+                winit_window.window_handle().unwrap().as_raw()
+            else {
+                panic!()
+            };
+            let view = unsafe { &*(window_handle.ui_view.as_ptr() as *const objc2_ui_kit::UIView) }
+                .retain();
+            (view, self.self_weak.clone())
+        };
+
+        // winit doesn't surface iOS appearance, so query the view's trait
+        // collection directly; the matching live observers are installed below as
+        // part of the `HasWindow` variant so their lifetime is tied to the window.
+        #[cfg(target_os = "ios")]
+        {
+            self.set_color_scheme(crate::ios::current_color_scheme(&content_view));
+            self.set_platform_default_font_size(crate::ios::current_default_font_size(
+                &content_view,
+            ));
+        }
+
+        let frame_throttle = crate::frame_throttle::create_frame_throttle(
+            self.self_weak.clone(),
+            &winit_window,
+            self.shared_backend_data.is_wayland,
+        );
+
+        *self.winit_window_or_none.borrow_mut() = WinitWindowOrNone::HasWindow {
             window: winit_window.clone(),
+            frame_throttle,
             #[cfg(enable_accesskit)]
             accesskit_adapter: crate::accesskit::AccessKitAdapter::new(
                 self.self_weak.clone(),
@@ -470,22 +680,57 @@ impl WinitWindowAdapter {
             )
             .into(),
             #[cfg(muda)]
-            muda_adapter: self
-                .menubar
-                .borrow()
-                .as_ref()
-                .map(|menubar| {
-                    crate::muda::MudaAdapter::setup(
-                        menubar,
-                        &winit_window,
-                        self.event_loop_proxy.clone(),
-                        self.self_weak.clone(),
-                    )
-                })
-                .into(),
+            muda_adapter: RefCell::new(None),
+            #[cfg(muda)]
+            context_menu_muda_adapter: None.into(),
+            #[cfg(target_os = "ios")]
+            keyboard_curve_sampler: super::ios::KeyboardCurveSampler::new(
+                &content_view,
+                move |rect| {
+                    if let Some(this) = keyboard_curve_self.upgrade() {
+                        use i_slint_core::api::{LogicalPosition, LogicalSize};
+
+                        this.window().set_virtual_keyboard(
+                            LogicalPosition::new(rect.origin.x as _, rect.origin.y as _),
+                            LogicalSize::new(rect.size.width as _, rect.size.height as _),
+                            i_slint_core::InternalToken,
+                        );
+                    }
+                },
+            ),
+            #[cfg(target_os = "ios")]
+            _color_scheme_observer: crate::ios::install_color_scheme_observer(
+                &content_view,
+                self.self_weak.clone(),
+            ),
+            #[cfg(target_os = "ios")]
+            _font_size_observer: crate::ios::install_font_size_observer(
+                &content_view,
+                self.self_weak.clone(),
+            ),
         };
 
-        drop(winit_window_or_none);
+        #[cfg(muda)]
+        {
+            let menubar = self.menubar();
+            let new_muda_adapter = menubar.as_ref().map(|menubar| {
+                crate::muda::MudaAdapter::setup(
+                    menubar,
+                    &winit_window,
+                    self.event_loop_proxy.clone(),
+                    self.self_weak.clone(),
+                )
+            });
+            match &*self.winit_window_or_none.borrow() {
+                WinitWindowOrNone::HasWindow { muda_adapter, .. } => {
+                    *muda_adapter.borrow_mut() = new_muda_adapter;
+                }
+                WinitWindowOrNone::None(_) => {
+                    // During muda menubar creation the winit window was destroyed again? Well then...
+                    // there's nothing to do for us :)
+                }
+            }
+        }
 
         if show_after_creation {
             self.shown.set(WindowVisibility::Hidden);
@@ -504,10 +749,14 @@ impl WinitWindowAdapter {
         self.shared_backend_data
             .register_window(winit_window.id(), (self.self_weak.upgrade().unwrap()) as _);
 
+        for waker in self.window_existence_wakers.take().into_iter() {
+            waker.wake();
+        }
+
         Ok(winit_window)
     }
 
-    fn suspend(&self) -> Result<(), PlatformError> {
+    pub(crate) fn suspend(&self) -> Result<(), PlatformError> {
         let mut winit_window_or_none = self.winit_window_or_none.borrow_mut();
         match *winit_window_or_none {
             WinitWindowOrNone::HasWindow { ref window, .. } => {
@@ -521,6 +770,9 @@ impl WinitWindowAdapter {
                 *winit_window_or_none = WinitWindowOrNone::None(attributes.into());
 
                 if let Some(last_instance) = Arc::into_inner(last_window_rc) {
+                    // Note: Don't register the window in inactive_windows for re-creation later, as creating the window
+                    // on wayland implies making it visible. Unfortunately, winit won't allow creating a window on wayland
+                    // that's not visible.
                     self.shared_backend_data.unregister_window(Some(last_instance.id()));
                     drop(last_instance);
                 } else {
@@ -540,7 +792,8 @@ impl WinitWindowAdapter {
     pub(crate) fn window_attributes() -> Result<WindowAttributes, PlatformError> {
         let mut attrs = WindowAttributes::default().with_transparent(true).with_visible(false);
 
-        attrs = attrs.with_title("Slint Window".to_string());
+        // Only until the component's own title reaches the window
+        attrs = attrs.with_title(i_slint_core::window::application_name().to_string());
 
         #[cfg(target_arch = "wasm32")]
         {
@@ -581,18 +834,41 @@ impl WinitWindowAdapter {
             // Note: On displays with a scale factor != 1, we get a scale factor change
             // event and a resize event, so all is good.
             if self.pending_resize_event_after_show.take() {
-                self.resize_event(winit_window.inner_size())?;
+                self.resize_event(winit_window.surface_size())?;
             }
         }
 
         let renderer = self.renderer();
-        renderer.render(self.window())?;
+        if !matches!(renderer.render(self.window())?, DrawOutcome::Success) {
+            // Frame was skipped (e.g. surface occluded). pending_redraw was already
+            // cleared above, so re-arm it so we try again.
+            self.request_redraw();
+        }
 
         Ok(())
     }
 
     pub fn winit_window(&self) -> Option<Arc<winit::window::Window>> {
         self.winit_window_or_none.borrow().as_window()
+    }
+
+    #[cfg(target_os = "ios")]
+    pub(crate) fn with_keyboard_curve_sampler<R>(
+        &self,
+        f: impl FnOnce(&super::ios::KeyboardCurveSampler) -> R,
+    ) -> Option<R> {
+        let winit_window_or_none = self.winit_window_or_none.borrow();
+        if let WinitWindowOrNone::HasWindow { keyboard_curve_sampler, .. } = &*winit_window_or_none
+        {
+            Some(f(keyboard_curve_sampler))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(muda)]
+    fn menubar(&self) -> Option<vtable::VRc<MenuVTable>> {
+        self.menubar_weak.borrow().as_ref().and_then(vtable::VWeak::upgrade)
     }
 
     #[cfg(muda)]
@@ -607,25 +883,40 @@ impl WinitWindowAdapter {
         };
         let mut maybe_muda_adapter = maybe_muda_adapter.borrow_mut();
         let Some(muda_adapter) = maybe_muda_adapter.as_mut() else { return };
-        muda_adapter.rebuild_menu(&winit_window, self.menubar.borrow().as_ref());
+        let menubar = self.menubar();
+        muda_adapter.rebuild_menu(winit_window, menubar.as_ref(), MudaType::Menubar);
     }
 
     #[cfg(muda)]
-    pub fn muda_event(&self, entry_id: usize) {
+    pub fn muda_event(&self, entry_id: usize, muda_type: MudaType) {
         let Ok(maybe_muda_adapter) = std::cell::Ref::filter_map(
             self.winit_window_or_none.borrow(),
-            |winit_window_or_none| match winit_window_or_none {
-                WinitWindowOrNone::HasWindow { muda_adapter, .. } => Some(muda_adapter),
-                WinitWindowOrNone::None(..) => None,
+            |winit_window_or_none| match (winit_window_or_none, muda_type) {
+                (WinitWindowOrNone::HasWindow { muda_adapter, .. }, MudaType::Menubar) => {
+                    Some(muda_adapter)
+                }
+                (
+                    WinitWindowOrNone::HasWindow { context_menu_muda_adapter, .. },
+                    MudaType::Context,
+                ) => Some(context_menu_muda_adapter),
+                (WinitWindowOrNone::None(..), _) => None,
             },
         ) else {
             return;
         };
         let maybe_muda_adapter = maybe_muda_adapter.borrow();
         let Some(muda_adapter) = maybe_muda_adapter.as_ref() else { return };
-        let menubar = self.menubar.borrow();
-        let Some(menubar) = menubar.as_ref() else { return };
-        muda_adapter.invoke(menubar, entry_id);
+        match muda_type {
+            MudaType::Menubar => {
+                let Some(menu) = self.menubar() else { return };
+                muda_adapter.invoke(&menu, entry_id);
+            }
+            MudaType::Context => {
+                let menu = self.context_menu.borrow();
+                let Some(menu) = menu.as_ref() else { return };
+                muda_adapter.invoke(menu, entry_id);
+            }
+        }
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -646,8 +937,14 @@ impl WinitWindowAdapter {
     // Requests for the window to be resized. Returns true if the window was resized immediately,
     // or if it will be resized later (false).
     fn resize_window(&self, size: winit::dpi::Size) -> Result<bool, PlatformError> {
+        if platform_dictates_window_size() {
+            // The platform's size wins: re-announce it so the window item snaps back to it.
+            self.resize_event(physical_size_to_winit(self.size.get()))?;
+            return Ok(true);
+        }
         match &*self.winit_window_or_none.borrow() {
             WinitWindowOrNone::HasWindow { window, .. } => {
+                self.physical_size_before_scale_factor.set(None);
                 if let Some(size) = window.request_inner_size(size) {
                     // On wayland we might not get a WindowEvent::Resized, so resize the EGL surface right away.
                     self.resize_event(size)?;
@@ -659,12 +956,13 @@ impl WinitWindowAdapter {
                 }
             }
             WinitWindowOrNone::None(attributes) => {
+                attributes.borrow_mut().inner_size = Some(size);
+                if let winit::dpi::Size::Physical(physical) = size {
+                    self.physical_size_before_scale_factor.set(Some(physical));
+                }
+                // The scale factor is not known yet: the resize event after creation corrects
+                // the window item.
                 let scale_factor = self.window().scale_factor() as _;
-                // Avoid storing the physical size in the attributes. When creating a new window, we don't know the scale
-                // factor, so we've computed the desired size based on a factor of 1 and provided the physical size
-                // will be wrong when the window is created. So stick to a logical size.
-                attributes.borrow_mut().inner_size =
-                    Some(size.to_logical::<f64>(scale_factor).into());
                 self.resize_event(size.to_physical(scale_factor))?;
                 Ok(true)
             }
@@ -673,6 +971,9 @@ impl WinitWindowAdapter {
 
     pub fn resize_event(&self, size: winit::dpi::PhysicalSize<u32>) -> Result<(), PlatformError> {
         self.pending_resize_event_after_show.set(false);
+        if self.physical_size_before_scale_factor.get().is_some_and(|requested| requested != size) {
+            self.physical_size_before_scale_factor.set(None);
+        }
         // When a window is minimized on Windows, we get a move event to an off-screen position
         // and a resize even with a zero size. Don't forward that, especially not to the renderer,
         // which might panic when trying to create a zero-sized surface.
@@ -681,9 +982,12 @@ impl WinitWindowAdapter {
             self.size.set(physical_size);
             self.pending_requested_size.set(None);
             let scale_factor = WindowInner::from_pub(self.window()).scale_factor();
-            self.window().try_dispatch_event(WindowEvent::Resized {
-                size: physical_size.to_logical(scale_factor),
-            })?;
+
+            let size = physical_size.to_logical(scale_factor);
+            self.window().dispatch_event_with_result(WindowEvent::Resized { size })?;
+
+            WindowInner::from_pub(self.window())
+                .set_window_item_safe_area(self.safe_area_inset().to_logical(scale_factor));
 
             // Workaround fox winit not sync'ing CSS size of the canvas (the size shown on the browser)
             // with the width/height attribute (the size of the viewport/GL surface)
@@ -702,20 +1006,98 @@ impl WinitWindowAdapter {
         Ok(())
     }
 
+    pub fn set_accent_color(&self, color: Color) {
+        WindowInner::from_pub(self.window()).context().set_accent_color(color);
+    }
+
+    fn query_system_accent_color() -> Color {
+        cfg_if::cfg_if! {
+            if #[cfg(target_os = "windows")] {
+                use windows::Win32::Graphics::{
+                    Dwm::DwmGetColorizationColor,
+                    Gdi::{GetSysColor, COLOR_HIGHLIGHT},
+                };
+
+                let mut argb = 0u32;
+                let mut _opaque_blend = windows::core::BOOL::default();
+                if unsafe { DwmGetColorizationColor(&mut argb, &mut _opaque_blend) }.is_ok() {
+                    let a = ((argb >> 24) & 0xFF) as u8;
+                    let r = ((argb >> 16) & 0xFF) as u8;
+                    let g = ((argb >> 8) & 0xFF) as u8;
+                    let b = (argb & 0xFF) as u8;
+                    return Color::from_argb_u8(a, r, g, b);
+                }
+
+                let colorref = unsafe { GetSysColor(COLOR_HIGHLIGHT) };
+                let r = (colorref & 0xFF) as u8;
+                let g = ((colorref >> 8) & 0xFF) as u8;
+                let b = ((colorref >> 16) & 0xFF) as u8;
+                Color::from_argb_u8(255, r, g, b)
+            } else if #[cfg(target_os = "macos")] {
+                use objc2::ClassType;
+                use objc2_app_kit::{NSColor, NSColorType};
+                // controlAccentColor is only available on macOS 10.14 and later.
+                // Probe for it so that older systems fall back to the default palette
+                // instead of aborting with an unrecognized-selector exception.
+                if !NSColor::class().responds_to(objc2::sel!(controlAccentColor)) {
+                    return Color::default();
+                }
+                let color = NSColor::controlAccentColor();
+                color.colorUsingType(NSColorType::ComponentBased).map(|c| {
+                    let r = c.redComponent() as f32;
+                    let g = c.greenComponent() as f32;
+                    let b = c.blueComponent() as f32;
+                    let a = c.alphaComponent() as f32;
+                    Color::from_argb_f32(a, r, g, b)
+                }).unwrap_or_default()
+            } else if #[cfg(target_arch = "wasm32")] {
+                query_wasm_accent_color()
+            } else {
+                // Linux: set by XDG settings watcher; other platforms: not available
+                Color::default()
+            }
+        }
+    }
+
+    /// Re-query the system accent color. Called on theme changes.
+    pub fn update_accent_color(&self) {
+        let color = Self::query_system_accent_color();
+        if color != Color::default() {
+            self.set_accent_color(color);
+        }
+    }
+
     pub fn set_color_scheme(&self, scheme: ColorScheme) {
-        self.color_scheme
-            .get_or_init(|| Box::pin(Property::new(ColorScheme::Unknown)))
-            .as_ref()
-            .set(scheme);
+        WindowInner::from_pub(self.window()).context().set_color_scheme(scheme);
+
+        // Update the menubar theme
+        #[cfg(all(target_os = "windows", muda))]
+        if let WinitWindowOrNone::HasWindow {
+            window: winit_window,
+            muda_adapter: maybe_muda_adapter,
+            ..
+        } = &*self.winit_window_or_none.borrow()
+        {
+            if let Some(muda_adapter) = maybe_muda_adapter.borrow().as_ref() {
+                muda_adapter.set_menubar_theme(&winit_window, scheme);
+            };
+        }
+
         // Inform winit about the selected color theme, so that the window decoration is drawn correctly.
-        #[cfg(not(use_winit_theme))]
+        #[cfg(xdg_desktop_settings)]
         if let Some(winit_window) = self.winit_window() {
             winit_window.set_theme(match scheme {
                 ColorScheme::Unknown => None,
                 ColorScheme::Dark => Some(winit::window::Theme::Dark),
                 ColorScheme::Light => Some(winit::window::Theme::Light),
+                _ => None,
             });
         }
+    }
+
+    #[cfg(target_os = "ios")]
+    pub fn set_platform_default_font_size(&self, size: i_slint_core::lengths::LogicalLength) {
+        WindowInner::from_pub(self.window()).context().set_platform_default_font_size(Some(size));
     }
 
     pub fn window_state_event(&self) {
@@ -777,18 +1159,27 @@ impl WinitWindowAdapter {
         }
     }
 
-    #[cfg(not(use_winit_theme))]
-    fn spawn_xdg_settings_watcher(&self) -> Option<i_slint_core::future::JoinHandle<()>> {
-        let window_inner = WindowInner::from_pub(self.window());
+    /// Register an observer for macOS system color changes so that
+    /// the accent color updates live when the user changes it in System Settings.
+    #[cfg(target_os = "macos")]
+    fn setup_macos_color_observer(&self) {
         let self_weak = self.self_weak.clone();
-        window_inner
-            .context()
-            .spawn_local(async move {
-                if let Err(err) = crate::xdg_color_scheme::watch(self_weak).await {
-                    i_slint_core::debug_log!("Error watching for xdg color schemes: {}", err);
+        let block =
+            block2::RcBlock::new(move |_: core::ptr::NonNull<objc2_foundation::NSNotification>| {
+                if let Some(adapter) = self_weak.upgrade() {
+                    adapter.update_accent_color();
                 }
-            })
-            .ok()
+            });
+        let observer = unsafe {
+            objc2_foundation::NSNotificationCenter::defaultCenter()
+                .addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSSystemColorsDidChangeNotification),
+                    None,
+                    None,
+                    &block,
+                )
+        };
+        let _ = self.macos_color_observer.set(observer);
     }
 
     pub fn activation_changed(&self, is_active: bool) -> Result<(), PlatformError> {
@@ -798,7 +1189,7 @@ impl WinitWindowAdapter {
         // We don't render popups as separate windows yet, so treat
         // focus to be the same as being active.
         if have_focus != runtime_window.active() {
-            slint_window.try_dispatch_event(
+            slint_window.dispatch_event_with_result(
                 corelib::platform::WindowEvent::WindowActiveChanged(have_focus),
             )?;
         }
@@ -810,7 +1201,7 @@ impl WinitWindowAdapter {
             {
                 if muda_adapter.borrow().is_none()
                     && self.muda_enable_default_menu_bar
-                    && self.menubar.borrow().is_none()
+                    && self.menubar().is_none()
                 {
                     *muda_adapter.borrow_mut() =
                         Some(crate::muda::MudaAdapter::setup_default_menu_bar()?);
@@ -825,6 +1216,372 @@ impl WinitWindowAdapter {
         Ok(())
     }
 
+    fn dispatch_internal_event(&self, event: impl Into<corelib::platform::InternalEvent>) {
+        self.window().dispatch_event(WindowEvent::internal(event));
+    }
+
+    /// Handles a winit window event for this window: applies the window event filter, feeds
+    /// accesskit, updates the cursor and dispatches the corresponding Slint event.
+    /// The event loop is needed to create the custom cursor.
+    pub(crate) fn dispatch_winit_window_event(
+        &self,
+        event_loop: &ActiveEventLoop,
+        winit_window: &winit::window::Window,
+        event: WinitWindowEvent,
+    ) -> Result<(), PlatformError> {
+        if let Some(mut window_event_filter) = self.window_event_filter.take() {
+            let event_result = window_event_filter(self.window(), &event);
+            self.window_event_filter.set(Some(window_event_filter));
+
+            match event_result {
+                EventResult::PreventDefault => return Ok(()),
+                EventResult::Propagate => (),
+            }
+        }
+
+        #[cfg(enable_accesskit)]
+        self.accesskit_adapter()
+            .expect("internal error: accesskit adapter must exist when window exists")
+            .borrow_mut()
+            .process_event(winit_window, &event);
+
+        let runtime_window = WindowInner::from_pub(self.window());
+        self.maybe_set_custom_cursor(event_loop, winit_window);
+        if !matches!(
+            event,
+            WinitWindowEvent::CursorMoved { .. } | WinitWindowEvent::AxisMotion { .. }
+        ) {
+            self.shared_backend_data.flush_pending_mouse_move();
+        }
+
+        match event {
+            WinitWindowEvent::RedrawRequested => self.draw()?,
+            WinitWindowEvent::Resized(size) => {
+                let resized = self.resize_event(size);
+
+                // Entering fullscreen, maximizing or minimizing the window will
+                // trigger a resize event. We need to update the internal window
+                // state to match the actual window state. We simulate a "window
+                // state event" since there is not an official event for it yet.
+                // See: https://github.com/rust-windowing/winit/issues/2334
+                self.window_state_event();
+
+                // Some platforms (e.g., Windows) may not emit an Occluded event when minimized,
+                // so manually mark the window as occluded if its size is zero.
+                #[cfg(target_os = "windows")]
+                {
+                    if size.width == 0 || size.height == 0 {
+                        self.renderer.occluded(true);
+                    }
+                }
+
+                resized?;
+            }
+            WinitWindowEvent::CloseRequested => {
+                self.window()
+                    .dispatch_event_with_result(corelib::platform::WindowEvent::CloseRequested)?;
+            }
+            WinitWindowEvent::Focused(have_focus) => {
+                // Work around https://github.com/rust-windowing/winit/issues/4371
+                let have_focus =
+                    if cfg!(target_os = "macos") { winit_window.has_focus() } else { have_focus };
+                self.activation_changed(have_focus)?;
+            }
+
+            WinitWindowEvent::KeyboardInput { event, is_synthetic, .. } => {
+                let key_code = event.logical_key.clone();
+                // For now: Match Qt's behavior of mapping command to control and control to meta (LWin/RWin).
+                let swap_cmd_ctrl = i_slint_core::is_apple_platform();
+
+                let key_code = if swap_cmd_ctrl {
+                    #[cfg_attr(slint_nightly_test, allow(non_exhaustive_omitted_patterns))]
+                    match key_code {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Control) => {
+                            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Super)
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Super) => {
+                            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Control)
+                        }
+                        code => code,
+                    }
+                } else {
+                    key_code
+                };
+
+                fn to_slint_key(event: &winit::event::KeyEvent, key_code: &Key) -> SharedString {
+                    macro_rules! winit_key_to_char {
+                        ($($char:literal # $name:ident # $($shifted:ident)? $(=> $($_muda:ident)? # $($_qt:ident)|* # $($winit:ident $(($pos:ident))?)|* # $($_xkb:ident)|* )? ;)*) => {
+                            #[cfg_attr(slint_nightly_test, allow(non_exhaustive_omitted_patterns))]
+                            match key_code {
+                                $( $( $(
+                                            winit::keyboard::Key::Named(winit::keyboard::NamedKey::$winit)
+                                            $(if event.location == winit::keyboard::KeyLocation::$pos)?
+                                            => $char.into(),
+                                )* )? )*
+                                    winit::keyboard::Key::Character(str) => str.as_str().into(),
+                                _ => {
+                                    if let Some(text) = &event.text {
+                                        text.as_str().into()
+                                    } else {
+                                        "".into()
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    i_slint_common::for_each_keys!(winit_key_to_char)
+                }
+                #[allow(unused_mut)]
+                let mut text = to_slint_key(&event, &key_code);
+
+                #[cfg(target_os = "windows")]
+                let text_without_modifiers = {
+                    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+
+                    // On Windows, if Ctrl+Alt is pressed with a key that does not use
+                    // AltGr for remapping, we need to fall back to the
+                    // key_without_modifiers.
+                    //
+                    // See: https://github.com/rust-windowing/winit/issues/2945
+                    //
+                    // The text_without_modifiers also let's us disambiguate between a Ctrl+Alt
+                    // combination used to imply AltGr or not.
+                    // The latter case should be treated as a shortcut, the former should not.
+                    let text_without_modifiers =
+                        to_slint_key(&event, &event.key_without_modifiers());
+                    // Skip the fallback for dead keys so the accent composes instead of being inserted.
+                    if text.is_empty()
+                        && !text_without_modifiers.is_empty()
+                        && !matches!(event.logical_key, winit::keyboard::Key::Dead(_))
+                    {
+                        text = text_without_modifiers.clone();
+                    }
+                    text_without_modifiers
+                };
+
+                if text.is_empty() {
+                    // Failed to translate the key event
+                    return Ok(());
+                }
+
+                if is_synthetic {
+                    // Synthetic event are sent when the focus is acquired, for all the keys currently pressed.
+                    // Don't forward these keys other than modifiers to the app
+                    use winit::keyboard::{Key::Named, NamedKey as N};
+                    if !matches!(
+                        key_code,
+                        Named(N::Control | N::Shift | N::Super | N::Alt | N::AltGraph),
+                    ) {
+                        return Ok(());
+                    }
+                }
+
+                let event_type = match event.state {
+                    winit::event::ElementState::Pressed => KeyEventType::KeyPressed,
+                    winit::event::ElementState::Released => KeyEventType::KeyReleased,
+                };
+                let mut key_event = KeyEvent::default();
+                key_event.text = text;
+                key_event.repeat = event.repeat;
+
+                let event = InternalKeyEvent {
+                    key_event,
+                    event_type,
+                    #[cfg(target_os = "windows")]
+                    text_without_modifiers,
+                    ..Default::default()
+                };
+
+                self.dispatch_internal_event(event);
+            }
+            WinitWindowEvent::Ime(winit::event::Ime::Preedit(string, preedit_selection)) => {
+                let event = InternalKeyEvent {
+                    event_type: KeyEventType::UpdateComposition,
+                    preedit_text: string.into(),
+                    preedit_selection: preedit_selection.map(|e| e.0 as i32..e.1 as i32),
+                    ..Default::default()
+                };
+                self.dispatch_internal_event(event);
+            }
+            WinitWindowEvent::Ime(winit::event::Ime::Commit(string)) => {
+                let mut key_event = KeyEvent::default();
+                key_event.text = string.into();
+                let event = InternalKeyEvent {
+                    event_type: KeyEventType::CommitComposition,
+                    key_event,
+                    ..Default::default()
+                };
+                self.dispatch_internal_event(event);
+            }
+            WinitWindowEvent::CursorMoved { position, .. } => {
+                self.current_resize_direction.set(handle_cursor_move_for_resize(
+                    winit_window,
+                    position,
+                    self.current_resize_direction.get(),
+                    runtime_window
+                        .window_item()
+                        .map_or(Default::default(), |w| w.as_pin_ref().resize_border_width()),
+                ));
+                let position = position.to_logical(runtime_window.scale_factor() as f64);
+                let cursor_pos = euclid::point2(position.x, position.y);
+                self.cursor_pos.set(cursor_pos);
+                // winit sends this event at a very high frequency, so coalesce the moves.
+                self.shared_backend_data.buffer_mouse_move(&self.self_weak, cursor_pos);
+            }
+            WinitWindowEvent::CursorLeft { .. } => {
+                // On the html canvas, we don't get the mouse move or release event when outside the canvas. So we have no choice but canceling the event
+                if cfg!(target_arch = "wasm32") || !self.pressed.get() {
+                    self.pressed.set(false);
+                    self.dispatch_internal_event(BackendMouseEvent::Exit);
+                }
+            }
+            WinitWindowEvent::MouseWheel { delta, phase, .. } => {
+                let (delta_x, delta_y) = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(lx, ly) => (lx * 60., ly * 60.),
+                    winit::event::MouseScrollDelta::PixelDelta(d) => {
+                        let d = d.to_logical(runtime_window.scale_factor() as f64);
+                        (d.x, d.y)
+                    }
+                };
+                let phase = winit_touch_phase(phase);
+                self.dispatch_internal_event(BackendMouseEvent::Wheel {
+                    position: self.cursor_pos.get(),
+                    delta_x,
+                    delta_y,
+                    phase,
+                });
+            }
+            WinitWindowEvent::MouseInput { state, button, .. } => {
+                let button = match button {
+                    winit::event::MouseButton::Left => PointerEventButton::Left,
+                    winit::event::MouseButton::Right => PointerEventButton::Right,
+                    winit::event::MouseButton::Middle => PointerEventButton::Middle,
+                    winit::event::MouseButton::Back => PointerEventButton::Back,
+                    winit::event::MouseButton::Forward => PointerEventButton::Forward,
+                    winit::event::MouseButton::Other(_) => PointerEventButton::Other,
+                };
+                let ev = match state {
+                    winit::event::ElementState::Pressed => {
+                        if button == PointerEventButton::Left
+                            && self.current_resize_direction.get().is_some()
+                        {
+                            handle_resize(winit_window, self.current_resize_direction.get());
+                            return Ok(());
+                        }
+
+                        self.pressed.set(true);
+                        BackendMouseEvent::Pressed {
+                            position: self.cursor_pos.get(),
+                            button,
+                            click_count: 0,
+                            touch_finger_id: 0,
+                        }
+                    }
+                    winit::event::ElementState::Released => {
+                        self.pressed.set(false);
+                        BackendMouseEvent::Released {
+                            position: self.cursor_pos.get(),
+                            button,
+                            click_count: 0,
+                            touch_finger_id: 0,
+                        }
+                    }
+                };
+                self.dispatch_internal_event(ev);
+            }
+            WinitWindowEvent::Touch(touch) => {
+                let location = touch.location.to_logical(runtime_window.scale_factor() as f64);
+                let position = euclid::point2(location.x, location.y);
+                // winit types the touch id as u64, but on all platforms except
+                // iOS it is in fact a small integer that fits in i32. Only iOS
+                // stores a UITouch pointer address in it, which
+                // TouchFingerIdAllocator maps to a small id instead.
+                #[cfg(not(target_os = "ios"))]
+                let finger_id =
+                    Some(i32::try_from(touch.id).expect("winit touch id out of i32 range"));
+                #[cfg(target_os = "ios")]
+                let finger_id = match touch.phase {
+                    winit::event::TouchPhase::Started | winit::event::TouchPhase::Moved => {
+                        self.touch_finger_ids.borrow_mut().id_for(touch.id)
+                    }
+                    winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled => {
+                        self.touch_finger_ids.borrow_mut().take(touch.id)
+                    }
+                };
+                if let Some(finger_id) = finger_id {
+                    self.dispatch_internal_event(corelib::platform::InternalEvent::Touch {
+                        id: finger_id,
+                        position,
+                        phase: winit_touch_phase(touch.phase),
+                    });
+                }
+            }
+            WinitWindowEvent::ScaleFactorChanged { scale_factor, mut inner_size_writer } => {
+                if std::env::var("SLINT_SCALE_FACTOR").is_err() {
+                    self.window().dispatch_event_with_result(
+                        corelib::platform::WindowEvent::ScaleFactorChanged {
+                            scale_factor: scale_factor as f32,
+                        },
+                    )?;
+                    if let Some(physical) = self.physical_size_before_scale_factor.take() {
+                        inner_size_writer.request_inner_size(physical).ok();
+                    }
+                    // TODO: otherwise send a resize event or try to keep the logical size the same.
+                }
+            }
+            WinitWindowEvent::ThemeChanged(theme) => {
+                self.set_color_scheme(match theme {
+                    winit::window::Theme::Dark => ColorScheme::Dark,
+                    winit::window::Theme::Light => ColorScheme::Light,
+                });
+                self.update_accent_color();
+            }
+            WinitWindowEvent::Occluded(x) => {
+                self.renderer.occluded(x);
+
+                // Same hack as in the Resized arm above, so that we handle Minimized changes
+                self.window_state_event();
+            }
+            // Note: winit's PinchGesture does not carry a position; we use the last
+            // known cursor position as the best available approximation. On macOS
+            // trackpads, CursorMoved events typically precede gesture events.
+            WinitWindowEvent::PinchGesture { delta, phase, .. } => {
+                self.dispatch_internal_event(BackendMouseEvent::PinchGesture {
+                    position: self.cursor_pos.get(),
+                    delta: delta as f32,
+                    phase: winit_touch_phase(phase),
+                });
+            }
+            WinitWindowEvent::RotationGesture { delta, phase, .. } => {
+                // macOS/winit: positive = counterclockwise. Negate to match
+                // Slint convention (positive = clockwise).
+                self.dispatch_internal_event(BackendMouseEvent::RotationGesture {
+                    position: self.cursor_pos.get(),
+                    delta: -delta,
+                    phase: winit_touch_phase(phase),
+                });
+            }
+
+            WinitWindowEvent::AxisMotion { .. } => {
+                // Ignored, but happens often and is also ignored for the purpose of bundling CursorMoved.
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    /// Sets the cursor to a custom source, if there is a new one.
+    fn maybe_set_custom_cursor(
+        &self,
+        event_loop: &ActiveEventLoop,
+        winit_window: &winit::window::Window,
+    ) {
+        if let Some(source) = self.custom_cursor_source.take() {
+            winit_window.set_cursor(event_loop.create_custom_cursor(source));
+        }
+    }
+
     fn set_visibility(&self, visibility: WindowVisibility) -> Result<(), PlatformError> {
         if visibility == self.shown.get() {
             return Ok(());
@@ -837,8 +1594,11 @@ impl WinitWindowAdapter {
             let recreating_window = matches!(visibility, WindowVisibility::Shown);
 
             let Some(winit_window) = self.winit_window() else {
-                // Can't really show it on the screen, safe it in the attributes and try again later.
+                // Can't really show it on the screen, safe it in the attributes and try again later
+                // by registering it for activation when we can.
                 self.winit_window_or_none.borrow().set_visible(true);
+                self.shared_backend_data
+                    .register_inactive_window((self.self_weak.upgrade().unwrap()) as _);
                 return Ok(());
             };
 
@@ -846,38 +1606,27 @@ impl WinitWindowAdapter {
 
             let scale_factor = runtime_window.scale_factor() as f64;
 
-            let component_rc = runtime_window.component();
-            let component = ItemTreeRc::borrow_pin(&component_rc);
-
-            let layout_info_h = component.as_ref().layout_info(Orientation::Horizontal);
-            if let Some(window_item) = runtime_window.window_item() {
-                // Setting the width to its preferred size before querying the vertical layout info
-                // is important in case the height depends on the width
-                window_item.width.set(LogicalLength::new(layout_info_h.preferred_bounded()));
-            }
-            let layout_info_v = component.as_ref().layout_info(Orientation::Vertical);
             #[allow(unused_mut)]
-            let mut preferred_size = winit::dpi::LogicalSize::new(
-                layout_info_h.preferred_bounded(),
-                layout_info_v.preferred_bounded(),
-            );
+            let mut preferred_size = self.preferred_size().unwrap_or_default();
 
             #[cfg(target_arch = "wasm32")]
             if let Some(html_canvas) = winit_window.canvas() {
-                let existing_canvas_size = winit::dpi::LogicalSize::new(
-                    html_canvas.client_width() as f32,
-                    html_canvas.client_height() as f32,
-                );
                 // Try to maintain the existing size of the canvas element, if any
-                if existing_canvas_size.width > 0. {
+                if !is_preferred_sized_canvas(&html_canvas)
+                    && !canvas_has_explicit_size_set(&html_canvas)
+                {
+                    let existing_canvas_size = winit::dpi::LogicalSize::new(
+                        html_canvas.client_width() as f32,
+                        html_canvas.client_height() as f32,
+                    );
                     preferred_size.width = existing_canvas_size.width;
-                }
-                if existing_canvas_size.height > 0. {
+
                     preferred_size.height = existing_canvas_size.height;
                 }
             }
 
-            if winit_window.fullscreen().is_none()
+            if !platform_dictates_window_size()
+                && winit_window.fullscreen().is_none()
                 && !self.has_explicit_size.get()
                 && preferred_size.width > 0 as Coord
                 && preferred_size.height > 0 as Coord
@@ -889,17 +1638,24 @@ impl WinitWindowAdapter {
                 self.resize_window(size.into())?;
             };
 
+            // Pre-render the first frame before mapping the window to avoid a flash of
+            // uninitialized VRAM on X11 (no background_pixmap). Skipped on Wayland, where
+            // rendering before the initial configure makes the compositor mis-size the window.
+            if matches!(visibility, WindowVisibility::ShownFirstTime)
+                && !self.shared_backend_data.is_wayland
+            {
+                let _ = self.draw();
+            }
+
             winit_window.set_visible(true);
 
-            // Make sure the dark color scheme property is up-to-date, as it may have been queried earlier when
-            // the window wasn't mapped yet.
-            if let Some(color_scheme_prop) = self.color_scheme.get() {
-                if let Some(theme) = winit_window.theme() {
-                    color_scheme_prop.as_ref().set(match theme {
-                        winit::window::Theme::Dark => ColorScheme::Dark,
-                        winit::window::Theme::Light => ColorScheme::Light,
-                    })
-                }
+            // Refresh the SlintContext color-scheme now that the window is mapped: on some platforms
+            // `winit_window.theme()` only reports a real value once the window is shown.
+            if let Some(theme) = winit_window.theme() {
+                self.set_color_scheme(match theme {
+                    winit::window::Theme::Dark => ColorScheme::Dark,
+                    winit::window::Theme::Light => ColorScheme::Light,
+                });
             }
 
             // In wasm a request_redraw() issued before show() results in a draw() even when the window
@@ -910,8 +1666,18 @@ impl WinitWindowAdapter {
                 self.draw()?;
             };
 
+            // On iOS making an already-created window visible doesn't generate a fresh
+            // RedrawRequested. winit's one initial RedrawRequested is delivered while the window is
+            // created (during `resumed`), so a window first shown later misses it and stays blank.
+            #[cfg(ios_and_friends)]
+            self.request_redraw();
+
             Ok(())
         } else {
+            // Release the context menu; it holds the menu item tree that keeps this adapter alive.
+            #[cfg(muda)]
+            self.context_menu.take();
+
             // Wayland doesn't support hiding a window, only destroying it entirely.
             if self.winit_window_or_none.borrow().as_window().is_some_and(|winit_window| {
                 use raw_window_handle::HasWindowHandle;
@@ -920,6 +1686,9 @@ impl WinitWindowAdapter {
                 }) || std::env::var_os("SLINT_DESTROY_WINDOW_ON_HIDE").is_some()
             }) {
                 self.suspend()?;
+                // Note: Don't register the window in inactive_windows for re-creation later, as creating the window
+                // on wayland implies making it visible. Unfortunately, winit won't allow creating a window on wayland
+                // that's not visible.
             } else {
                 self.winit_window_or_none.borrow().set_visible(false);
             }
@@ -932,14 +1701,41 @@ impl WinitWindowAdapter {
         }
     }
 
+    pub(crate) fn visibility(&self) -> WindowVisibility {
+        self.shown.get()
+    }
+
     pub(crate) fn pending_redraw(&self) -> bool {
         self.pending_redraw.get()
+    }
+
+    pub async fn async_winit_window(
+        self_weak: Weak<Self>,
+    ) -> Result<Arc<winit::window::Window>, PlatformError> {
+        std::future::poll_fn(move |context| {
+            let Some(self_) = self_weak.upgrade() else {
+                return std::task::Poll::Ready(Err(
+                    "Unable to obtain winit window from destroyed window".to_string().into(),
+                ));
+            };
+            match self_.winit_window() {
+                Some(window) => std::task::Poll::Ready(Ok(window)),
+                None => {
+                    let waker = context.waker();
+                    if !self_.window_existence_wakers.borrow().iter().any(|w| w.will_wake(waker)) {
+                        self_.window_existence_wakers.borrow_mut().push(waker.clone());
+                    }
+                    std::task::Poll::Pending
+                }
+            }
+        })
+        .await
     }
 }
 
 impl WindowAdapter for WinitWindowAdapter {
     fn window(&self) -> &corelib::api::Window {
-        self.window.get().unwrap()
+        &self.window
     }
 
     fn renderer(&self) -> &dyn i_slint_core::renderer::Renderer {
@@ -1003,16 +1799,17 @@ impl WindowAdapter for WinitWindowAdapter {
     }
 
     fn request_redraw(&self) {
-        if !self.pending_redraw.replace(true) {
-            self.frame_throttle.request_throttled_redraw();
+        if !self.pending_redraw.replace(true)
+            && let WinitWindowOrNone::HasWindow { window, frame_throttle, .. } =
+                &*self.winit_window_or_none.borrow()
+        {
+            frame_throttle.request_throttled_redraw(window);
         }
     }
 
     #[allow(clippy::unnecessary_cast)] // Coord is used!
     fn update_window_properties(&self, properties: corelib::window::WindowProperties<'_>) {
-        let Some(window_item) =
-            self.window.get().and_then(|w| WindowInner::from_pub(w).window_item())
-        else {
+        let Some(window_item) = WindowInner::from_pub(&self.window).window_item() else {
             return;
         };
         let window_item = window_item.as_pin_ref();
@@ -1067,12 +1864,17 @@ impl WindowAdapter for WinitWindowAdapter {
         // But not if there is a pending resize in flight as that resize will reset these properties back
         if ((existing_size.width - width).abs() > 1. || (existing_size.height - height).abs() > 1.)
             && self.pending_requested_size.get().is_none()
+            // Nor while the item still holds a physical size set before the window existed as
+            // its logical size: the scale factor to convert it is not known yet.
+            && self.physical_size_before_scale_factor.get().is_none_or(|requested| {
+                requested.width as f32 != width || requested.height as f32 != height
+            })
         {
             // If we're in fullscreen state, don't try to resize the window but maintain the surface
             // size we've been assigned to from the windowing system. Weston/Wayland don't like it
             // when we create a surface that's bigger than the screen due to constraints (#532).
             if winit_window_or_none.fullscreen().is_none() {
-                // TODO: don't ignore error, propgate to caller
+                // TODO: don't ignore error, propagate to caller
                 let immediately_resized = self
                     .resize_window(winit::dpi::LogicalSize::new(width, height).into())
                     .unwrap_or_default();
@@ -1085,10 +1887,12 @@ impl WindowAdapter for WinitWindowAdapter {
 
         if must_resize {
             self.window()
-                .try_dispatch_event(WindowEvent::Resized {
+                .dispatch_event_with_result(WindowEvent::Resized {
                     size: i_slint_core::api::LogicalSize::new(width, height),
                 })
                 .unwrap();
+            WindowInner::from_pub(self.window())
+                .set_window_item_safe_area(window_item.safe_area_insets());
         }
 
         let m = properties.is_fullscreen();
@@ -1134,29 +1938,28 @@ impl WindowAdapter for WinitWindowAdapter {
         let resizable = window_is_resizable(new_constraints.min, new_constraints.max);
         // we must call set_resizable before setting the min and max size otherwise setting the min and max size don't work on X11
         winit_window_or_none.set_resizable(resizable);
-        let winit_min_inner = new_constraints.min.map(logical_size_to_winit);
+        // Important: Filter out (temporary?) zero width/heights, to avoid attempting to create a zero surface. For example, with wayland
+        // the client-side rendering ends up passing a zero width/height to the renderer.
+        let winit_min_inner =
+            new_constraints.min.map(logical_size_to_winit).map(filter_out_zero_width_or_height);
         winit_window_or_none.set_min_inner_size(winit_min_inner, sf as f64);
-        let winit_max_inner = new_constraints.max.map(logical_size_to_winit);
+        let winit_max_inner =
+            new_constraints.max.map(logical_size_to_winit).map(filter_out_zero_width_or_height);
         winit_window_or_none.set_max_inner_size(winit_max_inner, sf as f64);
 
-        // On ios, etc. apps are fullscreen and need to be responsive.
-        #[cfg(not(ios_and_friends))]
-        adjust_window_size_to_satisfy_constraints(self, winit_min_inner, winit_max_inner);
+        if !platform_dictates_window_size() {
+            adjust_window_size_to_satisfy_constraints(self, winit_min_inner, winit_max_inner);
+        }
 
         // Auto-resize to the preferred size if users (SlintPad) requests it
         #[cfg(target_arch = "wasm32")]
         if let Some(canvas) =
             winit_window_or_none.as_window().and_then(|winit_window| winit_window.canvas())
         {
-            if canvas
-                .dataset()
-                .get("slintAutoResizeToPreferred")
-                .and_then(|val_str| val_str.parse().ok())
-                .unwrap_or_default()
-            {
+            if is_preferred_sized_canvas(&canvas) {
                 let pref = new_constraints.preferred;
                 if pref.width > 0 as Coord || pref.height > 0 as Coord {
-                    // TODO: don't ignore error, propgate to caller
+                    // TODO: don't ignore error, propagate to caller
                     self.resize_window(logical_size_to_winit(pref).into()).ok();
                 };
             }
@@ -1169,41 +1972,81 @@ impl WindowAdapter for WinitWindowAdapter {
 }
 
 impl WindowAdapterInternal for WinitWindowAdapter {
-    fn set_mouse_cursor(&self, cursor: MouseCursor) {
-        let winit_cursor = match cursor {
-            MouseCursor::Default => winit::window::CursorIcon::Default,
-            MouseCursor::None => winit::window::CursorIcon::Default,
-            MouseCursor::Help => winit::window::CursorIcon::Help,
-            MouseCursor::Pointer => winit::window::CursorIcon::Pointer,
-            MouseCursor::Progress => winit::window::CursorIcon::Progress,
-            MouseCursor::Wait => winit::window::CursorIcon::Wait,
-            MouseCursor::Crosshair => winit::window::CursorIcon::Crosshair,
-            MouseCursor::Text => winit::window::CursorIcon::Text,
-            MouseCursor::Alias => winit::window::CursorIcon::Alias,
-            MouseCursor::Copy => winit::window::CursorIcon::Copy,
-            MouseCursor::Move => winit::window::CursorIcon::Move,
-            MouseCursor::NoDrop => winit::window::CursorIcon::NoDrop,
-            MouseCursor::NotAllowed => winit::window::CursorIcon::NotAllowed,
-            MouseCursor::Grab => winit::window::CursorIcon::Grab,
-            MouseCursor::Grabbing => winit::window::CursorIcon::Grabbing,
-            MouseCursor::ColResize => winit::window::CursorIcon::ColResize,
-            MouseCursor::RowResize => winit::window::CursorIcon::RowResize,
-            MouseCursor::NResize => winit::window::CursorIcon::NResize,
-            MouseCursor::EResize => winit::window::CursorIcon::EResize,
-            MouseCursor::SResize => winit::window::CursorIcon::SResize,
-            MouseCursor::WResize => winit::window::CursorIcon::WResize,
-            MouseCursor::NeResize => winit::window::CursorIcon::NeResize,
-            MouseCursor::NwResize => winit::window::CursorIcon::NwResize,
-            MouseCursor::SeResize => winit::window::CursorIcon::SeResize,
-            MouseCursor::SwResize => winit::window::CursorIcon::SwResize,
-            MouseCursor::EwResize => winit::window::CursorIcon::EwResize,
-            MouseCursor::NsResize => winit::window::CursorIcon::NsResize,
-            MouseCursor::NeswResize => winit::window::CursorIcon::NeswResize,
-            MouseCursor::NwseResize => winit::window::CursorIcon::NwseResize,
+    fn start_window_move(&self) {
+        if let Some(winit_window) = self.winit_window_or_none.borrow().as_window() {
+            let _ = winit_window.drag_window();
+        }
+    }
+
+    fn set_mouse_cursor(&self, cursor: MouseCursorInner) {
+        let winit_cursor = match &cursor {
+            MouseCursorInner::BuiltIn(cursor) => Some(match cursor {
+                BuiltInMouseCursor::Default => winit::window::CursorIcon::Default,
+                BuiltInMouseCursor::None => winit::window::CursorIcon::Default,
+                BuiltInMouseCursor::Help => winit::window::CursorIcon::Help,
+                BuiltInMouseCursor::Pointer => winit::window::CursorIcon::Pointer,
+                BuiltInMouseCursor::Progress => winit::window::CursorIcon::Progress,
+                BuiltInMouseCursor::Wait => winit::window::CursorIcon::Wait,
+                BuiltInMouseCursor::Crosshair => winit::window::CursorIcon::Crosshair,
+                BuiltInMouseCursor::Text => winit::window::CursorIcon::Text,
+                BuiltInMouseCursor::Alias => winit::window::CursorIcon::Alias,
+                BuiltInMouseCursor::Copy => winit::window::CursorIcon::Copy,
+                BuiltInMouseCursor::Move => winit::window::CursorIcon::Move,
+                BuiltInMouseCursor::NoDrop => winit::window::CursorIcon::NoDrop,
+                BuiltInMouseCursor::NotAllowed => winit::window::CursorIcon::NotAllowed,
+                BuiltInMouseCursor::Grab => winit::window::CursorIcon::Grab,
+                BuiltInMouseCursor::Grabbing => winit::window::CursorIcon::Grabbing,
+                BuiltInMouseCursor::ColResize => winit::window::CursorIcon::ColResize,
+                BuiltInMouseCursor::RowResize => winit::window::CursorIcon::RowResize,
+                BuiltInMouseCursor::NResize => winit::window::CursorIcon::NResize,
+                BuiltInMouseCursor::EResize => winit::window::CursorIcon::EResize,
+                BuiltInMouseCursor::SResize => winit::window::CursorIcon::SResize,
+                BuiltInMouseCursor::WResize => winit::window::CursorIcon::WResize,
+                BuiltInMouseCursor::NeResize => winit::window::CursorIcon::NeResize,
+                BuiltInMouseCursor::NwResize => winit::window::CursorIcon::NwResize,
+                BuiltInMouseCursor::SeResize => winit::window::CursorIcon::SeResize,
+                BuiltInMouseCursor::SwResize => winit::window::CursorIcon::SwResize,
+                BuiltInMouseCursor::EwResize => winit::window::CursorIcon::EwResize,
+                BuiltInMouseCursor::NsResize => winit::window::CursorIcon::NsResize,
+                BuiltInMouseCursor::NeswResize => winit::window::CursorIcon::NeswResize,
+                BuiltInMouseCursor::NwseResize => winit::window::CursorIcon::NwseResize,
+                _ => winit::window::CursorIcon::Default,
+            }),
+            MouseCursorInner::CustomMouseCursor { image, hotspot_x, hotspot_y } => {
+                // Render scalable sources (SVG) at the display resolution so the cursor stays crisp.
+                let scale = self.window().scale_factor();
+                let source_size = image.size();
+                let target_size = IntSize::new(
+                    (source_size.width as f32 * scale) as u32,
+                    (source_size.height as f32 * scale) as u32,
+                );
+                if let Some(rgba8) =
+                    i_slint_core::graphics::image_to_rgba8_with_target_size(image, target_size)
+                {
+                    let (width, height) = (rgba8.width(), rgba8.height());
+                    // winit rejects a hotspot that lies outside the image, so clamp it inside.
+                    let source = CustomCursor::from_rgba(
+                        rgba8.as_bytes(),
+                        width as u16,
+                        height as u16,
+                        scaled_hotspot(*hotspot_x, source_size.width, width) as u16,
+                        scaled_hotspot(*hotspot_y, source_size.height, height) as u16,
+                    );
+
+                    // Custom cursors have to be set during the event loop
+                    self.custom_cursor_source.set(source.ok());
+                }
+                None
+            }
+            _ => None,
         };
         if let Some(winit_window) = self.winit_window_or_none.borrow().as_window() {
-            winit_window.set_cursor_visible(cursor != MouseCursor::None);
-            winit_window.set_cursor(winit_cursor);
+            winit_window
+                .set_cursor_visible(cursor != MouseCursorInner::BuiltIn(BuiltInMouseCursor::None));
+
+            if let Some(cursor) = winit_cursor {
+                winit_window.set_cursor(cursor);
+            }
         }
     }
 
@@ -1223,7 +2066,11 @@ impl WindowAdapterInternal for WinitWindowAdapter {
             };
             winit_window.set_ime_purpose(match props.input_type {
                 corelib::items::InputType::Password => winit::window::ImePurpose::Password,
-                _ => winit::window::ImePurpose::Normal,
+                corelib::items::InputType::Text
+                | corelib::items::InputType::Number
+                | corelib::items::InputType::Decimal
+                | corelib::items::InputType::Search
+                | _ => winit::window::ImePurpose::Normal,
             });
             winit_window.set_ime_cursor_area(
                 position_to_winit(&props.cursor_rect_origin.into()),
@@ -1254,45 +2101,14 @@ impl WindowAdapterInternal for WinitWindowAdapter {
         };
     }
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn color_scheme(&self) -> ColorScheme {
-        self.color_scheme
-            .get_or_init(|| {
-                Box::pin(Property::new({
-                    cfg_if::cfg_if! {
-                        if #[cfg(use_winit_theme)] {
-                            self.winit_window_or_none
-                                .borrow()
-                                .as_window()
-                                .and_then(|window| window.theme())
-                                .map_or(ColorScheme::Unknown, |theme| match theme {
-                                    winit::window::Theme::Dark => ColorScheme::Dark,
-                                    winit::window::Theme::Light => ColorScheme::Light,
-                                })
-                        } else {
-                            if let Some(old_watch) = self.xdg_settings_watcher.replace(self.spawn_xdg_settings_watcher()) {
-                                old_watch.abort()
-                            }
-                            ColorScheme::Unknown
-                        }
-                    }
-                }))
-            })
-            .as_ref()
-            .get()
-    }
-
     #[cfg(muda)]
     fn supports_native_menu_bar(&self) -> bool {
-        true
+        !crate::muda::is_disabled()
     }
 
     #[cfg(muda)]
-    fn setup_menubar(&self, menubar: vtable::VBox<i_slint_core::menus::MenuVTable>) {
-        self.menubar.replace(Some(menubar));
+    fn setup_menubar(&self, menubar: vtable::VRc<MenuVTable>) {
+        self.menubar_weak.replace(Some(vtable::VRc::downgrade(&menubar)));
 
         if let WinitWindowOrNone::HasWindow { muda_adapter, .. } =
             &*self.winit_window_or_none.borrow()
@@ -1300,7 +2116,7 @@ impl WindowAdapterInternal for WinitWindowAdapter {
             // On Windows, we must destroy the muda menu before re-creating a new one
             drop(muda_adapter.borrow_mut().take());
             muda_adapter.replace(Some(crate::muda::MudaAdapter::setup(
-                self.menubar.borrow().as_ref().unwrap(),
+                &menubar,
                 &self.winit_window().unwrap(),
                 self.event_loop_proxy.clone(),
                 self.self_weak.clone(),
@@ -1308,14 +2124,50 @@ impl WindowAdapterInternal for WinitWindowAdapter {
         }
     }
 
-    #[cfg(enable_accesskit)]
-    fn handle_focus_change(&self, _old: Option<ItemRc>, _new: Option<ItemRc>) {
-        let Some(accesskit_adapter_cell) = self.accesskit_adapter() else { return };
-        accesskit_adapter_cell.borrow_mut().handle_focus_item_change();
+    #[cfg(muda)]
+    fn show_native_popup_menu(
+        &self,
+        context_menu_item: vtable::VRc<MenuVTable>,
+        position: LogicalPosition,
+    ) -> bool {
+        if crate::muda::is_disabled() {
+            return false;
+        }
+
+        // Set before showing: on Windows the activation event can arrive before this returns.
+        self.context_menu.replace(Some(context_menu_item));
+
+        if let WinitWindowOrNone::HasWindow { context_menu_muda_adapter, .. } =
+            &*self.winit_window_or_none.borrow()
+        {
+            // On Windows, we must destroy the muda menu before re-creating a new one
+            drop(context_menu_muda_adapter.borrow_mut().take());
+            if let Some(new_adapter) = crate::muda::MudaAdapter::show_context_menu(
+                self.context_menu.borrow().as_ref().unwrap(),
+                &self.winit_window().unwrap(),
+                position,
+                self.event_loop_proxy.clone(),
+            ) {
+                context_menu_muda_adapter.replace(Some(new_adapter));
+                return true;
+            }
+        }
+
+        // No native menu shown; release it so it doesn't keep the adapter alive.
+        self.context_menu.take();
+        false
     }
 
     #[cfg(enable_accesskit)]
-    fn register_item_tree(&self) {
+    fn handle_focus_change(&self, _old: Option<ItemRc>, _new: Option<ItemRc>) {
+        let Some(accesskit_adapter_cell) = self.accesskit_adapter() else { return };
+        if let Ok(mut a) = accesskit_adapter_cell.try_borrow_mut() {
+            a.handle_focus_item_change();
+        }
+    }
+
+    #[cfg(enable_accesskit)]
+    fn register_item_tree(&self, _: ItemTreeRefPin) {
         let Some(accesskit_adapter_cell) = self.accesskit_adapter() else { return };
         // If the accesskit_adapter is already borrowed, this means the new items were created when the tree was built and there is no need to re-visit them
         if let Ok(mut a) = accesskit_adapter_cell.try_borrow_mut() {
@@ -1327,7 +2179,7 @@ impl WindowAdapterInternal for WinitWindowAdapter {
     fn unregister_item_tree(
         &self,
         component: ItemTreeRef,
-        _: &mut dyn Iterator<Item = Pin<ItemRef<'_>>>,
+        _: &mut dyn Iterator<Item = core::pin::Pin<ItemRef<'_>>>,
     ) {
         let Some(accesskit_adapter_cell) = self.accesskit_adapter() else { return };
         if let Ok(mut a) = accesskit_adapter_cell.try_borrow_mut() {
@@ -1339,20 +2191,22 @@ impl WindowAdapterInternal for WinitWindowAdapter {
     fn window_handle_06_rc(
         &self,
     ) -> Result<Arc<dyn raw_window_handle::HasWindowHandle>, raw_window_handle::HandleError> {
-        self.winit_window_or_none
+        Ok(self
+            .winit_window_or_none
             .borrow()
             .as_window()
-            .map_or(Err(raw_window_handle::HandleError::Unavailable), |window| Ok(window))
+            .ok_or(raw_window_handle::HandleError::Unavailable)?)
     }
 
     #[cfg(feature = "raw-window-handle-06")]
     fn display_handle_06_rc(
         &self,
     ) -> Result<Arc<dyn raw_window_handle::HasDisplayHandle>, raw_window_handle::HandleError> {
-        self.winit_window_or_none
+        Ok(self
+            .winit_window_or_none
             .borrow()
             .as_window()
-            .map_or(Err(raw_window_handle::HandleError::Unavailable), |window| Ok(window))
+            .ok_or(raw_window_handle::HandleError::Unavailable)?)
     }
 
     fn bring_to_front(&self) -> Result<(), PlatformError> {
@@ -1362,6 +2216,30 @@ impl WindowAdapterInternal for WinitWindowAdapter {
         }
         Ok(())
     }
+
+    #[cfg(target_os = "ios")]
+    fn safe_area_inset(&self) -> i_slint_core::lengths::PhysicalEdges {
+        self.winit_window_or_none
+            .borrow()
+            .as_window()
+            .and_then(|window| {
+                let outer_position = window.outer_position().ok()?;
+                let inner_position = window.inner_position().ok()?;
+                let outer_size = window.outer_size();
+                let inner_size = window.inner_size();
+                Some(i_slint_core::lengths::PhysicalEdges::new(
+                    inner_position.y - outer_position.y,
+                    outer_size.height as i32
+                        - (inner_size.height as i32)
+                        - (inner_position.y - outer_position.y),
+                    inner_position.x - outer_position.x,
+                    outer_size.width as i32
+                        - (inner_size.width as i32)
+                        - (inner_position.x - outer_position.x),
+                ))
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl Drop for WinitWindowAdapter {
@@ -1370,15 +2248,17 @@ impl Drop for WinitWindowAdapter {
             self.winit_window_or_none.borrow().as_window().map(|winit_window| winit_window.id()),
         );
 
-        #[cfg(not(use_winit_theme))]
-        if let Some(xdg_watch_future) = self.xdg_settings_watcher.take() {
-            xdg_watch_future.abort();
+        #[cfg(target_os = "macos")]
+        if let Some(observer) = self.macos_color_observer.get() {
+            unsafe {
+                objc2_foundation::NSNotificationCenter::defaultCenter()
+                    .removeObserver((*observer).as_ref());
+            }
         }
     }
 }
 
 // Winit doesn't automatically resize the window to satisfy constraints. Qt does it though, and so do we here.
-#[cfg(not(ios_and_friends))]
 fn adjust_window_size_to_satisfy_constraints(
     adapter: &WinitWindowAdapter,
     min_size: Option<winit::dpi::LogicalSize<f64>>,
@@ -1388,24 +2268,91 @@ fn adjust_window_size_to_satisfy_constraints(
     let current_size = adapter
         .pending_requested_size
         .get()
-        .map(|s| s.to_logical::<f64>(sf))
-        .unwrap_or_else(|| physical_size_to_winit(adapter.size.get()).to_logical(sf));
+        .unwrap_or_else(|| {
+            let existing_adapter_size = adapter.size.get();
+            physical_size_to_winit(existing_adapter_size).into()
+        })
+        .to_logical::<f64>(sf);
 
     let mut window_size = current_size;
-    if let Some(min_size) = min_size {
-        let min_size = min_size.cast();
-        window_size.width = window_size.width.max(min_size.width);
-        window_size.height = window_size.height.max(min_size.height);
-    }
-
     if let Some(max_size) = max_size {
         let max_size = max_size.cast();
         window_size.width = window_size.width.min(max_size.width);
         window_size.height = window_size.height.min(max_size.height);
     }
 
+    // After the max clamp, so that a minimum above a fractional maximum wins
+    // (staying below the minimum would cut off content, e.g. for a min == max
+    // window). Raise a dimension whenever the physical rounding would land
+    // below the minimum, not only when its logical value is below it (see
+    // `round_up_logical`).
+    if let Some(min_size) = min_size {
+        let min_size = min_size.cast::<f64>();
+        if (window_size.width * sf).round() < min_size.width * sf {
+            window_size.width = round_up_logical(min_size.width, sf);
+        }
+        if (window_size.height * sf).round() < min_size.height * sf {
+            window_size.height = round_up_logical(min_size.height, sf);
+        }
+    }
+
     if window_size != current_size {
-        // TODO: don't ignore error, propgate to caller
+        // TODO: don't ignore error, propagate to caller
         adapter.resize_window(window_size.into()).ok();
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn query_wasm_accent_color() -> Color {
+    (|| {
+        use wasm_bindgen::JsCast;
+        let window = web_sys::window()?;
+        let document = window.document()?;
+        let element = document.create_element("span").ok()?;
+        let html_element: &web_sys::HtmlElement = element.dyn_ref()?;
+        html_element.style().set_property("color", "AccentColor").ok()?;
+        // If the browser doesn't support AccentColor, the property won't be set
+        if html_element.style().get_property_value("color").ok()?.is_empty() {
+            return None;
+        }
+        html_element.style().set_property("display", "none").ok()?;
+        document.body()?.append_child(&element).ok()?;
+        let color_str =
+            window.get_computed_style(&element).ok()??.get_property_value("color").ok()?;
+        element.remove();
+        // Parse "rgb(r, g, b)" computed color string
+        let inner = color_str.strip_prefix("rgb(")?.strip_suffix(')')?;
+        let mut parts = inner.split(',').map(|p| p.trim().parse::<u8>().ok());
+        Some(Color::from_argb_u8(255, parts.next()??, parts.next()??, parts.next()??))
+    })()
+    .unwrap_or_default()
+}
+
+#[cfg(target_family = "wasm")]
+fn is_preferred_sized_canvas(canvas: &web_sys::HtmlCanvasElement) -> bool {
+    canvas
+        .dataset()
+        .get("slintAutoResizeToPreferred")
+        .and_then(|val_str| val_str.parse::<bool>().ok())
+        .unwrap_or_default()
+}
+
+#[cfg(target_family = "wasm")]
+fn canvas_has_explicit_size_set(canvas: &web_sys::HtmlCanvasElement) -> bool {
+    let style = canvas.style();
+    if !style.get_property_value("width").unwrap_or_default().is_empty()
+        || !style.get_property_value("height").unwrap_or_default().is_empty()
+    {
+        return true;
+    }
+
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+    let Some(computed_style) = window.get_computed_style(&canvas).ok().flatten() else {
+        return false;
+    };
+
+    computed_style.get_property_value("width").ok().as_deref() != Some("auto")
+        || computed_style.get_property_value("height").ok().as_deref() != Some("auto")
 }

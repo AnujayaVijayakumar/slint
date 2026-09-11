@@ -1,0 +1,263 @@
+// Copyright © SixtyFPS GmbH <info@slint.dev>
+// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
+
+import "./assets/Inter-VariableFont.ttf";
+
+import { Api, EditorSurfaceMode, Hover } from "api.slint";
+import { Project } from "project.slint";
+import { Preview } from "preview.slint";
+import { StartupWizard } from "startup-wizard.slint";
+import { AppState, ElementKind, SidebarToggleButton, StudioTheme } from "components/common.slint";
+import { DragPreview } from "components/drag-preview.slint";
+import { EditorCanvas } from "components/editor-canvas.slint";
+import { EditorTopBar } from "components/top-bar.slint";
+import { ImageAssetEditor } from "components/image-asset-editor.slint";
+import { InspectorPane } from "components/inspector-pane.slint";
+import { LeftPane } from "components/left-pane.slint";
+import { EditorMetrics } from "components/common.slint";
+import { UpdateStatus, UpdateStatusBar, UpdateStatusPill } from "components/update-status.slint";
+
+export { Api, Hover, Preview, Project }
+export { EditorCursors, EditorMetrics } from "components/common.slint";
+
+export component EditorUi inherits Window {
+    preferred-width: 1360px;
+    preferred-height: 860px;
+    min-width: 1040px;
+    min-height: 680px;
+    title: "Slint Visual Editor";
+    background: StudioTheme.app-bg;
+    default-font-family: "Inter";
+
+    init => {
+        EditorMetrics.window-width = root.width;
+        EditorMetrics.window-height = root.height;
+    }
+    changed width => { EditorMetrics.window-width = root.width; }
+    changed height => { EditorMetrics.window-height = root.height; }
+
+    property <bool> sidebars-collapsed: false;
+    property <length> inspector-scroll-y: 0px;
+    in property <length> elements-pane-height: 0px;
+    in property <length> outline-pane-height: 0px;
+    callback elements-pane-resized(length);
+    callback outline-pane-resized(length);
+    callback elements-pane-reset();
+    callback outline-pane-reset();
+
+    function open-startup-wizard() {
+        Api.open-startup-wizard();
+    }
+
+    function close-startup-wizard() {
+        Api.close-startup-wizard();
+    }
+
+    function open-project() {
+        root.close-startup-wizard();
+    }
+    function apply-history(redo: bool) {
+        Api.inspector-cancel();
+        Api.inspector-generation += 1;
+        Api.inspector-fill-generation += 1;
+        if redo {
+            if Api.redo-enabled { Api.redo(); }
+        } else {
+            if Api.undo-enabled { Api.undo(); }
+        }
+    }
+
+    MenuBar {
+        Menu {
+            title: @tr("Edit");
+            MenuItem {
+                title: @tr("Undo");
+                enabled: Api.undo-enabled;
+                activated => { root.apply-history(false); }
+            }
+            MenuItem {
+                title: @tr("Redo");
+                enabled: Api.redo-enabled;
+                activated => { root.apply-history(true); }
+            }
+        }
+    }
+
+    Rectangle {
+        y: 0;
+        height: EditorMetrics.top-bar-height;
+        WindowMoveArea { }
+    }
+
+    VerticalLayout {
+        if !Api.startup-wizard-visible: editor := FocusScope {
+            property <bool> shift-pressed: false;
+
+            init => {
+                self.focus();
+            }
+
+            capture-key-pressed(event) => {
+                if event.text == Key.Shift || event.text == Key.ShiftR {
+                    self.shift-pressed = true;
+                    return reject;
+                }
+                reject
+            }
+
+            capture-key-released(event) => {
+                if event.text == Key.Shift || event.text == Key.ShiftR {
+                    self.shift-pressed = false;
+                    return reject;
+                }
+                reject
+            }
+
+            key-pressed(event) => {
+                let redo-y = Platform.os == OperatingSystemType.windows && (event.text == "y" || event.text == "Y");
+                if (event.modifiers.control || event.modifiers.meta) && (event.text == "z" || event.text == "Z" || redo-y) {
+                    root.apply-history(event.modifiers.shift || redo-y);
+                    return accept;
+                }
+                if event.text == Key.Escape && AppState.has-active-drag() {
+                    AppState.cancel-active-drags();
+                    return accept;
+                }
+                if (event.text == Key.Delete || event.text == Key.Backspace)
+                    && Api.selection.highlight-index >= 0 {
+                    Api.selected-element-delete();
+                    return accept;
+                }
+                reject
+            }
+
+            focus-lost => {
+                self.shift-pressed = false;
+            }
+
+            DropArea {
+                can-drop(event) => {
+                    if AppState.palette-drag-kind != ElementKind.none {
+                        AppState.update-palette-drag(AppState.palette-drag-kind, { x: event.position.x + self.absolute-position.x, y: event.position.y + self.absolute-position.y });
+                    }
+                    return DragAction.none;
+                }
+
+                Rectangle {
+                    background: StudioTheme.app-bg;
+                }
+
+                VerticalLayout {
+                    title-move-area := WindowMoveArea {
+                        height: EditorMetrics.top-bar-height;
+
+                        EditorTopBar { }
+                    }
+
+                    HorizontalLayout {
+                        vertical-stretch: 1;
+
+                        if !root.sidebars-collapsed: LeftPane {
+                            can-collapse: true;
+                            elements-pane-height: root.elements-pane-height;
+                            drag-started => { editor.focus(); }
+                            panes-collapsed => {
+                                root.sidebars-collapsed = true;
+                            }
+                            elements-pane-resized(height) => {
+                                root.elements-pane-resized(height);
+                            }
+                            elements-pane-reset => {
+                                root.elements-pane-reset();
+                            }
+                        }
+
+                        if Api.editor-surface-mode == EditorSurfaceMode.component: EditorCanvas {
+                            shift-pressed: editor.shift-pressed;
+                            real-element-selected => { editor.focus(); }
+                        }
+
+                        if Api.editor-surface-mode == EditorSurfaceMode.image: ImageAssetEditor {
+                            sidebars-collapsed: root.sidebars-collapsed;
+                        }
+
+                        if Api.editor-surface-mode == EditorSurfaceMode.component && !root.sidebars-collapsed: InspectorPane {
+                            outline-pane-height: root.outline-pane-height;
+                            element-information: Api.current-element;
+                            inspector-scroll-y <=> root.inspector-scroll-y;
+                            element-selected => { editor.focus(); }
+                            outline-drag-started => { editor.focus(); }
+                            outline-pane-resized(height) => {
+                                root.outline-pane-resized(height);
+                            }
+                            outline-pane-reset => {
+                                root.outline-pane-reset();
+                            }
+                        }
+                    }
+                }
+
+                DragPreview { parent-origin: parent.absolute-position; }
+
+                if root.sidebars-collapsed: Rectangle {
+                    x: 18px;
+                    y: EditorMetrics.top-bar-height + 14px;
+                    width: 274px;
+                    height: 42px;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: StudioTheme.dark ? #ffffff18 : #d0d7de;
+                    background: StudioTheme.panel-bg.with-alpha(0.92);
+                    drop-shadow-blur: 16px;
+                    drop-shadow-offset-y: 8px;
+                    drop-shadow-color: StudioTheme.dark ? #00000055 : #64748b28;
+
+                    HorizontalLayout {
+                        padding-left: 12px;
+                        padding-right: 6px;
+                        spacing: 10px;
+                        cross-axis-alignment: center;
+
+                        Text {
+                            horizontal-stretch: 1;
+                            text: Project.selected-project-file;
+                            color: StudioTheme.text;
+                            font-size: 13px;
+                            font-weight: 800;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        SidebarToggleButton {
+                            active: true;
+                            accessible-role: AccessibleRole.button;
+                            accessible-label: "Expand sidebars";
+                            clicked => {
+                                root.sidebars-collapsed = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if Api.startup-wizard-visible: StartupWizard {
+            opened => {
+                root.open-project();
+            }
+            create-new-project => {
+                Project.create-new-project();
+            }
+            open-existing-project => {
+                Project.open-existing-project();
+            }
+        }
+
+        if UpdateStatus.shows-bar(): UpdateStatusBar { }
+    }
+
+    if UpdateStatus.in-titlebar() && UpdateStatus.has-news(): UpdateStatusPill {
+        x: 100px;
+        y: 16px;
+    }
+}

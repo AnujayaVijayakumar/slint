@@ -25,11 +25,7 @@ pub trait LexingRule {
 impl LexingRule for &str {
     #[inline]
     fn lex(&self, text: &str, _: &mut LexState) -> usize {
-        if text.starts_with(*self) {
-            self.len()
-        } else {
-            0
-        }
+        if text.starts_with(*self) { self.len() } else { 0 }
     }
 }
 
@@ -106,7 +102,7 @@ pub fn lex_string(text: &str, state: &mut LexState) -> usize {
     } else if !text.starts_with('"') {
         return 0;
     }
-    let text_len = text.as_bytes().len();
+    let text_len = text.len();
     let mut end = 1; // skip the '"'
     loop {
         let stop = match text[end..].find(&['"', '\\'][..]) {
@@ -182,10 +178,23 @@ pub fn lex_color(text: &str, _: &mut LexState) -> usize {
 }
 
 pub fn lex_identifier(text: &str, _: &mut LexState) -> usize {
+    // Identifiers follow the Unicode identifier properties (UAX #31): the first
+    // character has XID_Start (or is `_`), each following one has XID_Continue
+    // (or is the Slint-specific kebab-case `-`). That is the character set the
+    // generated Rust and C++ can represent, so any character accepted here is a
+    // valid identifier there; a character outside it (e.g. `½`) is not consumed
+    // and surfaces as an error token.
+    let xid_start = icu_properties::CodePointSetData::new::<icu_properties::props::XidStart>();
+    let xid_continue =
+        icu_properties::CodePointSetData::new::<icu_properties::props::XidContinue>();
     let mut len = 0;
-    let chars = text.chars();
-    for c in chars {
-        if !c.is_alphanumeric() && c != '_' && (c != '-' || len == 0) {
+    for c in text.chars() {
+        let valid = if len == 0 {
+            c == '_' || xid_start.contains(c)
+        } else {
+            c == '-' || xid_continue.contains(c)
+        };
+        if !valid {
             break;
         }
         len += c.len_utf8();
@@ -195,7 +204,7 @@ pub fn lex_identifier(text: &str, _: &mut LexState) -> usize {
 
 #[allow(clippy::needless_update)] // Token may have extra fields depending on selected features
 pub fn lex(mut source: &str) -> Vec<crate::parser::Token> {
-    let mut result = vec![];
+    let mut result = Vec::new();
     let mut offset = 0;
     let mut state = LexState::default();
     if source.starts_with("\u{FEFF}") {
@@ -210,26 +219,22 @@ pub fn lex(mut source: &str) -> Vec<crate::parser::Token> {
         offset += 3;
     }
     while !source.is_empty() {
-        if let Some((len, kind)) = crate::parser::lex_next_token(source, &mut state) {
-            result.push(crate::parser::Token {
-                kind,
-                text: source[..len].into(),
-                offset,
-                ..Default::default()
-            });
-            offset += len;
-            source = &source[len..];
-        } else {
-            // FIXME: recover
-            result.push(crate::parser::Token {
-                kind: SyntaxKind::Error,
-                text: source.into(),
-                offset,
-                ..Default::default()
-            });
-            //offset += source.len();
-            break;
-        }
+        let (len, kind) = crate::parser::lex_next_token(source, &mut state).unwrap_or_else(|| {
+            // Recover from errors by returning "Error" tokens for all individual characters
+            // that the lexer could not handle.
+            //
+            // Note: Make sure to actually consume a whole character (may be more than 1 byte with
+            // UTF-8 multi-byte characters)
+            (source.ceil_char_boundary(1), SyntaxKind::Error)
+        });
+        result.push(crate::parser::Token {
+            kind,
+            text: source[..len].into(),
+            offset,
+            ..Default::default()
+        });
+        offset += len;
+        source = &source[len..];
     }
     result
 }
@@ -324,8 +329,56 @@ fn basic_lexer_test() {
 
     // Fuzzer tests:
     compare(r#"/**"#, &[(SyntaxKind::Div, "/"), (SyntaxKind::Star, "*"), (SyntaxKind::Star, "*")]);
-    compare(r#""\"#, &[(SyntaxKind::Error, "\"\\")]);
-    compare(r#""\ޱ"#, &[(SyntaxKind::Error, "\"\\ޱ")]);
+    compare(r#""\"#, &[(SyntaxKind::Error, "\""), (SyntaxKind::Error, "\\")]);
+    compare(
+        r#""\ޱ"#,
+        &[(SyntaxKind::Error, "\""), (SyntaxKind::Error, "\\"), (SyntaxKind::Identifier, "ޱ")],
+    );
+}
+
+/// The identifier and number token rules of the Slint SC language
+/// specification (docs/.../language/lexical-structure.mdx).
+#[test]
+fn identifier_and_number_tokens() {
+    let kinds = |source: &str| lex(source).iter().map(|t| t.kind).collect::<Vec<_>>();
+    let single = |source: &str| {
+        let k = kinds(source);
+        assert_eq!(k.len(), 1, "{source:?} lexed into {k:?}, expected a single token");
+        k[0]
+    };
+
+    // An identifier is drawn from Unicode identifier characters, `_`, and a
+    // non-leading `-`; non-ASCII letters are allowed.
+    // cSpell:ignore Über
+    //#sls.lex.identifier.classes
+    for id in ["foo", "_foo", "foo-bar", "snake_case", "x1", "café", "Über", "λ", "名前"] {
+        assert_eq!(single(id), SyntaxKind::Identifier, "{id:?}");
+    }
+
+    // A number is one or more decimal digits, an optional fractional part, and
+    // an optional unit or `%` suffix.
+    //#sls.lex.number
+    for n in ["45", "1.5", "100%", "10px", "1.5deg"] {
+        assert_eq!(single(n), SyntaxKind::NumberLiteral, "{n:?}");
+    }
+
+    // The token kinds are tried in a fixed order, so a run that begins with a
+    // decimal digit is a number even though a digit also starts an identifier.
+    //#sls.lex.tokens
+    //#sls.lex.identifier.no-leading-digit
+    assert_eq!(single("1abc"), SyntaxKind::NumberLiteral);
+    assert_eq!(single("42"), SyntaxKind::NumberLiteral);
+
+    // A leading `-` is a separate token, not part of the identifier.
+    //#sls.lex.identifier.no-leading-hyphen
+    assert_eq!(kinds("-foo"), [SyntaxKind::Minus, SyntaxKind::Identifier]);
+
+    // A character that is alphanumeric but lacks the Unicode identifier
+    // properties (here `½`) is not part of an identifier; it does not start
+    // one, and ends one it appears in, surfacing as an error token.
+    //#sls.lex.identifier.classes
+    assert_eq!(kinds("x½"), [SyntaxKind::Identifier, SyntaxKind::Error]);
+    assert_eq!(kinds("½x"), [SyntaxKind::Error, SyntaxKind::Identifier]);
 }
 
 /// Given the source of a rust file, find the occurrence of each `slint!(...)`macro.
@@ -334,36 +387,32 @@ pub fn locate_slint_macro(rust_source: &str) -> impl Iterator<Item = core::ops::
     let mut begin = 0;
     std::iter::from_fn(move || {
         let (open, close) = loop {
-            if let Some(m) = rust_source[begin..].find("slint") {
-                // heuristics to find if we are not in a comment or a string literal. Not perfect, but should work in most cases
-                if let Some(x) = rust_source[begin..(begin + m)].rfind(['\\', '\n', '/', '\"']) {
-                    if rust_source.as_bytes()[begin + x] != b'\n' {
-                        begin += m + 5;
-                        begin += rust_source[begin..].find(['\n']).unwrap_or(0);
-                        continue;
-                    }
-                }
+            let m = rust_source[begin..].find("slint")?;
+            // heuristics to find if we are not in a comment or a string literal. Not perfect, but should work in most cases
+            if let Some(x) = rust_source[begin..(begin + m)].rfind(['\\', '\n', '/', '\"'])
+                && rust_source.as_bytes()[begin + x] != b'\n'
+            {
                 begin += m + 5;
-                while rust_source[begin..].starts_with(' ') {
-                    begin += 1;
-                }
-                if !rust_source[begin..].starts_with('!') {
-                    continue;
-                }
+                begin += rust_source[begin..].find(['\n']).unwrap_or(0);
+                continue;
+            }
+            begin += m + 5;
+            while rust_source[begin..].starts_with(' ') {
                 begin += 1;
-                while rust_source[begin..].starts_with(' ') {
-                    begin += 1;
-                }
-                let Some(open) = rust_source.as_bytes().get(begin) else { continue };
-                match open {
-                    b'{' => break (SyntaxKind::LBrace, SyntaxKind::RBrace),
-                    b'[' => break (SyntaxKind::LBracket, SyntaxKind::RBracket),
-                    b'(' => break (SyntaxKind::LParent, SyntaxKind::RParent),
-                    _ => continue,
-                }
-            } else {
-                // No macro found, just return
-                return None;
+            }
+            if !rust_source[begin..].starts_with('!') {
+                continue;
+            }
+            begin += 1;
+            while rust_source[begin..].starts_with(' ') {
+                begin += 1;
+            }
+            let Some(open) = rust_source.as_bytes().get(begin) else { continue };
+            match open {
+                b'{' => break (SyntaxKind::LBrace, SyntaxKind::RBrace),
+                b'[' => break (SyntaxKind::LBracket, SyntaxKind::RBracket),
+                b'(' => break (SyntaxKind::LParent, SyntaxKind::RParent),
+                _ => continue,
             }
         };
 

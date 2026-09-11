@@ -1,5 +1,4 @@
 ---
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: MIT -->
 title: Math
 description: Math Namespace
 ---
@@ -62,6 +61,15 @@ Math.round(4.4); // returns 4
 Math.round(-1.2); // returns -1
 ```
 
+### sign(float) -> float
+Returns 1 or -1, indicating the sign of the number passed as argument.
+Returns 1 if the input is 0 or -0.
+```slint no-test
+Math.sign(10); // returns 1
+Math.sign(-30); // returns -1
+Math.sign(0); // returns 1
+```
+
 ### clamp(T, T, T) -> T
 
 Takes a `value`, `minimum` and `maximum` and returns `maximum` if
@@ -73,7 +81,7 @@ Return the log of the first value with a base of the second value
 
 ### ln(float) -> float
 
-Return the natural log of the value. Same as log(e, x)
+Return the natural log of the value. Same as `log(x, e)`
 
 ### min(T, T) -> T
 ### max(T, T) -> T
@@ -101,9 +109,9 @@ Square root
 
 Return the value of the first value raised to the second
 
-### exp(float, float) -> float
+### exp(float) -> float
 
-Return the value of the e raised to the x
+Return the value of e raised to the given value
 
 ## Trigonometric Functions
 ### acos(float) -> angle

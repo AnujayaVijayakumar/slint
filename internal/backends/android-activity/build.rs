@@ -1,12 +1,14 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore Dexer multidex
 use std::env;
 use std::path::PathBuf;
 
 use android_build::{Dexer, JavaBuild};
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(slint_nightly_test)");
     if !env::var("TARGET").unwrap().contains("android") {
         return;
     }
@@ -68,12 +70,14 @@ fn main() {
 
     if !o.status.success() {
         eprintln!("Dex conversion failed: {}", String::from_utf8_lossy(&o.stderr));
-        let javac = android_build::javac().unwrap();
-        let java_ver = android_build::check_javac_version(&javac).unwrap();
+        let java_home = android_build::java_home().unwrap();
+        let java_ver = android_build::check_javac_version(&java_home).unwrap();
         if java_ver >= 21 {
             eprintln!("WARNING: JDK version 21 is known to cause an error with older android SDK");
             eprintln!("See https://github.com/slint-ui/slint/issues/4973");
-            eprintln!("Try downgrading your version of Java to something like JDK 17, or upgrade to the SDK build tools 35");
+            eprintln!(
+                "Try downgrading your version of Java to something like JDK 17, or upgrade to the SDK build tools 35"
+            );
         }
         panic!("Dex conversion failed");
     }

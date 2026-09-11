@@ -5,10 +5,7 @@ use i_slint_core::platform::PlatformError;
 pub struct Backend {}
 
 impl Backend {
-    pub fn new() -> Result<Self, PlatformError> {
-        Self::new_with_renderer_by_name(None)
-    }
-    pub fn new_with_renderer_by_name(_renderer_name: Option<&str>) -> Result<Self, PlatformError> {
+    pub fn build(_builder: super::BackendBuilder) -> Result<Self, PlatformError> {
         Ok(Backend {})
     }
 }
@@ -20,7 +17,7 @@ impl i_slint_core::platform::Platform for Backend {
         std::rc::Rc<dyn i_slint_core::window::WindowAdapter>,
         i_slint_core::platform::PlatformError,
     > {
-        Err(format!("The linuxkms backend is only supported on Linux").into())
+        Err("The linuxkms backend is only supported on Linux".into())
     }
 
     fn run_event_loop(&self) -> Result<(), PlatformError> {

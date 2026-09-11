@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 
-TestCase := Rectangle {
+// cSpell: ignore roundtripped
+export component TestCase inherits Window {
     width: 300phx;
     height: 300phx;
-    property<[{name: string, account: string, score: float}]> model: [
+    in-out property<[{name: string, account: string, score: float}]> model: [
         {
             name: "Olivier",
             account: "ogoffart",
@@ -18,13 +19,14 @@ TestCase := Rectangle {
         }
     ];
 
-    property <int> clicked_score;
-    property <string> clicked_name;
-    property <int> clicked_internal_state;
-    property <int> clicked_index;
+    in-out property <int> clicked_score;
+    in-out property <string> clicked_name;
+    in-out property <int> clicked_internal_state;
+    in-out property <int> clicked_index;
 
     for person[i] in model: TouchArea {
         x: i*10phx;
+        y: 0phx;
         width: 10phx;
         height: 10phx;
         property <length> model; // this is not the model
@@ -38,6 +40,14 @@ TestCase := Rectangle {
             clicked_name = text;
             clicked_index = i;
         }
+    }
+
+    public function push_person(name: string, account: string, score: float) {
+        model.push({name: name, account: account, score: score})
+    }
+    public function remove_person(index: int) { model.remove(index) }
+    public function insert_person(index: int, name: string, account: string, score: float) {
+        model.insert(index, {name: name, account: account, score: score})
     }
 }
 
@@ -136,7 +146,7 @@ assert_eq!(instance.get_clicked_score(), 44000);
 
 // At position 0 there is the invalid item
 slint_testing::send_mouse_click(&instance, 5., 5.);
-assert_eq!(instance.get_clicked_score(), 0);
+assert_eq!(instance.get_clicked_score(), 42000);
 assert_eq!(instance.get_clicked_index(), 0);
 
 ```
@@ -228,7 +238,7 @@ assert_eq(instance.get_clicked_score(), 44000);
 
 // At position 0 there is the invalid item
 slint_testing::send_mouse_click(&instance, 5., 5.);
-assert_eq(instance.get_clicked_score(), 0);
+assert_eq(instance.get_clicked_score(), 42000);
 assert_eq(instance.get_clicked_index(), 0);
 ```
 
@@ -285,6 +295,86 @@ assert.equal(instance.clicked_internal_state, 2);
 assert.equal(instance.clicked_index, 1);
 ```
 
+////////// Test push, remove and insert on repeater
+```rust
+let instance = TestCase::new().unwrap();
+
+instance.invoke_push_person("world".into(), "a3".into(), 333.);
+slint_testing::send_mouse_click(&instance, 25., 5.);
+assert_eq!(instance.get_clicked_score(), 333000);
+assert_eq!(instance.get_clicked_name(), slint::SharedString::from("world"));
+assert_eq!(instance.get_clicked_index(), 2);
+
+instance.invoke_remove_person(0);
+slint_testing::send_mouse_click(&instance, 5., 5.);
+assert_eq!(instance.get_clicked_score(), 789000);
+assert_eq!(instance.get_clicked_name(), slint::SharedString::from("Simon"));
+assert_eq!(instance.get_clicked_index(), 0);
+
+instance.invoke_insert_person(1, "inserted".into(), "a_new".into(), 999.);
+slint_testing::send_mouse_click(&instance, 15., 5.);
+assert_eq!(instance.get_clicked_score(), 999000);
+assert_eq!(instance.get_clicked_name(), slint::SharedString::from("inserted"));
+assert_eq!(instance.get_clicked_index(), 1);
+slint_testing::send_mouse_click(&instance, 25., 5.);
+assert_eq!(instance.get_clicked_score(), 333000);
+assert_eq!(instance.get_clicked_name(), slint::SharedString::from("world"));
+assert_eq!(instance.get_clicked_index(), 2);
+```
+
+```cpp
+auto handle = TestCase::create();
+const TestCase &instance = *handle;
+
+instance.invoke_push_person("world", "a3", 333.);
+slint_testing::send_mouse_click(&instance, 25., 5.);
+assert_eq(instance.get_clicked_score(), 333000);
+assert_eq(instance.get_clicked_name(), "world");
+assert_eq(instance.get_clicked_index(), 2);
+
+instance.invoke_remove_person(0);
+slint_testing::send_mouse_click(&instance, 5., 5.);
+assert_eq(instance.get_clicked_score(), 789000);
+assert_eq(instance.get_clicked_name(), "Simon");
+assert_eq(instance.get_clicked_index(), 0);
+
+instance.invoke_insert_person(1, "inserted", "a_new", 999.);
+slint_testing::send_mouse_click(&instance, 15., 5.);
+assert_eq(instance.get_clicked_score(), 999000);
+assert_eq(instance.get_clicked_name(), "inserted");
+assert_eq(instance.get_clicked_index(), 1);
+slint_testing::send_mouse_click(&instance, 25., 5.);
+assert_eq(instance.get_clicked_score(), 333000);
+assert_eq(instance.get_clicked_name(), "world");
+assert_eq(instance.get_clicked_index(), 2);
+```
+
+```js
+var instance = new slint.TestCase({});
+
+instance.push_person("world", "a3", 333.);
+slintlib.private_api.send_mouse_click(instance, 25., 5.);
+assert.equal(instance.clicked_score, 333000);
+assert.equal(instance.clicked_name, "world");
+assert.equal(instance.clicked_index, 2);
+
+instance.remove_person(0);
+slintlib.private_api.send_mouse_click(instance, 5., 5.);
+assert.equal(instance.clicked_score, 789000);
+assert.equal(instance.clicked_name, "Simon");
+assert.equal(instance.clicked_index, 0);
+
+instance.insert_person(1, "inserted", "a_new", 999.);
+slintlib.private_api.send_mouse_click(instance, 15., 5.);
+assert.equal(instance.clicked_score, 999000);
+assert.equal(instance.clicked_name, "inserted");
+assert.equal(instance.clicked_index, 1);
+slintlib.private_api.send_mouse_click(instance, 25., 5.);
+assert.equal(instance.clicked_score, 333000);
+assert.equal(instance.clicked_name, "world");
+assert.equal(instance.clicked_index, 2);
+```
+
 ////////// Issue #8021
 ```cpp
 using ModelData = std::tuple<slint::SharedString, slint::SharedString, float>;
@@ -322,4 +412,36 @@ slint_testing::send_mouse_click(&instance, 35., 5.);
 assert_eq(instance.get_clicked_name(), "Olivier");
 ```
 
+////////// Issue #10278
+```rust
+
+type ModelData = (slint::SharedString, slint::SharedString, f32);
+
+struct MyModel {
+    window_weak: slint::Weak<TestCase>,
+}
+
+impl slint::Model for MyModel {
+    type Data = ModelData;
+
+    fn row_count(&self) -> usize {
+        42
+    }
+
+    fn row_data(&self, row: usize) -> Option<Self::Data> {
+        let name = self.window_weak.unwrap().get_clicked_name();
+        let account = format!("row: {row}").into();
+        Some((name, account, row as f32))
+    }
+
+    fn model_tracker(&self) -> &dyn slint::ModelTracker {
+        &()
+    }
+}
+
+
+let instance = TestCase::new().unwrap();
+let model = std::rc::Rc::new(MyModel { window_weak: instance.as_weak() });
+instance.set_model(slint::ModelRc::from(model));
+```
 */

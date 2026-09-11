@@ -1,24 +1,29 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore importident incdir splitn
 use smol_str::{SmolStr, ToSmolStr};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
 
-use crate::diagnostics::{BuildDiagnostics, Spanned};
+use crate::diagnostics::{BuildDiagnostics, Diagnostic, Spanned};
 use crate::expression_tree::Callable;
 use crate::object_tree::{self, Document, ExportedName, Exports};
-use crate::parser::{syntax_nodes, NodeOrToken, SyntaxKind, SyntaxToken};
+use crate::parser::{NodeOrToken, SyntaxKind, SyntaxToken, syntax_nodes};
 use crate::typeregister::TypeRegister;
-use crate::{expression_tree, CompilerConfiguration};
+use crate::{CompilerConfiguration, expression_tree};
 use crate::{fileaccess, langtype, layout, parser};
 use core::future::Future;
 use itertools::Itertools;
 
+#[allow(clippy::large_enum_variant)]
 enum LoadedDocument {
     Document(Document),
+    /// A dependency of this file has changed, so we need to re-analyze it.
+    /// The file contents have not changed, so we can keep the parsed CST around.
     Invalidated(syntax_nodes::Document),
 }
 
@@ -50,10 +55,22 @@ pub enum ImportKind {
 }
 
 #[derive(Debug, Clone)]
+pub struct LibraryInfo {
+    pub name: String,
+    pub package: String,
+    pub module: Option<String>,
+    pub exports: Vec<ExportedName>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ImportedTypes {
     pub import_uri_token: SyntaxToken,
     pub import_kind: ImportKind,
     pub file: String,
+
+    /// `import {Foo, Bar} from "@Foo"` where Foo is an external
+    /// library located in another crate
+    pub library_info: Option<LibraryInfo>,
 }
 
 #[derive(Debug)]
@@ -138,7 +155,7 @@ pub(crate) fn snapshot_with_extra_doc(
     if let Some(doc_node) = &new_doc.node {
         let path = doc_node.source_file.path().to_path_buf();
         if let Some(r) = &mut result {
-            r.all_documents.docs.insert(path, (LoadedDocument::Document(new_doc), vec![]));
+            r.all_documents.docs.insert(path, (LoadedDocument::Document(new_doc), Vec::new()));
         }
     }
 
@@ -163,8 +180,8 @@ impl Snapshotter {
         registry
             .borrow()
             .all_elements()
-            .iter()
-            .filter_map(|(_, ty)| match ty {
+            .values()
+            .filter_map(|ty| match ty {
                 langtype::ElementType::Component(c) if c.is_global() => Some(c),
                 _ => None,
             })
@@ -196,6 +213,9 @@ impl Snapshotter {
             global_type_registry: self.snapshot_type_register(&type_loader.global_type_registry),
             compiler_config: type_loader.compiler_config.clone(),
             resolved_style: type_loader.resolved_style.clone(),
+            revision: type_loader.revision,
+            // Share the counters so names generated after the snapshot stay unique.
+            symbol_counters: type_loader.symbol_counters.clone(),
         })
     }
 
@@ -290,6 +310,7 @@ impl Snapshotter {
             custom_fonts: document.custom_fonts.clone(),
             imports: document.imports.clone(),
             exports,
+            library_exports: document.library_exports.clone(),
             embedded_file_resources: document.embedded_file_resources.clone(),
             #[cfg(feature = "bundle-translations")]
             translation_builder: document.translation_builder.clone(),
@@ -307,7 +328,7 @@ impl Snapshotter {
     ) -> Rc<object_tree::Component> {
         let input_address = by_address::ByAddress(component.clone());
 
-        let parent_element = if let Some(pe) = component.parent_element.upgrade() {
+        let parent_element = if let Some(pe) = component.parent_element() {
             Rc::downgrade(&self.use_element(&pe))
         } else {
             Weak::default()
@@ -327,8 +348,9 @@ impl Snapshotter {
                     .collect(),
             );
 
-            let child_insertion_point =
-                RefCell::new(component.child_insertion_point.borrow().clone());
+            let child_insertion_points =
+                RefCell::new(component.child_insertion_points.borrow().clone());
+            let declared_slots = component.declared_slots.clone();
 
             let popup_windows = RefCell::new(
                 component
@@ -354,7 +376,8 @@ impl Snapshotter {
             object_tree::Component {
                 node: component.node.clone(),
                 id: component.id.clone(),
-                child_insertion_point,
+                child_insertion_points,
+                declared_slots,
                 exported_global_names: RefCell::new(
                     component.exported_global_names.borrow().clone(),
                 ),
@@ -362,13 +385,14 @@ impl Snapshotter {
                 init_code: RefCell::new(component.init_code.borrow().clone()),
                 inherits_popup_window: std::cell::Cell::new(component.inherits_popup_window.get()),
                 optimized_elements,
-                parent_element,
+                parent_element: RefCell::new(parent_element),
                 popup_windows,
                 timers,
                 menu_item_tree,
                 private_properties: RefCell::new(component.private_properties.borrow().clone()),
                 root_constraints,
                 root_element,
+                from_library: core::cell::Cell::new(false),
             }
         });
         self.keep_alive.push((component.clone(), result.clone()));
@@ -462,8 +486,7 @@ impl Snapshotter {
             .collect();
 
         target_element.bindings = elem
-            .bindings
-            .iter()
+            .bindings_including_synthetic()
             .map(|(k, v)| {
                 let bm = v.borrow();
                 let binding = self.snapshot_binding_expression(&bm);
@@ -494,9 +517,9 @@ impl Snapshotter {
                 index_id: r.index_id.clone(),
                 is_conditional_element: r.is_conditional_element,
                 is_listview: r.is_listview.as_ref().map(|lv| object_tree::ListViewInfo {
-                    viewport_y: lv.viewport_y.snapshot(self),
-                    viewport_height: lv.viewport_height.snapshot(self),
-                    viewport_width: lv.viewport_width.snapshot(self),
+                    content_y: lv.content_y.snapshot(self),
+                    content_height: lv.content_height.as_ref().map(|height| height.snapshot(self)),
+                    content_width: lv.content_width.as_ref().map(|width| width.snapshot(self)),
                     listview_height: lv.listview_height.snapshot(self),
                     listview_width: lv.listview_width.snapshot(self),
                 }),
@@ -523,21 +546,27 @@ impl Snapshotter {
                     is_alias: v.is_alias.as_ref().map(|a| a.snapshot(self)),
                     visibility: v.visibility,
                     pure: v.pure,
+                    shadowed_name: v.shadowed_name.clone(),
+                    shadowable: v.shadowable,
+                    moved_from: v.moved_from.clone(),
+                    deprecated: v.deprecated.clone(),
                 };
                 (k.clone(), decl)
             })
             .collect();
+        target_element.shadowing_members = elem.shadowing_members.clone();
         target_element.layout_info_prop =
             elem.layout_info_prop.as_ref().map(|(n1, n2)| (n1.snapshot(self), n2.snapshot(self)));
         target_element.property_analysis = RefCell::new(elem.property_analysis.borrow().clone());
 
         target_element.change_callbacks = elem.change_callbacks.clone();
         target_element.child_of_layout = elem.child_of_layout;
+        target_element.child_of_flexbox = elem.child_of_flexbox;
         target_element.default_fill_parent = elem.default_fill_parent;
         target_element.has_popup_child = elem.has_popup_child;
         target_element.inline_depth = elem.inline_depth;
         target_element.is_component_placeholder = elem.is_component_placeholder;
-        target_element.is_flickable_viewport = elem.is_flickable_viewport;
+        target_element.is_flickable_content = elem.is_flickable_content;
         target_element.is_legacy_syntax = elem.is_legacy_syntax;
         target_element.item_index = elem.item_index.clone();
         target_element.item_index_of_first_children = elem.item_index_of_first_children.clone();
@@ -582,7 +611,21 @@ impl Snapshotter {
             two_way_bindings: binding_expression
                 .two_way_bindings
                 .iter()
-                .map(|twb| twb.snapshot(self))
+                .map(|twb| match twb {
+                    crate::expression_tree::TwoWayBinding::Property { property, field_access } => {
+                        crate::expression_tree::TwoWayBinding::Property {
+                            property: property.snapshot(self),
+                            field_access: field_access.clone(),
+                        }
+                    }
+                    crate::expression_tree::TwoWayBinding::ModelData {
+                        repeated_element,
+                        field_access,
+                    } => crate::expression_tree::TwoWayBinding::ModelData {
+                        repeated_element: repeated_element.clone(),
+                        field_access: field_access.clone(),
+                    },
+                })
                 .collect(),
         }
     }
@@ -623,7 +666,17 @@ impl Snapshotter {
                 Weak::upgrade(&self.use_component(component)).expect("Looking at a known component")
             })
             .collect();
-        object_tree::UsedSubTypes { globals, structs_and_enums, sub_components }
+        let library_types_imports = used_types.library_types_imports.clone();
+        let library_global_imports = used_types.library_global_imports.clone();
+        object_tree::UsedSubTypes {
+            globals,
+            structs_and_enums,
+            sub_components,
+            library_types_imports,
+            library_global_imports,
+            deprecated_type_aliases: Vec::new(),
+            collision_renamed_names: Default::default(),
+        }
     }
 
     fn snapshot_popup_window(
@@ -637,14 +690,17 @@ impl Snapshotter {
             y: popup_window.y.snapshot(self),
             close_policy: popup_window.close_policy.clone(),
             parent_element: self.use_element(&popup_window.parent_element),
+            is_tooltip: popup_window.is_tooltip,
+            is_open: popup_window.is_open.as_ref().map(|is_open| is_open.snapshot(self)),
         }
     }
 
-    fn snapshot_timer(&mut self, popup_window: &object_tree::Timer) -> object_tree::Timer {
+    fn snapshot_timer(&mut self, timer: &object_tree::Timer) -> object_tree::Timer {
         object_tree::Timer {
-            interval: popup_window.interval.snapshot(self),
-            running: popup_window.running.snapshot(self),
-            triggered: popup_window.triggered.snapshot(self),
+            interval: timer.interval.snapshot(self),
+            running: timer.running.snapshot(self),
+            triggered: timer.triggered.snapshot(self),
+            element: timer.element.clone(),
         }
     }
 
@@ -675,6 +731,7 @@ impl Snapshotter {
                 .map(|lc| lc.snapshot(self)),
             fixed_width: layout_constraints.fixed_width,
             fixed_height: layout_constraints.fixed_height,
+            local: layout_constraints.local.clone(),
         }
     }
 
@@ -741,19 +798,23 @@ impl Snapshotter {
                 op: *op,
                 node: node.clone(),
             },
-            Expression::BinaryExpression { lhs, rhs, op } => Expression::BinaryExpression {
+            Expression::BinaryExpression { lhs, rhs, op, .. } => Expression::BinaryExpression {
                 lhs: Box::new(self.snapshot_expression(lhs)),
                 rhs: Box::new(self.snapshot_expression(rhs)),
                 op: *op,
+                source_location: None,
             },
             Expression::UnaryOp { sub, op } => {
                 Expression::UnaryOp { sub: Box::new(self.snapshot_expression(sub)), op: *op }
             }
-            Expression::Condition { condition, true_expr, false_expr } => Expression::Condition {
-                condition: Box::new(self.snapshot_expression(condition)),
-                true_expr: Box::new(self.snapshot_expression(true_expr)),
-                false_expr: Box::new(self.snapshot_expression(false_expr)),
-            },
+            Expression::Condition { condition, true_expr, false_expr, .. } => {
+                Expression::Condition {
+                    condition: Box::new(self.snapshot_expression(condition)),
+                    true_expr: Box::new(self.snapshot_expression(true_expr)),
+                    false_expr: Box::new(self.snapshot_expression(false_expr)),
+                    source_location: None,
+                }
+            }
             Expression::Array { element_ty, values } => Expression::Array {
                 element_ty: element_ty.clone(),
                 values: values.iter().map(|e| self.snapshot_expression(e)).collect(),
@@ -803,7 +864,21 @@ impl Snapshotter {
                     .map(|(e1, e2)| (self.snapshot_expression(e1), self.snapshot_expression(e2)))
                     .collect(),
             },
-            Expression::RadialGradient { stops } => Expression::RadialGradient {
+            Expression::RadialGradient { center, radius, stops } => Expression::RadialGradient {
+                center: center.as_ref().map(|(cx, cy)| {
+                    (Box::new(self.snapshot_expression(cx)), Box::new(self.snapshot_expression(cy)))
+                }),
+                radius: radius.as_ref().map(|r| Box::new(self.snapshot_expression(r))),
+                stops: stops
+                    .iter()
+                    .map(|(e1, e2)| (self.snapshot_expression(e1), self.snapshot_expression(e2)))
+                    .collect(),
+            },
+            Expression::ConicGradient { from_angle, center, stops } => Expression::ConicGradient {
+                from_angle: Box::new(self.snapshot_expression(from_angle)),
+                center: center.as_ref().map(|(cx, cy)| {
+                    (Box::new(self.snapshot_expression(cx)), Box::new(self.snapshot_expression(cy)))
+                }),
                 stops: stops
                     .iter()
                     .map(|(e1, e2)| (self.snapshot_expression(e1), self.snapshot_expression(e2)))
@@ -812,15 +887,38 @@ impl Snapshotter {
             Expression::ReturnStatement(expr) => Expression::ReturnStatement(
                 expr.as_ref().map(|e| Box::new(self.snapshot_expression(e))),
             ),
-            Expression::LayoutCacheAccess { layout_cache_prop, index, repeater_index } => {
-                Expression::LayoutCacheAccess {
-                    layout_cache_prop: layout_cache_prop.snapshot(self),
-                    index: *index,
-                    repeater_index: repeater_index
-                        .as_ref()
-                        .map(|e| Box::new(self.snapshot_expression(e))),
-                }
-            }
+            Expression::LayoutCacheAccess {
+                layout_cache_prop,
+                index,
+                repeater_index,
+                entries_per_item,
+            } => Expression::LayoutCacheAccess {
+                layout_cache_prop: layout_cache_prop.snapshot(self),
+                index: *index,
+                repeater_index: repeater_index
+                    .as_ref()
+                    .map(|e| Box::new(self.snapshot_expression(e))),
+                entries_per_item: *entries_per_item,
+            },
+            Expression::GridRepeaterCacheAccess {
+                layout_cache_prop,
+                index,
+                repeater_index,
+                stride,
+                child_offset,
+                inner_repeater_index,
+                entries_per_item,
+            } => Expression::GridRepeaterCacheAccess {
+                layout_cache_prop: layout_cache_prop.snapshot(self),
+                index: *index,
+                repeater_index: Box::new(self.snapshot_expression(repeater_index)),
+                stride: Box::new(self.snapshot_expression(stride)),
+                child_offset: *child_offset,
+                inner_repeater_index: inner_repeater_index
+                    .as_ref()
+                    .map(|e| Box::new(self.snapshot_expression(e))),
+                entries_per_item: *entries_per_item,
+            },
             Expression::MinMax { ty, op, lhs, rhs } => Expression::MinMax {
                 ty: ty.clone(),
                 lhs: Box::new(self.snapshot_expression(lhs)),
@@ -838,7 +936,14 @@ pub struct TypeLoader {
     /// The style that was specified in the compiler configuration, but resolved. So "native" for example is resolved to the concrete
     /// style.
     pub resolved_style: String,
+    /// The revision in the TypeLoader marks changes to the TypeLoader.
+    /// Any changes should increase the revision number via [Self::bump_revision]
+    revision: u64,
     all_documents: LoadedDocuments,
+    /// Counters for the deterministic unique symbol names generated by the
+    /// passes. Shared across all documents of the compilation so the names stay
+    /// unique even after inlining merges components from different documents.
+    pub symbol_counters: Rc<crate::symbol_counters::SymbolCounters>,
 }
 
 struct BorrowedTypeLoader<'a> {
@@ -847,26 +952,25 @@ struct BorrowedTypeLoader<'a> {
 }
 
 impl TypeLoader {
-    pub fn new(
-        global_type_registry: Rc<RefCell<TypeRegister>>,
-        compiler_config: CompilerConfiguration,
-        diag: &mut BuildDiagnostics,
-    ) -> Self {
-        let mut style = compiler_config
-            .style
-            .clone()
-            .or_else(|| std::env::var("SLINT_STYLE").ok())
-            .unwrap_or_else(|| "native".into());
+    pub fn new(compiler_config: CompilerConfiguration, diag: &mut BuildDiagnostics) -> Self {
+        let mut style = compiler_config.style.clone().unwrap_or_else(|| "fluent".into());
 
         if style == "native" {
             style = get_native_style(&mut diag.all_loaded_files);
         }
 
+        let symbol_counters = crate::symbol_counters::SymbolCounters::shared();
         let myself = Self {
-            global_type_registry,
+            global_type_registry: if compiler_config.enable_experimental {
+                crate::typeregister::TypeRegister::builtin_experimental()
+            } else {
+                crate::typeregister::TypeRegister::builtin()
+            },
             compiler_config,
             resolved_style: style.clone(),
+            revision: 0,
             all_documents: Default::default(),
+            symbol_counters,
         };
 
         let mut known_styles = fileaccess::styles();
@@ -879,7 +983,7 @@ impl TypeLoader {
             diag.push_diagnostic_with_span(
                 format!(
                     "Style {} is not known. Use one of the builtin styles [{}] or make sure your custom style is found in the include directories",
-                    &style,
+                    style,
                     known_styles.join(", ")
                 ),
                 Default::default(),
@@ -890,35 +994,44 @@ impl TypeLoader {
         myself
     }
 
-    pub fn drop_document(&mut self, path: &Path) -> Result<(), std::io::Error> {
-        if let Some((LoadedDocument::Document(doc), _)) = self.all_documents.docs.remove(path) {
-            for dep in &doc.imports {
-                self.all_documents
-                    .dependencies
-                    .entry(Path::new(&dep.file).into())
-                    .or_default()
-                    .remove(path);
-            }
-        }
-        self.all_documents.dependencies.remove(path);
+    fn bump_revision(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Drop a document from the TypeLoader and invalidate all of its dependencies.
+    /// Returns the list of all (transitive) dependencies.
+    ///
+    /// This forces the compiler to entirely reload the document from scratch.
+    /// To only cause a re-analyze, but not a reparse, use [Self::invalidate_document]
+    pub fn drop_document(&mut self, path: &Path) -> Result<HashSet<PathBuf>, std::io::Error> {
+        let dependencies = self.invalidate_document(path);
+        self.all_documents.docs.remove(path);
+        self.bump_revision();
+
         if self.all_documents.currently_loading.contains_key(path) {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("{path:?} is still loading"),
-            ))
+            Err(std::io::Error::new(ErrorKind::InvalidInput, format!("{path:?} is still loading")))
         } else {
-            Ok(())
+            Ok(dependencies)
         }
     }
 
     /// Invalidate a document and all its dependencies.
+    ///
+    /// This will keep the CST of the document in cache, but mark that it needs to be re-analyzed
+    /// to reconstruct its types.
+    ///
+    /// To entirely forget a document and cause a complete re-parse, use [Self::drop_document].
     pub fn invalidate_document(&mut self, path: &Path) -> HashSet<PathBuf> {
         if let Some((d, _)) = self.all_documents.docs.get_mut(path) {
             if let LoadedDocument::Document(doc) = d {
-                for dep in &doc.imports {
+                for import in &doc.imports {
                     self.all_documents
                         .dependencies
-                        .entry(Path::new(&dep.file).into())
+                        .entry(Path::new(&import.file).into())
                         .or_default()
                         .remove(path);
                 }
@@ -934,7 +1047,10 @@ impl TypeLoader {
                 return HashSet::new();
             }
         } else {
-            return HashSet::new();
+            // If a document is not in the TypeLoader, it may still have dependencies,
+            // as another document may have tried to import it, but it failed (e.g. the file didn't exist).
+            // So still invalidate all dependencies, even if the file is not in the TypeLoader.
+            // (Fallthrough)
         }
         let deps = self.all_documents.dependencies.remove(path).unwrap_or_default();
         let mut extra_deps = HashSet::new();
@@ -942,6 +1058,7 @@ impl TypeLoader {
             extra_deps.extend(self.invalidate_document(dep));
         }
         extra_deps.extend(deps);
+        self.bump_revision();
         extra_deps
     }
 
@@ -968,9 +1085,44 @@ impl TypeLoader {
         registry_to_populate: &'b Rc<RefCell<TypeRegister>>,
         import_stack: &'b HashSet<PathBuf>,
     ) -> (Vec<ImportedTypes>, Exports) {
-        let mut imports = vec![];
-        let mut dependencies_futures = vec![];
+        let mut imports = Vec::new();
+        let mut dependencies_futures = Vec::new();
         for mut import in Self::collect_dependencies(state, doc) {
+            // The embedded files import each other by that path, so only a
+            // document outside them is rejected.
+            if import.file.starts_with("builtin:")
+                && !import.import_uri_token.source_file.path().starts_with("builtin:")
+            {
+                state.borrow_mut().diag.push_error(
+                    format!(
+                        "Cannot import \"{}\": the files built into the compiler are internal. Import the widgets from \"std-widgets.slint\"",
+                        import.file
+                    ),
+                    &import.import_uri_token,
+                );
+                continue;
+            }
+
+            // The path shapes that don't resolve relative to the importing
+            // file. Rejecting them here, before any search path is consulted,
+            // keeps the Slint SC error the only diagnostic and leaves the
+            // named file unread. No builtin file imports this way, so skipping
+            // the load can't leave a builtin document half-loaded.
+            #[cfg(feature = "slint-sc")]
+            if state.borrow().diag.slint_sc {
+                let rejected = if import.file.starts_with('@') {
+                    Some("Library imports are")
+                } else if crate::pathutils::is_absolute(Path::new(import.file.as_str())) {
+                    Some("Absolute import paths are")
+                } else {
+                    None
+                };
+                if let Some(feature) = rejected {
+                    state.borrow_mut().diag.slint_sc_error(feature, &import.import_uri_token);
+                    continue;
+                }
+            }
+
             if matches!(import.import_kind, ImportKind::FileImport) {
                 if let Some((path, _)) = state.borrow().tl.resolve_import_path(
                     Some(&import.import_uri_token.clone().into()),
@@ -981,11 +1133,56 @@ impl TypeLoader {
                 imports.push(import);
                 continue;
             }
+
             dependencies_futures.push(Box::pin(async move {
-                let file = import.file.as_str();
+                #[cfg(feature = "experimental-library-module")]
+                let import_file = import.file.clone();
+                #[cfg(feature = "experimental-library-module")]
+                if let Some(maybe_library_import) = import_file.strip_prefix('@')
+                    && let Ok(library_name) = std::env::var(format!(
+                        "DEP_{}_SLINT_LIBRARY_NAME",
+                        maybe_library_import.to_uppercase()
+                    ))
+                    && library_name == maybe_library_import
+                {
+                    let library_slint_source = std::env::var(format!(
+                        "DEP_{}_SLINT_LIBRARY_SOURCE",
+                        maybe_library_import.to_uppercase()
+                    ))
+                    .unwrap_or_default();
+
+                    import.file = library_slint_source;
+
+                    if let Ok(library_package) = std::env::var(format!(
+                        "DEP_{}_SLINT_LIBRARY_PACKAGE",
+                        maybe_library_import.to_uppercase()
+                    )) {
+                        import.library_info = Some(LibraryInfo {
+                            name: library_name,
+                            package: library_package,
+                            module: std::env::var(format!(
+                                "DEP_{}_SLINT_LIBRARY_MODULE",
+                                maybe_library_import.to_uppercase()
+                            ))
+                            .ok(),
+                            exports: Vec::new(),
+                        });
+                    } else {
+                        // This should never happen
+                        let mut state = state.borrow_mut();
+                        state.diag.push_error(
+                            format!(
+                                "DEP_{}_SLINT_LIBRARY_PACKAGE is missing for external library import",
+                                maybe_library_import.to_uppercase()
+                            ),
+                            &import.import_uri_token.parent(),
+                        );
+                    }
+                }
+
                 let doc_path = Self::ensure_document_loaded(
                     state,
-                    file,
+                    import.file.as_str(),
                     Some(import.import_uri_token.clone().into()),
                     import_stack.clone(),
                 )
@@ -999,17 +1196,51 @@ impl TypeLoader {
         std::future::poll_fn(|cx| {
             dependencies_futures.retain_mut(|fut| {
                 let core::task::Poll::Ready((mut import, doc_path)) = fut.as_mut().poll(cx) else { return true; };
-                let Some(doc_path) = doc_path else { return false };
+                let doc_path = match doc_path {
+                    Ok(doc_path) => doc_path,
+                    Err(Some(doc_path)) => {
+                        // Even if the import failed (e.g. the file doesn't exist), we need to add it to the document imports so that
+                        // the dependency graph is correct and we can retry loading the document if the imported file changes or is created.
+                        import.file = doc_path.to_string_lossy().into_owned();
+                        imports.push(import);
+
+                        return false;
+                    }
+                    Err(None) => return false,
+                };
                 let mut state = state.borrow_mut();
-                let state = &mut *state;
+                let state: &mut BorrowedTypeLoader<'a> = &mut state;
                 let Some(doc) = state.tl.get_document(&doc_path) else {
                     panic!("Just loaded document not available")
                 };
+
+                // The widget library and the styles are built into the
+                // compiler and aren't part of the subset. This catches the
+                // "std-widgets.slint" spelling, which only becomes a builtin
+                // path here; naming the embedded path is rejected earlier, for
+                // every mode. Their own imports reach this too, but the error
+                // is suppressed for a builtin referencing file.
+                #[cfg(feature = "slint-sc")]
+                if doc_path.starts_with("builtin:") {
+                    state.diag.slint_sc_error(
+                        &format!("Importing the builtin file '{}' is", import.file),
+                        &import.import_uri_token,
+                    );
+                }
+
                 match &import.import_kind {
                     ImportKind::ImportList(imported_types) => {
                         let mut imported_types = ImportedName::extract_imported_names(imported_types).peekable();
                         if imported_types.peek().is_some() {
                             Self::register_imported_types(doc, &import, imported_types, registry_to_populate, state.diag);
+
+                            #[cfg(feature = "experimental-library-module")]
+                            if let Some(library_info) = import.library_info.as_mut() {
+                                library_info.exports =
+                                    doc.exports.iter().map(|(exported_name, _compo_or_type)| {
+                                        exported_name.clone()
+                                    }).collect();
+                            }
                         } else {
                             state.diag.push_error("Import names are missing. Please specify which types you would like to import".into(), &import.import_uri_token.parent());
                         }
@@ -1078,8 +1309,8 @@ impl TypeLoader {
             match Self::ensure_document_loaded(&state, file_to_import, None, Default::default())
                 .await
             {
-                Some(doc_path) => doc_path,
-                None => return None,
+                Ok(doc_path) => doc_path,
+                Err(_) => return None,
             };
 
         let Some(doc) = self.get_document(&doc_path) else {
@@ -1116,19 +1347,24 @@ impl TypeLoader {
         }
     }
 
+    /// Returns whether the file was successfully loaded.
+    /// If not, the path that was attempted to be loaded is returned (if any).
+    #[allow(clippy::await_holding_refcell_ref)] // false positive: explicit drop() before await
     async fn ensure_document_loaded<'a: 'b, 'b>(
         state: &'a RefCell<BorrowedTypeLoader<'a>>,
         file_to_import: &'b str,
         import_token: Option<NodeOrToken>,
         mut import_stack: HashSet<PathBuf>,
-    ) -> Option<PathBuf> {
+    ) -> Result<PathBuf, Option<PathBuf>> {
         let mut borrowed_state = state.borrow_mut();
 
+        let mut resolved = false;
         let (path_canon, builtin) = match borrowed_state
             .tl
             .resolve_import_path(import_token.as_ref(), file_to_import)
         {
             Some(x) => {
+                resolved = true;
                 if let Some(file_name) = x.0.file_name().and_then(|f| f.to_str()) {
                     let len = file_to_import.len();
                     if !file_to_import.ends_with(file_name)
@@ -1136,13 +1372,12 @@ impl TypeLoader {
                         && file_name.eq_ignore_ascii_case(
                             file_to_import.get(len - file_name.len()..).unwrap_or(""),
                         )
+                        && import_token.as_ref().and_then(|x| x.source_file()).is_some()
                     {
-                        if import_token.as_ref().and_then(|x| x.source_file()).is_some() {
-                            borrowed_state.diag.push_warning(
+                        borrowed_state.diag.push_warning(
                                 format!("Loading \"{file_to_import}\" resolved to a file named \"{file_name}\" with different casing. This behavior is not cross platform. Rename the file, or edit the import to use the same casing"),
                                 &import_token,
                             );
-                        }
                     }
                 }
                 x
@@ -1160,7 +1395,7 @@ impl TypeLoader {
                     }
                     (import_path, None)
                 } else {
-                    // We will load using the `open_import_fallback`
+                    // We will load using the `open_import_callback`
                     // Simplify the path to remove the ".."
                     let base_path = import_token
                         .as_ref()
@@ -1169,7 +1404,8 @@ impl TypeLoader {
                     let path = crate::pathutils::join(
                         &crate::pathutils::dirname(&base_path),
                         Path::new(file_to_import),
-                    )?;
+                    )
+                    .ok_or(None)?;
                     (path, None)
                 }
             }
@@ -1180,7 +1416,7 @@ impl TypeLoader {
                 format!("Recursive import of \"{}\"", path_canon.display()),
                 &import_token,
             );
-            return None;
+            return Err(Some(path_canon));
         }
 
         drop(borrowed_state);
@@ -1215,7 +1451,7 @@ impl TypeLoader {
         })
         .await;
         if is_loaded {
-            return Some(path_canon);
+            return Ok(path_canon);
         }
 
         let doc_node = if let Some((doc_node, errors)) = doc_node {
@@ -1230,9 +1466,9 @@ impl TypeLoader {
                         .expect("internal error: embedded file is not UTF-8 source code"),
                 ))
             } else {
-                let fallback = state.borrow().tl.compiler_config.open_import_fallback.clone();
-                if let Some(fallback) = fallback {
-                    let result = fallback(path_canon.to_string_lossy().into()).await;
+                let callback = state.borrow().tl.compiler_config.open_import_callback.clone();
+                if let Some(callback) = callback {
+                    let result = callback(path_canon.to_string_lossy().into()).await;
                     result.unwrap_or_else(|| std::fs::read_to_string(&path_canon))
                 } else {
                     std::fs::read_to_string(&path_canon)
@@ -1244,19 +1480,26 @@ impl TypeLoader {
                     Some(&path_canon),
                     state.borrow_mut().diag,
                 )),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Err(err)
+                    if !resolved
+                        && matches!(
+                            err.kind(),
+                            // A path that can't name a file (e.g. one with a character
+                            // Windows forbids) can't be found either, so report it the
+                            // same way rather than leaking the raw OS error.
+                            ErrorKind::NotFound
+                                | ErrorKind::NotADirectory
+                                | ErrorKind::InvalidFilename
+                        ) =>
+                {
+                    let import_kind =
+                        if file_to_import.starts_with('@') { "library" } else { "include" };
                     state.borrow_mut().diag.push_error(
-                            if file_to_import.starts_with('@') {
-                                format!(
-                                    "Cannot find requested import \"{file_to_import}\" in the library search path",
-                                )
-                            } else {
-                                format!(
-                                    "Cannot find requested import \"{file_to_import}\" in the include search path",
-                                )
-                            },
-                            &import_token,
-                        );
+                        format!(
+                            "Cannot find requested import \"{file_to_import}\" in the {import_kind} search path",
+                        ),
+                        &import_token,
+                    );
                     None
                 }
                 Err(err) => {
@@ -1293,7 +1536,7 @@ impl TypeLoader {
             x.wake();
         }
 
-        ok.then_some(path_canon)
+        if ok { Ok(path_canon) } else { Err(Some(path_canon)) }
     }
 
     /// Load a file, and its dependency, running only the import passes.
@@ -1333,6 +1576,7 @@ impl TypeLoader {
     /// Load a file, and its dependency, running the full set of passes.
     ///
     /// the path must be the canonical path
+    #[allow(clippy::await_holding_refcell_ref)] // requires mutable typeloader+diag through async pass pipeline
     pub async fn load_root_file(
         &mut self,
         path: &Path,
@@ -1356,12 +1600,27 @@ impl TypeLoader {
         } else {
             None
         };
-        state
-            .tl
-            .all_documents
-            .docs
-            .insert(path.clone(), (LoadedDocument::Document(doc), parse_errors));
+        Self::register_document(state, doc, path.clone(), parse_errors);
         (path, raw_type_loader)
+    }
+
+    fn register_document(
+        state: &mut BorrowedTypeLoader<'_>,
+        doc: Document,
+        path: PathBuf,
+        parse_errors: Vec<Diagnostic>,
+    ) {
+        for dep in &doc.imports {
+            state
+                .tl
+                .all_documents
+                .dependencies
+                .entry(Path::new(&dep.file).into())
+                .or_default()
+                .insert(path.clone());
+        }
+        state.tl.all_documents.docs.insert(path, (LoadedDocument::Document(doc), parse_errors));
+        state.tl.bump_revision();
     }
 
     async fn load_file_impl<'a>(
@@ -1386,16 +1645,7 @@ impl TypeLoader {
         if !state.diag.has_errors() {
             crate::passes::run_import_passes(&doc, state.tl, state.diag);
         }
-        for dep in &doc.imports {
-            state
-                .tl
-                .all_documents
-                .dependencies
-                .entry(Path::new(&dep.file).into())
-                .or_default()
-                .insert(path.clone());
-        }
-        state.tl.all_documents.docs.insert(path, (LoadedDocument::Document(doc), parse_errors));
+        Self::register_document(state, doc, path, parse_errors);
     }
 
     async fn load_doc_no_pass<'a>(
@@ -1417,6 +1667,9 @@ impl TypeLoader {
         )
         .await;
 
+        let ignore_missing_font_files =
+            state.borrow().tl.compiler_config.resource_url_mapper.is_some();
+        let symbol_counters = state.borrow().tl.symbol_counters.clone();
         if state.borrow().diag.has_errors() {
             // If there was error (esp parse error) we don't want to report further error in this document.
             // because they might be nonsense (TODO: we should check that the parse error were really in this document).
@@ -1432,6 +1685,8 @@ impl TypeLoader {
                 reexports,
                 &mut ignore_diag,
                 &dependency_registry,
+                ignore_missing_font_files,
+                &symbol_counters,
             );
             return (path.to_owned(), doc);
         }
@@ -1443,6 +1698,8 @@ impl TypeLoader {
             reexports,
             state.diag,
             &dependency_registry,
+            ignore_missing_font_files,
+            &symbol_counters,
         );
         (path.to_owned(), doc)
     }
@@ -1471,7 +1728,11 @@ impl TypeLoader {
                 }
             };
 
-            match imported_type {
+            #[cfg(feature = "slint-sc")]
+            let internal_name = import_name.internal_name.clone();
+
+            #[cfg_attr(not(feature = "slint-sc"), allow(unused_variables))]
+            let inserted = match imported_type {
                 itertools::Either::Left(c) => {
                     registry_to_populate.borrow_mut().add_with_name(import_name.internal_name, c)
                 }
@@ -1479,6 +1740,16 @@ impl TypeLoader {
                     .borrow_mut()
                     .insert_type_with_name(ty, import_name.internal_name),
             };
+
+            // Regular Slint lets a later import replace an earlier one of the
+            // same name; Slint SC requires each name to be introduced once.
+            #[cfg(feature = "slint-sc")]
+            if !inserted {
+                build_diagnostics.slint_sc_error(
+                    &format!("Importing the name '{internal_name}' more than once is"),
+                    &import.import_uri_token,
+                );
+            }
         }
     }
 
@@ -1501,6 +1772,7 @@ impl TypeLoader {
             };
             crate::fileaccess::load_file(path.as_path())
                 .map(|virtual_file| (virtual_file.canon_path, virtual_file.builtin_contents))
+                .or(Some((path, None)))
         })
     }
 
@@ -1513,8 +1785,9 @@ impl TypeLoader {
     ) -> Option<(PathBuf, Option<&'static [u8]>)> {
         // The directory of the current file is the first in the list of include directories.
         referencing_file
-            .map(base_directory)
+            .and_then(|x| x.parent().map(|x| x.to_path_buf()))
             .into_iter()
+            .chain(referencing_file.and_then(maybe_base_directory))
             .chain(self.compiler_config.include_paths.iter().map(PathBuf::as_path).map(
                 |include_path| {
                     let base = referencing_file.map(Path::to_path_buf).unwrap_or_default();
@@ -1524,6 +1797,8 @@ impl TypeLoader {
             ))
             .chain(
                 (file_to_import == "std-widgets.slint"
+                    || (file_to_import == "style-base.slint" && referencing_file.is_none())
+                    || (file_to_import == "std-widgets-impl.slint" && referencing_file.is_none())
                     || referencing_file.is_some_and(|x| x.starts_with("builtin:/")))
                 .then(|| format!("builtin:/{}", self.resolved_style).into()),
             )
@@ -1541,6 +1816,7 @@ impl TypeLoader {
         doc.ImportSpecifier()
             .map(|import| {
                 let maybe_import_uri = import.child_token(SyntaxKind::StringLiteral);
+
                 let kind = import
                     .ImportIdentifierList()
                     .map(ImportKind::ImportList)
@@ -1564,6 +1840,8 @@ impl TypeLoader {
                         return None;
                     }
                 };
+                // The path is taken verbatim: escape sequences aren't decoded, so a
+                // backslash stays a directory separator rather than an escape.
                 let path_to_import = import_uri.text().to_string();
                 let path_to_import = path_to_import.trim_matches('\"').to_string();
 
@@ -1579,6 +1857,7 @@ impl TypeLoader {
                     import_uri_token: import_uri,
                     import_kind: type_specifier,
                     file: path_to_import,
+                    library_info: None,
                 })
             })
     }
@@ -1596,6 +1875,39 @@ impl TypeLoader {
     /// Return an iterator over all the loaded file path
     pub fn all_files(&self) -> impl Iterator<Item = &PathBuf> {
         self.all_documents.docs.keys()
+    }
+
+    /// Returns all file paths whose on-disk changes can affect the current document graph.
+    ///
+    /// This includes loaded documents and unresolved import targets that are kept in the
+    /// dependency graph so newly created files can invalidate their dependents.
+    pub fn all_files_to_watch(&self) -> HashSet<PathBuf> {
+        // Note: This only works if the full set of passes have run (e.g. in load_root_file, but not
+        // in load_file).
+        //
+        // TODO: the LSP will only run the import passes, which do not yet
+        // detect embedded file resources, so we won't know about them until we
+        // run the full pass pipeline (e.g. in the editor binary).
+        fn resource_paths(document: &LoadedDocument) -> Vec<PathBuf> {
+            match document {
+                LoadedDocument::Document(document) => document
+                    .embedded_file_resources
+                    .borrow()
+                    .iter()
+                    .flat_map(|resource| resource.path.as_ref().map(|path| PathBuf::from(&**path)))
+                    .collect(),
+                LoadedDocument::Invalidated(_document) => vec![],
+            }
+        }
+
+        self.all_documents
+            .docs
+            .iter()
+            .flat_map(|(path, (document, _diagnostics))| {
+                std::iter::once(path.clone()).chain(resource_paths(document))
+            })
+            .chain(self.all_documents.dependencies.keys().cloned())
+            .collect()
     }
 
     /// Returns an iterator over all the loaded documents
@@ -1664,15 +1976,12 @@ fn get_native_style(all_loaded_files: &mut std::collections::BTreeSet<PathBuf>) 
     i_slint_common::get_native_style(false, &std::env::var("TARGET").unwrap_or_default()).into()
 }
 
-/// return the base directory from which imports are loaded
+/// For a .rs file, return the manifest directory
 ///
-/// For a .slint file, this is the parent directory.
-/// For a .rs file, this is relative to the CARGO_MANIFEST_DIR
-///
-/// Note: this function is only called for .rs path as part of the LSP or viewer.
-/// Because from a proc_macro, we don't actually know the path of the current file, and this
-/// is why we must be relative to CARGO_MANIFEST_DIR.
-pub fn base_directory(referencing_file: &Path) -> PathBuf {
+/// This is for compatibility with `slint!` macro as before rust 1.88,
+/// it was not possible for the macro to know the current path and
+/// the Cargo.toml file was used instead
+fn maybe_base_directory(referencing_file: &Path) -> Option<PathBuf> {
     if referencing_file.extension().is_some_and(|e| e == "rs") {
         // For .rs file, this is a rust macro, and rust macro locates the file relative to the CARGO_MANIFEST_DIR which is the directory that has a Cargo.toml file.
         let mut candidate = referencing_file;
@@ -1684,10 +1993,10 @@ pub fn base_directory(referencing_file: &Path) -> PathBuf {
                 break Some(candidate);
             }
         }
+        .map(|x| x.to_path_buf())
     } else {
-        referencing_file.parent()
+        None
     }
-    .map_or_else(Default::default, |p| p.to_path_buf())
 }
 
 #[test]
@@ -1705,21 +2014,18 @@ fn test_dependency_loading() {
         HashMap::from([("library".into(), test_source_path.join("library").join("lib.slint"))]);
     compiler_config.style = Some("fluent".into());
 
-    let mut main_test_path = test_source_path;
+    let mut main_test_path = test_source_path.clone();
     main_test_path.push("dependency_test_main.slint");
 
     let mut test_diags = crate::diagnostics::BuildDiagnostics::default();
-    let doc_node = crate::parser::parse_file(main_test_path, &mut test_diags).unwrap();
+    let doc_node = crate::parser::parse_file(&main_test_path, &mut test_diags).unwrap();
 
     let doc_node: syntax_nodes::Document = doc_node.into();
 
-    let global_registry = TypeRegister::builtin();
-
-    let registry = Rc::new(RefCell::new(TypeRegister::new(&global_registry)));
-
     let mut build_diagnostics = BuildDiagnostics::default();
 
-    let mut loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    let registry = Rc::new(RefCell::new(TypeRegister::new(&loader.global_type_registry)));
 
     let (foreign_imports, _) = spin_on::spin_on(loader.load_dependencies_recursively(
         &doc_node,
@@ -1731,6 +2037,36 @@ fn test_dependency_loading() {
     assert!(!build_diagnostics.has_errors());
     assert_eq!(foreign_imports.len(), 3);
     assert!(foreign_imports.iter().all(|x| matches!(x.import_kind, ImportKind::ImportList(..))));
+
+    let imported_files: Vec<_> = [
+        "incpath/local_helper_type.slint",
+        "incpath/dependency_from_incpath.slint",
+        "dependency_local.slint",
+        "library/lib.slint",
+        "library/dependency_from_library.slint",
+    ]
+    .into_iter()
+    .map(|path| test_source_path.join(path))
+    .collect();
+    for file in &imported_files {
+        assert!(loader.get_document(file).is_some());
+    }
+
+    // Test Typeloader invalidation/dropping
+    // Dropping/invalidating all leaf nodes should invalidate everything.
+    let to_drop = test_source_path.join("incpath/local_helper_type.slint");
+    loader.drop_document(&to_drop).unwrap();
+    let to_invalidate = test_source_path.join("library/dependency_from_library.slint");
+    loader.invalidate_document(&to_invalidate);
+
+    // Check that the dropped file has indeed been fully dropped.
+    assert!(!loader.all_files().contains(&to_drop));
+    // But that the invalidated file is still there (even if get_document won't return it anymore)
+    assert!(loader.all_files().contains(&to_invalidate));
+
+    for file in imported_files {
+        assert!(loader.get_document(&file).is_none(), "{} is still loaded", file.display());
+    }
 }
 
 #[test]
@@ -1756,13 +2092,10 @@ fn test_dependency_loading_from_rust() {
 
     let doc_node: syntax_nodes::Document = doc_node.into();
 
-    let global_registry = TypeRegister::builtin();
-
-    let registry = Rc::new(RefCell::new(TypeRegister::new(&global_registry)));
-
     let mut build_diagnostics = BuildDiagnostics::default();
 
-    let mut loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    let registry = Rc::new(RefCell::new(TypeRegister::new(&loader.global_type_registry)));
 
     let (foreign_imports, _) = spin_on::spin_on(loader.load_dependencies_recursively(
         &doc_node,
@@ -1779,6 +2112,58 @@ fn test_dependency_loading_from_rust() {
 }
 
 #[test]
+fn test_import_path_verbatim() {
+    // The import path is taken verbatim, not unescaped: a literal Unicode or emoji
+    // file name is used as written, and a backslash is a directory separator rather
+    // than an escape, so `sub\comp.slint` names `sub/comp.slint`. An absolute path
+    // with a backslash cleans to a different string, so it must be registered and
+    // looked up under that cleaned path or the type loader panics (#12798).
+    let requested = Rc::new(RefCell::new(Vec::<String>::new()));
+    let requested_ = requested.clone();
+
+    let mut compiler_config =
+        CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter);
+    compiler_config.style = Some("fluent".into());
+    compiler_config.open_import_callback = Some(Rc::new(move |path| {
+        let requested_ = requested_.clone();
+        Box::pin(async move {
+            requested_.borrow_mut().push(path);
+            Some(Ok("export XX := Rectangle {} ".to_owned()))
+        })
+    }));
+
+    let mut test_diags = crate::diagnostics::BuildDiagnostics::default();
+    let doc_node = crate::parser::parse(
+        r#"
+import { XX as A } from "naïve.slint";
+import { XX as B } from "party🎉.slint";
+import { XX as C } from "sub\comp.slint";
+import { XX as D } from "/ddd\dd.slint";
+export component X { A {} B {} C {} D {} }
+"#
+        .into(),
+        Some(std::path::Path::new("HELLO")),
+        &mut test_diags,
+    );
+
+    let doc_node: syntax_nodes::Document = doc_node.into();
+    let mut build_diagnostics = BuildDiagnostics::default();
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    let registry = Rc::new(RefCell::new(TypeRegister::new(&loader.global_type_registry)));
+    spin_on::spin_on(loader.load_dependencies_recursively(
+        &doc_node,
+        &mut build_diagnostics,
+        &registry,
+    ));
+    assert!(!test_diags.has_errors());
+    assert!(!build_diagnostics.has_errors(), "{:?}", build_diagnostics.to_string_vec());
+    let mut requested = requested.borrow().clone();
+    requested.sort();
+    // Unicode names are kept as written; a backslash is normalized to a slash.
+    assert_eq!(requested, ["/ddd/dd.slint", "naïve.slint", "party🎉.slint", "sub/comp.slint"]);
+}
+
+#[test]
 fn test_load_from_callback_ok() {
     let ok = Rc::new(core::cell::Cell::new(false));
     let ok_ = ok.clone();
@@ -1786,7 +2171,7 @@ fn test_load_from_callback_ok() {
     let mut compiler_config =
         CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter);
     compiler_config.style = Some("fluent".into());
-    compiler_config.open_import_fallback = Some(Rc::new(move |path| {
+    compiler_config.open_import_callback = Some(Rc::new(move |path| {
         let ok_ = ok_.clone();
         Box::pin(async move {
             assert_eq!(path.replace('\\', "/"), "../FooBar.slint");
@@ -1809,10 +2194,9 @@ X := XX {}
     );
 
     let doc_node: syntax_nodes::Document = doc_node.into();
-    let global_registry = TypeRegister::builtin();
-    let registry = Rc::new(RefCell::new(TypeRegister::new(&global_registry)));
     let mut build_diagnostics = BuildDiagnostics::default();
-    let mut loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    let registry = Rc::new(RefCell::new(TypeRegister::new(&loader.global_type_registry)));
     spin_on::spin_on(loader.load_dependencies_recursively(
         &doc_node,
         &mut build_diagnostics,
@@ -1842,10 +2226,9 @@ component Foo { XX {} }
     );
 
     let doc_node: syntax_nodes::Document = doc_node.into();
-    let global_registry = TypeRegister::builtin();
-    let registry = Rc::new(RefCell::new(TypeRegister::new(&global_registry)));
     let mut build_diagnostics = BuildDiagnostics::default();
-    let mut loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    let registry = Rc::new(RefCell::new(TypeRegister::new(&loader.global_type_registry)));
     spin_on::spin_on(loader.load_dependencies_recursively(
         &doc_node,
         &mut build_diagnostics,
@@ -1874,13 +2257,125 @@ component Foo { XX {} }
 }
 
 #[test]
+fn test_load_file_watches_missing_imports() {
+    let mut compiler_config =
+        CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter);
+    compiler_config.style = Some("fluent".into());
+    compiler_config.embed_resources = crate::EmbedResourcesKind::ListAllResources;
+    let mut build_diagnostics = BuildDiagnostics::default();
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    let main_path = Path::new("/tmp/main.slint");
+
+    spin_on::spin_on(
+        loader.load_file(
+            main_path,
+            main_path,
+            r#"
+/* ... */
+import { XX } from "missing/dependency.slint";
+component Foo { XX {} }
+"#
+            .into(),
+            false,
+            &mut build_diagnostics,
+        ),
+    );
+
+    assert!(build_diagnostics.has_errors());
+
+    let watch_files = loader.all_files_to_watch();
+    assert!(watch_files.contains(&PathBuf::from("/tmp/main.slint")));
+    assert!(watch_files.contains(&PathBuf::from("/tmp/missing/dependency.slint")));
+}
+
+#[test]
+fn test_load_root_file_tracks_missing_imports() {
+    let mut compiler_config =
+        CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter);
+    compiler_config.style = Some("fluent".into());
+    compiler_config.embed_resources = crate::EmbedResourcesKind::ListAllResources;
+    let mut build_diagnostics = BuildDiagnostics::default();
+    let main_path = std::env::temp_dir().join("main.slint");
+    let missing_path = main_path.with_file_name("missing.slint");
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    spin_on::spin_on(
+        loader.load_root_file(
+            &main_path,
+            &main_path,
+            r#"
+import { Missing } from "missing.slint";
+export component Main inherits Window {
+    Missing { }
+}
+"#
+            .into(),
+            false,
+            &mut build_diagnostics,
+        ),
+    );
+
+    assert!(build_diagnostics.has_errors());
+    assert!(
+        loader.all_files_to_watch().contains(&main_path),
+        "watch paths: {:?}",
+        loader.all_files_to_watch()
+    );
+    assert!(
+        loader.all_files_to_watch().contains(&missing_path),
+        "watch paths: {:?}",
+        loader.all_files_to_watch()
+    );
+}
+
+#[test]
+fn test_load_root_file_tracks_missing_resources() {
+    let mut compiler_config =
+        CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter);
+    compiler_config.style = Some("fluent".into());
+    compiler_config.embed_resources = crate::EmbedResourcesKind::ListAllResources;
+    let mut build_diagnostics = BuildDiagnostics::default();
+    let main_path = std::env::temp_dir().join("main.slint");
+    let resource_path = main_path.with_file_name("icon.svg");
+
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    spin_on::spin_on(
+        loader.load_root_file(
+            &main_path,
+            &main_path,
+            r#"
+export component Main inherits Window {
+    Image {
+        source: @image-url("icon.svg");
+    }
+}
+"#
+            .into(),
+            false,
+            &mut build_diagnostics,
+        ),
+    );
+
+    // The image is not embedded, so it doesn't cause an error
+    assert!(!build_diagnostics.has_errors());
+    assert!(
+        loader.all_files_to_watch().contains(&main_path),
+        "watch paths: {:?}",
+        loader.all_files_to_watch()
+    );
+    assert!(
+        loader.all_files_to_watch().contains(&resource_path),
+        "watch paths: {:?}",
+        loader.all_files_to_watch()
+    );
+}
+
+#[test]
 fn test_manual_import() {
     let mut compiler_config =
         CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter);
     compiler_config.style = Some("fluent".into());
-    let global_registry = TypeRegister::builtin();
     let mut build_diagnostics = BuildDiagnostics::default();
-    let mut loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
 
     let maybe_button_type = spin_on::spin_on(loader.import_component(
         "std-widgets.slint",
@@ -1904,9 +2399,8 @@ fn test_builtin_style() {
     compiler_config.include_paths = vec![incdir];
     compiler_config.style = Some("fluent".into());
 
-    let global_registry = TypeRegister::builtin();
     let mut build_diagnostics = BuildDiagnostics::default();
-    let _loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let _loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
 
     assert!(!build_diagnostics.has_errors());
 }
@@ -1923,9 +2417,8 @@ fn test_user_style() {
     compiler_config.include_paths = vec![incdir];
     compiler_config.style = Some("TestStyle".into());
 
-    let global_registry = TypeRegister::builtin();
     let mut build_diagnostics = BuildDiagnostics::default();
-    let _loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let _loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
 
     assert!(!build_diagnostics.has_errors());
 }
@@ -1942,9 +2435,8 @@ fn test_unknown_style() {
     compiler_config.include_paths = vec![incdir];
     compiler_config.style = Some("FooBar".into());
 
-    let global_registry = TypeRegister::builtin();
     let mut build_diagnostics = BuildDiagnostics::default();
-    let _loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let _loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
 
     assert!(build_diagnostics.has_errors());
     let diags = build_diagnostics.to_string_vec();
@@ -1980,10 +2472,9 @@ import { LibraryHelperType } from "@libdir/library_helper_type.slint";
     );
 
     let doc_node: syntax_nodes::Document = doc_node.into();
-    let global_registry = TypeRegister::builtin();
-    let registry = Rc::new(RefCell::new(TypeRegister::new(&global_registry)));
     let mut build_diagnostics = BuildDiagnostics::default();
-    let mut loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    let registry = Rc::new(RefCell::new(TypeRegister::new(&loader.global_type_registry)));
     spin_on::spin_on(loader.load_dependencies_recursively(
         &doc_node,
         &mut build_diagnostics,
@@ -2024,10 +2515,9 @@ import { E } from "@unknown/lib.slint";
     );
 
     let doc_node: syntax_nodes::Document = doc_node.into();
-    let global_registry = TypeRegister::builtin();
-    let registry = Rc::new(RefCell::new(TypeRegister::new(&global_registry)));
     let mut build_diagnostics = BuildDiagnostics::default();
-    let mut loader = TypeLoader::new(global_registry, compiler_config, &mut build_diagnostics);
+    let mut loader = TypeLoader::new(compiler_config, &mut build_diagnostics);
+    let registry = Rc::new(RefCell::new(TypeRegister::new(&loader.global_type_registry)));
     spin_on::spin_on(loader.load_dependencies_recursively(
         &doc_node,
         &mut build_diagnostics,
@@ -2037,12 +2527,27 @@ import { E } from "@unknown/lib.slint";
     assert!(build_diagnostics.has_errors());
     let diags = build_diagnostics.to_string_vec();
     assert_eq!(diags.len(), 5);
-    assert!(diags[0].starts_with(&format!(
-        "HELLO:3: Error reading requested import \"{}\": ",
-        test_source_path.to_string_lossy()
-    )));
-    assert_eq!(&diags[1], "HELLO:4: Cannot find requested import \"@libdir/unknown.slint\" in the library search path");
-    assert_eq!(&diags[2], "HELLO:5: Cannot find requested import \"@libfile.slint/unknown.slint\" in the library search path");
+    assert_starts_with(
+        &diags[0],
+        &format!(
+            "HELLO:3: Error reading requested import \"{}\": ",
+            test_source_path.to_string_lossy()
+        ),
+    );
+    assert_starts_with(
+        &diags[1],
+        &format!(
+            "HELLO:4: Error reading requested import \"{}\": ",
+            test_source_path.join("unknown.slint").to_string_lossy(),
+        ),
+    );
+    assert_starts_with(
+        &diags[2],
+        &format!(
+            "HELLO:5: Error reading requested import \"{}\": ",
+            test_source_path.join("lib.slint").join("unknown.slint").to_string_lossy()
+        ),
+    );
     assert_eq!(
         &diags[3],
         "HELLO:6: Cannot find requested import \"@unknown\" in the library search path"
@@ -2051,12 +2556,16 @@ import { E } from "@unknown/lib.slint";
         &diags[4],
         "HELLO:7: Cannot find requested import \"@unknown/lib.slint\" in the library search path"
     );
+
+    #[track_caller]
+    fn assert_starts_with(actual: &str, start: &str) {
+        assert!(actual.starts_with(start), "{actual:?} does not start with {start:?}");
+    }
 }
 
 #[test]
 fn test_snapshotting() {
     let mut type_loader = TypeLoader::new(
-        crate::typeregister::TypeRegister::builtin(),
         crate::CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter),
         &mut BuildDiagnostics::default(),
     );
@@ -2080,10 +2589,42 @@ fn test_snapshotting() {
     assert_eq!(root_element.borrow().base_type.to_string(), "Rectangle");
 
     let copy = snapshot(&type_loader).unwrap();
+    assert_eq!(copy.revision(), type_loader.revision());
 
     let doc = copy.get_document(&path).unwrap();
     let c = doc.inner_components.first().unwrap();
     assert_eq!(c.id, "Foobar");
     let root_element = c.root_element.clone();
     assert_eq!(root_element.borrow().base_type.to_string(), "Rectangle");
+}
+
+#[test]
+fn test_watch_paths_revision_bumps_on_mutations() {
+    let mut type_loader = TypeLoader::new(
+        crate::CompilerConfiguration::new(crate::generator::OutputFormat::Interpreter),
+        &mut BuildDiagnostics::default(),
+    );
+
+    assert_eq!(type_loader.revision(), 0);
+
+    let path = PathBuf::from("/tmp/test-revision.slint");
+    let mut diag = BuildDiagnostics::default();
+    spin_on::spin_on(type_loader.load_file(
+        &path,
+        &path,
+        "export component Foobar inherits Rectangle { }".to_string(),
+        false,
+        &mut diag,
+    ));
+    assert!(!diag.has_errors());
+    let after_load = type_loader.revision();
+    assert_ne!(after_load, 0);
+
+    type_loader.invalidate_document(&path);
+    let after_invalidate = type_loader.revision();
+    assert_ne!(after_invalidate, after_load);
+
+    type_loader.drop_document(&path).unwrap();
+    let after_drop = type_loader.revision();
+    assert_ne!(after_drop, after_invalidate);
 }

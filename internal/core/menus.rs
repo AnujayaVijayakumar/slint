@@ -5,6 +5,7 @@
 #![allow(unsafe_code)]
 
 use crate::graphics::Image;
+use crate::input::{InternalKeyEvent, Keys};
 use crate::item_rendering::CachedRenderingData;
 use crate::item_tree::{ItemTreeRc, ItemWeak, VisitChildrenResult};
 use crate::items::{ItemRc, ItemRef, MenuEntry, VoidArg};
@@ -27,12 +28,16 @@ use vtable::{VRef, VRefMut};
 #[vtable::vtable]
 #[repr(C)]
 pub struct MenuVTable {
-    /// destructor
-    drop: extern "C" fn(VRefMut<MenuVTable>),
     /// Return the list of items for the sub menu (or the main menu of parent is None)
     sub_menu: extern "C" fn(VRef<MenuVTable>, Option<&MenuEntry>, &mut SharedVector<MenuEntry>),
     /// Handler when the menu entry is activated
     activate: extern "C" fn(VRef<MenuVTable>, &MenuEntry),
+    /// Handler to return whether the menu is visible or not
+    visible: extern "C" fn(VRef<MenuVTable>) -> bool,
+    /// drop_in_place handler
+    drop_in_place: extern "C" fn(VRefMut<MenuVTable>) -> Layout,
+    /// dealloc handler
+    dealloc: extern "C" fn(&MenuVTable, ptr: *mut u8, layout: Layout),
 }
 
 struct ShadowTreeNode {
@@ -46,24 +51,62 @@ pub struct MenuFromItemTree {
     root: RefCell<SharedVector<MenuEntry>>,
     next_id: Cell<usize>,
     tracker: Pin<Box<PropertyTracker>>,
+    condition: Option<Pin<Box<Property<bool>>>>,
+    visible: Option<Pin<Box<Property<bool>>>>,
 }
 
 impl MenuFromItemTree {
     pub fn new(item_tree: ItemTreeRc) -> Self {
+        Self::new_internal(item_tree, None, None)
+    }
+
+    pub fn new_with_condition_and_visible(
+        item_tree: ItemTreeRc,
+        condition: impl Fn() -> bool + 'static,
+        visible: impl Fn() -> bool + 'static,
+    ) -> Self {
+        fn make_prop(
+            f: impl Fn() -> bool + 'static,
+            name: &'static str,
+        ) -> Option<Pin<Box<Property<bool>>>> {
+            let prop = Box::pin(Property::new_named(true, name));
+            prop.as_ref().set_binding(f);
+            Some(prop)
+        }
+        let condition = make_prop(condition, "MenuFromItemTree::condition");
+        let visible = make_prop(visible, "MenuFromItemTree::visible");
+        Self::new_internal(item_tree, condition, visible)
+    }
+
+    fn new_internal(
+        item_tree: ItemTreeRc,
+        condition: Option<Pin<Box<Property<bool>>>>,
+        visible: Option<Pin<Box<Property<bool>>>>,
+    ) -> Self {
         Self {
             item_tree,
             item_cache: Default::default(),
             root: Default::default(),
             tracker: Box::pin(PropertyTracker::default()),
             next_id: 0.into(),
+            condition,
+            visible,
         }
     }
 
     fn update_shadow_tree(&self) {
         self.tracker.as_ref().evaluate_if_dirty(|| {
             self.item_cache.replace(Default::default());
-            self.root
-                .replace(self.update_shadow_tree_recursive(&ItemRc::new(self.item_tree.clone(), 0)))
+            if let Some(condition) = &self.condition
+                && !condition.as_ref().get()
+            {
+                self.root.replace(SharedVector::default());
+                return;
+            }
+            crate::item_tree::ensure_item_tree_instantiated(&self.item_tree);
+            self.root.replace(
+                self.update_shadow_tree_recursive(&ItemRc::new_root(self.item_tree.clone())),
+            );
         });
     }
 
@@ -88,12 +131,25 @@ impl MenuFromItemTree {
                     let children = self.update_shadow_tree_recursive(&item);
                     let has_sub_menu = !children.is_empty();
                     let enabled = menu_item.enabled();
+                    let checkable = menu_item.checkable();
+                    let checked = menu_item.checked();
                     let icon = menu_item.icon();
+                    let shortcut = menu_item.shortcut();
                     self.item_cache.borrow_mut().insert(
                         id.clone(),
                         ShadowTreeNode { item: ItemRc::downgrade(&item), children },
                     );
-                    result.push(MenuEntry { title, id, has_sub_menu, is_separator, enabled, icon });
+                    result.push(MenuEntry {
+                        title,
+                        id,
+                        has_sub_menu,
+                        is_separator,
+                        enabled,
+                        checkable,
+                        checked,
+                        icon,
+                        shortcut,
+                    });
                 }
                 VisitChildrenResult::CONTINUE
             };
@@ -129,11 +185,18 @@ impl Menu for MenuFromItemTree {
     fn activate(&self, entry: &MenuEntry) {
         if let Some(menu_item) =
             self.item_cache.borrow().get(entry.id.as_str()).and_then(|e| e.item.upgrade())
+            && let Some(menu_item) = menu_item.downcast::<MenuItem>()
         {
-            if let Some(menu_item) = menu_item.downcast::<MenuItem>() {
-                menu_item.activated.call(&());
+            if menu_item.as_pin_ref().checkable() {
+                menu_item.checked.set(!menu_item.as_pin_ref().checked());
             }
+
+            menu_item.activated.call(&());
         }
+    }
+
+    fn visible(&self) -> bool {
+        self.visible.as_ref().is_none_or(|v| v.as_ref().get())
     }
 }
 
@@ -148,15 +211,21 @@ pub struct MenuItem {
     pub title: Property<SharedString>,
     pub activated: Callback<VoidArg>,
     pub enabled: Property<bool>,
+    pub checkable: Property<bool>,
+    pub checked: Property<bool>,
     pub icon: Property<Image>,
+    pub shortcut: Property<Keys>,
 }
 
 impl crate::items::Item for MenuItem {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {}
 
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
+
     fn layout_info(
         self: Pin<&Self>,
         _orientation: crate::items::Orientation,
+        _cross_axis_constraint: crate::Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> crate::layout::LayoutInfo {
@@ -168,6 +237,7 @@ impl crate::items::Item for MenuItem {
         _: &crate::input::MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut crate::cursor::MouseCursorInner,
     ) -> crate::input::InputEventFilterResult {
         Default::default()
     }
@@ -177,13 +247,23 @@ impl crate::items::Item for MenuItem {
         _: &crate::input::MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut crate::cursor::MouseCursorInner,
     ) -> crate::input::InputEventResult {
         Default::default()
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> crate::input::KeyEventResult {
+        crate::input::KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        _: &crate::input::KeyEvent,
+        _: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> crate::input::KeyEventResult {
@@ -226,22 +306,51 @@ impl crate::items::ItemConsts for MenuItem {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<
         MenuItem,
         CachedRenderingData,
-    > = MenuItem::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+    > = MenuItem::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
 }
 
 #[cfg(feature = "ffi")]
 pub mod ffi {
     use super::*;
 
-    /// Create a `VBox::<MenuVTable>`` that wraps the [`ItemTreeRc`]
+    /// Create a `VRc::<MenuVTable>`` that wraps the [`ItemTreeRc`]
     ///
-    /// Put the created VBox into the result pointer with std::ptr::write
+    /// Put the created VRc into the result pointer with std::ptr::write
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn slint_menus_create_wrapper(
         menu_tree: &ItemTreeRc,
-        result: *mut vtable::VBox<MenuVTable>,
+        result: *mut vtable::VRc<MenuVTable>,
+        condition: Option<extern "C" fn(menu_tree: &ItemTreeRc) -> bool>,
+        visible: Option<extern "C" fn(menu_tree: &ItemTreeRc) -> bool>,
     ) {
-        let b = vtable::VBox::<MenuVTable>::new(MenuFromItemTree::new(menu_tree.clone()));
-        core::ptr::write(result, b);
+        let menu = match (condition, visible) {
+            (None, None) => MenuFromItemTree::new(menu_tree.clone()),
+            (condition, visible) => {
+                let menu_weak = ItemTreeRc::downgrade(menu_tree);
+                let condition = move || {
+                    menu_weak
+                        .upgrade()
+                        .map(|menu_rc| condition.map(|x| x(&menu_rc)).unwrap_or(true))
+                        .unwrap_or(false)
+                };
+
+                let menu_weak = ItemTreeRc::downgrade(menu_tree);
+                let visible = move || {
+                    menu_weak
+                        .upgrade()
+                        .map(|menu_rc| visible.map(|x| x(&menu_rc)).unwrap_or(true))
+                        .unwrap_or(false)
+                };
+
+                MenuFromItemTree::new_with_condition_and_visible(
+                    menu_tree.clone(),
+                    condition,
+                    visible,
+                )
+            }
+        };
+
+        let vrc = vtable::VRc::into_dyn(vtable::VRc::new(menu));
+        unsafe { core::ptr::write(result, vrc) };
     }
 }

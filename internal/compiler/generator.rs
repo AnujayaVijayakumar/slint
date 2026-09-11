@@ -13,20 +13,27 @@ use smol_str::SmolStr;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::rc::{Rc, Weak};
 
+use crate::CompilerConfiguration;
 use crate::expression_tree::{BindingExpression, Expression};
-use crate::langtype::ElementType;
+use crate::langtype::{BuiltinStruct, ElementType, StructName};
 use crate::namedreference::NamedReference;
 use crate::object_tree::{Component, Document, ElementRc};
-use crate::CompilerConfiguration;
+
+pub mod accessor_names;
 
 #[cfg(feature = "cpp")]
 pub mod cpp;
 #[cfg(feature = "cpp")]
-pub mod cpp_live_reload;
+pub mod cpp_live_preview;
 #[cfg(feature = "rust")]
 pub mod rust;
 #[cfg(feature = "rust")]
-pub mod rust_live_reload;
+pub mod rust_live_preview;
+#[cfg(feature = "slint-sc")]
+pub mod slint_sc;
+
+#[cfg(feature = "python")]
+pub mod python;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutputFormat {
@@ -34,8 +41,14 @@ pub enum OutputFormat {
     Cpp(cpp::Config),
     #[cfg(feature = "rust")]
     Rust,
+    /// Safety-critical subset of Slint.  Generates minimal Rust code
+    /// targeting the `slint-sc` runtime crate.
+    #[cfg(feature = "slint-sc")]
+    SlintSc,
     Interpreter,
     Llr,
+    #[cfg(feature = "python")]
+    Python,
 }
 
 impl OutputFormat {
@@ -47,6 +60,8 @@ impl OutputFormat {
             }
             #[cfg(feature = "rust")]
             Some("rs") => Some(Self::Rust),
+            #[cfg(feature = "python")]
+            Some("py") => Some(Self::Python),
             _ => None,
         }
     }
@@ -60,7 +75,11 @@ impl std::str::FromStr for OutputFormat {
             "cpp" => Ok(Self::Cpp(cpp::Config::default())),
             #[cfg(feature = "rust")]
             "rust" => Ok(Self::Rust),
+            #[cfg(feature = "slint-sc")]
+            "slint-sc" | "rust-sc" => Ok(Self::SlintSc),
             "llr" => Ok(Self::Llr),
+            #[cfg(feature = "python")]
+            "python" => Ok(Self::Python),
             _ => Err(format!("Unknown output format {s}")),
         }
     }
@@ -69,6 +88,7 @@ impl std::str::FromStr for OutputFormat {
 pub fn generate(
     format: OutputFormat,
     destination: &mut impl std::io::Write,
+    destination_path: Option<&std::path::Path>,
     doc: &Document,
     compiler_config: &CompilerConfiguration,
 ) -> std::io::Result<()> {
@@ -86,16 +106,29 @@ pub fn generate(
             let output = rust::generate(doc, compiler_config)?;
             write!(destination, "{output}")?;
         }
+        #[cfg(feature = "slint-sc")]
+        OutputFormat::SlintSc => {
+            let generated = slint_sc::generate(doc, compiler_config)?;
+            write!(destination, "{}", generated.code)?;
+            if let (true, Some(path)) = (compiler_config.coverage, destination_path) {
+                let map = path.with_extension("slintcov");
+                crate::fileaccess::write_file_if_changed(&map, generated.coverage_map.as_bytes())?;
+            }
+        }
         OutputFormat::Interpreter => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "Unsupported output format: The interpreter is not a valid output format yet.",
             )); // Perhaps byte code in the future?
         }
         OutputFormat::Llr => {
-            let root = crate::llr::lower_to_item_tree::lower_to_item_tree(doc, compiler_config)?;
+            let root = crate::llr::lower_to_item_tree::lower_to_item_tree(doc, compiler_config);
             let mut output = String::new();
             crate::llr::pretty_print::pretty_print(&root, &mut output).unwrap();
+            write!(destination, "{output}")?;
+        }
+        #[cfg(feature = "python")]
+        OutputFormat::Python => {
+            let output = python::generate(doc, compiler_config, destination_path)?;
             write!(destination, "{output}")?;
         }
     }
@@ -220,28 +253,24 @@ pub fn build_item_tree<T: ItemTreeBuilder>(
         // StandardButton is a sub-component and we'll call visit_children() on it. Now we are here. However as `StandardButton` has no children,
         // and therefore we would never recurse into `Button`'s children and thus miss the repeater. That is what this condition attempts to
         // detect and chain the children visitation.
-        if children.is_empty() {
-            if let Some(nested_subcomponent) = parent_item.borrow().sub_component() {
-                let sub_component_state = builder.enter_component(
-                    parent_item,
-                    nested_subcomponent,
-                    children_offset,
-                    state,
-                );
-                visit_children(
-                    &sub_component_state,
-                    &nested_subcomponent.root_element.borrow().children,
-                    nested_subcomponent,
-                    &nested_subcomponent.root_element,
-                    parent_index,
-                    relative_parent_index,
-                    children_offset,
-                    relative_children_offset,
-                    repeater_count,
-                    builder,
-                );
-                return;
-            }
+        if children.is_empty()
+            && let Some(nested_subcomponent) = parent_item.borrow().sub_component()
+        {
+            let sub_component_state =
+                builder.enter_component(parent_item, nested_subcomponent, children_offset, state);
+            visit_children(
+                &sub_component_state,
+                &nested_subcomponent.root_element.borrow().children,
+                nested_subcomponent,
+                &nested_subcomponent.root_element,
+                parent_index,
+                relative_parent_index,
+                children_offset,
+                relative_children_offset,
+                repeater_count,
+                builder,
+            );
+            return;
         }
 
         let mut offset = children_offset + children.len() as u32;
@@ -269,10 +298,10 @@ pub fn build_item_tree<T: ItemTreeBuilder>(
 
         let mut offset = children_offset + children.len() as u32;
         let mut relative_offset = relative_children_offset + children.len() as u32;
-        let mut index = children_offset;
-        let mut relative_index = relative_children_offset;
 
-        for e in children.iter() {
+        for (i, e) in children.iter().enumerate() {
+            let index = children_offset + i as u32;
+            let relative_index = relative_children_offset + i as u32;
             if let Some(sub_component) = e.borrow().sub_component() {
                 let sub_tree_state = sub_component_states.pop_front().unwrap();
                 builder.enter_component_children(e, *repeater_count, state, &sub_tree_state);
@@ -303,8 +332,6 @@ pub fn build_item_tree<T: ItemTreeBuilder>(
                 );
             }
 
-            index += 1;
-            relative_index += 1;
             let size = item_sub_tree_size(e) as u32;
             offset += size;
             relative_offset += size;
@@ -326,13 +353,12 @@ pub fn build_item_tree<T: ItemTreeBuilder>(
             let mut item = item.clone();
             let mut component_state = component_state.clone();
             while let Some((base, state)) = {
-                let base = item.borrow().sub_component().map(|c| {
+                item.borrow().sub_component().map(|c| {
                     (
                         c.root_element.clone(),
                         builder.enter_component(&item, c, children_offset, &component_state),
                     )
-                });
-                base
+                })
             } {
                 item = base;
                 component_state = state;
@@ -371,17 +397,17 @@ pub fn handle_property_bindings_init(
             binding_expression.expression.visit_recursive(&mut |e| {
                 if let Expression::PropertyReference(nr) = e {
                     let elem = nr.element();
-                    if Weak::ptr_eq(&elem.borrow().enclosing_component, component) {
-                        if let Some(be) = elem.borrow().bindings.get(nr.name()) {
-                            handle_property_inner(
-                                component,
-                                &elem,
-                                nr.name(),
-                                &be.borrow(),
-                                handle_property,
-                                processed,
-                            );
-                        }
+                    if Weak::ptr_eq(&elem.borrow().enclosing_component, component)
+                        && let Some(be) = elem.borrow().binding_cell_including_synthetic(nr.name())
+                    {
+                        handle_property_inner(
+                            component,
+                            &elem,
+                            nr.name(),
+                            &be.borrow(),
+                            handle_property,
+                            processed,
+                        );
                     }
                 }
             })
@@ -391,7 +417,7 @@ pub fn handle_property_bindings_init(
 
     let mut processed = HashSet::new();
     crate::object_tree::recurse_elem(&component.root_element, &(), &mut |elem: &ElementRc, ()| {
-        for (prop_name, binding_expression) in &elem.borrow().bindings {
+        for (prop_name, binding_expression) in elem.borrow().bindings_including_synthetic() {
             handle_property_inner(
                 &Rc::downgrade(component),
                 elem,
@@ -423,7 +449,7 @@ pub fn for_each_const_properties(
                     .iter()
                     .filter(|(_, x)| {
                         x.property_type.is_property_type() &&
-                            !matches!( &x.property_type, crate::langtype::Type::Struct(s) if s.name.as_ref().is_some_and(|name| name.ends_with("::StateInfo")))
+                            !matches!( &x.property_type, crate::langtype::Type::Struct(s) if matches!(s.name, StructName::Builtin(BuiltinStruct::StateInfo)))
                     })
                     .map(|(k, _)| k.clone()),
             );
@@ -439,7 +465,8 @@ pub fn for_each_const_properties(
                                 .iter()
                                 .filter(|(k, x)| {
                                     x.ty.is_property_type()
-                                        && !k.starts_with("viewport-")
+                                        && (n.class_name != "Flickable"
+                                            || !k.starts_with("content-"))
                                         && k.as_str() != "commands"
                                 })
                                 .map(|(k, _)| k.clone()),
@@ -454,7 +481,7 @@ pub fn for_each_const_properties(
                 ElementType::Builtin(_) => {
                     unreachable!("builtin element should have been resolved")
                 }
-                ElementType::Global | ElementType::Error => break,
+                ElementType::Global | ElementType::Interface | ElementType::Error => break,
             }
         }
         for c in all_prop {
@@ -496,6 +523,24 @@ pub fn to_kebab_case(str: &str) -> String {
         }
     }
     String::from_utf8(result).unwrap()
+}
+
+/// The number of arguments taken by the accessibility action of the given name, where the name
+/// is the `AccessibilityAction` variant in pascal case (such as `SetSelectionOffsets`).
+///
+/// The `AccessibilityAction` enum of the run-time library mirrors the `accessible-action-*`
+/// callbacks declared in the type register: a variant has one field per callback argument, so
+/// that the generators can bind the fields without knowing about any particular action.
+pub fn accessibility_action_argument_count(action: &str) -> usize {
+    let property_name = format!("accessible-action-{}", to_kebab_case(action));
+    crate::typeregister::reserved_accessibility_properties()
+        .find_map(|(name, ty)| match ty {
+            crate::langtype::Type::Callback(function) if name == property_name => {
+                Some(function.args.len())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("Unknown accessibility action {action}"))
 }
 
 #[test]

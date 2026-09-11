@@ -1,7 +1,9 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-//! Passes that fills the root component used_types.sub_components
+//! This pass fills the root component used_types.sub_components
+
+#![allow(clippy::mutable_key_type)] // Component identity keys intentionally wrap interior mutability
 
 use by_address::ByAddress;
 
@@ -12,7 +14,7 @@ use std::rc::Rc;
 
 /// Fill the root_component's used_types.sub_components
 pub fn collect_subcomponents(doc: &Document) {
-    let mut result = vec![];
+    let mut result = Vec::new();
     let mut hash = HashSet::new();
     for component in doc.exported_roots().chain(doc.popup_menu_impl.iter().cloned()) {
         collect_subcomponents_recursive(&component, &mut result, &mut hash);
@@ -37,7 +39,7 @@ fn collect_subcomponents_recursive(
             _ => return,
         };
         collect_subcomponents_recursive(&base_comp, result, hash);
-        if base_comp.parent_element.upgrade().is_some() {
+        if base_comp.parent_element().is_some() {
             // This is not a sub-component, but is a repeated component
             return;
         }

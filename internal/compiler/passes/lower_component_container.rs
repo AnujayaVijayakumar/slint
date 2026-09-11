@@ -7,7 +7,7 @@
 //!
 //! ```slint
 //!     ComponentContainer {
-//!         if false: Emtpy {}
+//!         if false: Empty {}
 //!     }
 //! ```
 //!
@@ -50,12 +50,11 @@ fn diagnose_component_container(element: &ElementRc, diag: &mut BuildDiagnostics
     if !elem.children.is_empty() {
         diag.push_error("ComponentContainers may not have children".into(), &*element.borrow());
     }
-    if let Some(cip) =
-        elem.enclosing_component.upgrade().unwrap().child_insertion_point.borrow().clone()
+    for (name, cip) in &*elem.enclosing_component.upgrade().unwrap().child_insertion_points.borrow()
     {
         if Rc::ptr_eq(&cip.parent, element) {
             diag.push_error(
-                "The @children placeholder cannot appear in a ComponentContainer".into(),
+                format!("{} cannot appear in a ComponentContainer", slot_error_subject(name)),
                 &*element.borrow(),
             );
         }
@@ -74,7 +73,6 @@ fn process_component_container(element: &ElementRc, empty_type: &ElementType) {
         }));
 
         Component {
-            node: element.borrow().debug.first().map(|n| n.node.clone().into()),
             id: smol_str::format_smolstr!("ComponentContainerInternal_{}", suffix),
             root_element,
             ..Default::default()

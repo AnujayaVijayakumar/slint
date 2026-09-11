@@ -1,11 +1,11 @@
 {
   "name": "slint-docs",
   "type": "module",
-  "version": "1.13.0",
+  "version": "1.18.0",
   "scripts": {
     "dev": "astro dev",
     "start": "astro dev",
-    "build": "astro check && astro build",
+    "build": "astro check && astro build && node scripts/validate-md-links.mjs",
     "preview": "astro preview",
     "astro": "astro",
     "format": "biome format",
@@ -18,22 +18,23 @@
     "test:ui": "playwright test --ui"
   },
   "dependencies": {
-    "@astrojs/check": "0.9.4",
-    "@astrojs/starlight": "0.34.4",
-    "@expressive-code/plugin-line-numbers": "0.41.3",
-    "@types/node": "20.16.10",
-    "astro": "5.11.0",
-    "astro-embed": "0.9.0",
-    "playwright-ctrf-json-reporter": "0.0.21",
-    "rehype-external-links": "3.0.0",
-    "sharp": "0.34.2",
-    "starlight-links-validator": "0.17.0",
-    "starlight-sidebar-topics": "0.6.0",
-    "typescript": "5.8.3",
+    "@astrojs/check": "catalog:",
+    "@astrojs/sitemap": "catalog:",
+    "@astrojs/starlight": "catalog:",
+    "@types/node": "catalog:",
+    "astro": "catalog:",
+    "astro-embed": "catalog:",
+    "playwright-ctrf-json-reporter": "catalog:",
+    "remark-parse": "catalog:",
+    "sharp": "catalog:",
+    "starlight-sidebar-topics": "0.8.0",
+    "typescript": "catalog:",
+    "unified": "catalog:",
+    "unist-util-visit": "catalog:",
     "@slint/common-files": "workspace:*"
   },
   "devDependencies": {
-    "@playwright/test": "1.53.2",
-    "cspell": "9.1.3"
+    "@playwright/test": "catalog:",
+    "cspell": "catalog:"
   }
 }

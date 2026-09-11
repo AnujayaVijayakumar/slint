@@ -1,11 +1,13 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore CRTC crtcs htotal vrefresh vtotal
 use std::cell::{Cell, RefCell};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::rc::Rc;
 
 use crate::DeviceOpener;
+use drm::Device as DrmDevice;
 use drm::buffer::Buffer;
 use drm::control::Device;
 use i_slint_core::platform::PlatformError;
@@ -19,7 +21,7 @@ impl AsFd for SharedFd {
     }
 }
 
-impl drm::Device for SharedFd {}
+impl DrmDevice for SharedFd {}
 
 impl drm::control::Device for SharedFd {}
 
@@ -36,7 +38,7 @@ enum PageFlipState {
 
 pub struct DrmOutput {
     pub drm_device: SharedFd,
-    connector: drm::control::connector::Info,
+    pub connector: drm::control::connector::Info,
     mode: drm::control::Mode,
     crtc: drm::control::crtc::Handle,
     last_buffer: Cell<Option<Box<dyn Buffer>>>,
@@ -83,7 +85,10 @@ impl DrmOutput {
                     .map(|(name, _, connected)| format!("{} (connected: {})", name, connected))
                     .collect::<Vec<_>>();
                 // Can't return error here because newlines are escaped.
-                eprintln!("\nDRM Output List Requested:\n{}\nPlease select an output with the SLINT_DRM_OUTPUT environment variable and re-run the program.", names_and_status.join("\n"));
+                eprintln!(
+                    "\nDRM Output List Requested:\n{}\nPlease select an output with the SLINT_DRM_OUTPUT environment variable and re-run the program.",
+                    names_and_status.join("\n")
+                );
                 std::process::exit(1);
             } else {
                 let (_, connector, connected) =
@@ -108,9 +113,9 @@ impl DrmOutput {
                 .find_map(|handle| {
                     let connector = drm_device.get_connector(*handle, false).ok()?;
                     (connector.state() == drm::control::connector::State::Connected)
-                        .then(|| connector)
+                        .then_some(connector)
                 })
-                .ok_or_else(|| format!("No connected display connector found"))?
+                .ok_or_else(|| "No connected display connector found".to_string())?
         };
 
         let mode = std::env::var("SLINT_DRM_MODE").map_or_else(
@@ -133,7 +138,7 @@ impl DrmOutput {
                         current.cmp(&next)
                     })
                     .cloned()
-                    .ok_or_else(|| format!("No preferred or non-zero size display mode found"))
+                    .ok_or_else(|| "No preferred or non-zero size display mode found".to_string())
             },
             |mode_str| {
                 let mut modes_and_index = connector.modes().iter().cloned().enumerate();
@@ -154,7 +159,11 @@ impl DrmOutput {
                     std::process::exit(1);
                 }
                 let mode_index: usize =
-                    mode_str.parse().map_err(|_| format!("Invalid mode index {mode_str}"))?;
+                    mode_str.parse().map_err(|_| {
+                        format!(
+                            "Invalid SLINT_DRM_MODE value '{mode_str}': expected a mode index or 'list' to list the available modes"
+                        )
+                    })?;
                 modes_and_index.nth(mode_index).map_or_else(
                     || Err(format!("Mode index is out of bounds: {mode_index}")),
                     |(_, mode)| Ok(mode),
@@ -164,11 +173,11 @@ impl DrmOutput {
 
         let encoder = connector
             .current_encoder()
-            .filter(|current| connector.encoders().iter().any(|h| *h == *current))
+            .filter(|current| connector.encoders().contains(current))
             .and_then(|current| drm_device.get_encoder(current).ok());
 
         let crtc = if let Some(encoder) = encoder {
-            encoder.crtc().ok_or_else(|| format!("no crtc for encoder"))?
+            encoder.crtc().ok_or_else(|| "no crtc for encoder".to_string())?
         } else {
             // No crtc found for current encoder? Pick the first possible crtc
             // as described in https://manpages.debian.org/testing/libdrm-dev/drm-kms.7.en.html#CRTC/Encoder_Selection
@@ -242,18 +251,146 @@ impl DrmOutput {
                 return;
             };
 
-            if event_it.any(|event| matches!(event, drm::control::Event::PageFlip(..))) {
-                if let PageFlipState::WaitingForPageFlip { .. } =
+            if event_it.any(|event| matches!(event, drm::control::Event::PageFlip(..)))
+                && let PageFlipState::WaitingForPageFlip { .. } =
                     self.page_flip_state.replace(PageFlipState::ReadyForNextBuffer)
+            {
+                return;
+            }
+        }
+    }
+
+    pub fn get_supported_formats(&self) -> Result<Vec<drm::buffer::DrmFourcc>, PlatformError> {
+        // Try to set universal planes client capability if possible
+        let _ = self.drm_device.set_client_capability(drm::ClientCapability::UniversalPlanes, true);
+
+        let mut all_formats = std::collections::HashSet::new();
+
+        // Iterate through all planes and collect formats from compatible ones
+        if let Ok(plane_handles) = self.drm_device.plane_handles() {
+            for &plane_handle in &plane_handles {
+                if let Ok(plane) = self.drm_device.get_plane(plane_handle)
+                    && plane.crtc() == Some(self.crtc)
                 {
-                    return;
+                    // Collect formats from this compatible plane
+                    for &format_u32 in plane.formats() {
+                        if let Ok(format) = drm::buffer::DrmFourcc::try_from(format_u32) {
+                            all_formats.insert(format);
+                        }
+                    }
                 }
             }
+        }
+
+        if all_formats.is_empty() {
+            eprintln!(
+                "No available formats found for any plane with CRTC {:?}. Falling back to XRGB8888 format",
+                self.crtc
+            );
+
+            Ok(vec![drm::buffer::DrmFourcc::Xrgb8888])
+        } else {
+            Ok(all_formats.into_iter().collect())
         }
     }
 
     pub fn size(&self) -> (u32, u32) {
         let (width, height) = self.mode.size();
         (width as u32, height as u32)
+    }
+
+    /// Returns the refresh rate in millihertz, computed from the mode's pixel clock
+    /// and timing parameters. This matches the precision used by Vulkan's
+    /// VkDisplayModeParametersKHR::refreshRate.
+    #[cfg(wgpu_surface)]
+    pub fn refresh_rate_millihertz(&self) -> u32 {
+        let clock = self.mode.clock() as u64; // in kHz
+        let (_, _, htotal) = self.mode.hsync();
+        let (_, _, vtotal) = self.mode.vsync();
+        let htotal = htotal as u64;
+        let vtotal = vtotal as u64;
+        if htotal == 0 || vtotal == 0 {
+            // Fallback to rounded vrefresh * 1000
+            return self.mode.vrefresh() * 1000;
+        }
+        // clock is in kHz, so clock * 1_000_000 gives us millihertz * htotal * vtotal
+        ((clock * 1_000_000 + (htotal * vtotal) / 2) / (htotal * vtotal)) as u32
+    }
+
+    #[cfg(wgpu_29_surface_target)]
+    /// Creates a wgpu-29 DRM surface target from this output.
+    pub fn wgpu_29_surface_target(
+        &self,
+    ) -> Result<
+        (i_slint_core::graphics::wgpu_29::SurfaceTarget, i_slint_core::api::PhysicalSize),
+        PlatformError,
+    > {
+        use i_slint_core::graphics::wgpu_29::wgpu;
+        use std::os::fd::AsRawFd;
+        let plane = self.find_compatible_plane()?;
+        let (width, height) = self.size();
+        let target =
+            i_slint_core::graphics::wgpu_29::SurfaceTarget::Drm(wgpu::SurfaceTargetUnsafe::Drm {
+                fd: self.drm_device.as_fd().as_raw_fd(),
+                plane: plane.handle().into(),
+                connector_id: self.connector.handle().into(),
+                width,
+                height,
+                refresh_rate: self.refresh_rate_millihertz(),
+            });
+        Ok((target, i_slint_core::api::PhysicalSize::new(width, height)))
+    }
+
+    #[cfg(any(feature = "unstable-wgpu-30", feature = "renderer-femtovg-wgpu"))]
+    /// Creates a wgpu-30 DRM surface target from this output.
+    pub fn wgpu_30_surface_target(
+        &self,
+    ) -> Result<
+        (i_slint_core::graphics::wgpu_30::SurfaceTarget, i_slint_core::api::PhysicalSize),
+        PlatformError,
+    > {
+        use i_slint_core::graphics::wgpu_30::wgpu;
+        use std::os::fd::AsRawFd;
+        let plane = self.find_compatible_plane()?;
+        let (width, height) = self.size();
+        let target =
+            i_slint_core::graphics::wgpu_30::SurfaceTarget::Drm(wgpu::SurfaceTargetUnsafe::Drm {
+                fd: self.drm_device.as_fd().as_raw_fd(),
+                plane: plane.handle().into(),
+                connector_id: self.connector.handle().into(),
+                width,
+                height,
+                refresh_rate: self.refresh_rate_millihertz(),
+            });
+        Ok((target, i_slint_core::api::PhysicalSize::new(width, height)))
+    }
+
+    // Iterate through all planes and collect formats from compatible ones
+    #[cfg(wgpu_surface)]
+    pub fn find_compatible_plane(&self) -> Result<drm::control::plane::Info, PlatformError> {
+        let _ = self.drm_device.set_client_capability(drm::ClientCapability::UniversalPlanes, true);
+        let plane_handles = self
+            .drm_device
+            .plane_handles()
+            .map_err(|e| format!("Error obtaining drm plane handles: {e}"))?
+            .into_iter()
+            .filter(|plane_handle| {
+                let Ok(plane_info) = self.drm_device.get_plane(*plane_handle) else {
+                    return false;
+                };
+                self.drm_device
+                    .resource_handles()
+                    .unwrap()
+                    .filter_crtcs(plane_info.possible_crtcs())
+                    .contains(&self.crtc)
+            });
+
+        for plane_handle in plane_handles {
+            if let Ok(plane) = self.drm_device.get_plane(plane_handle) {
+                return Ok(plane);
+            }
+        }
+
+        Err(PlatformError::Other("Could not find plane matching crtc".into()))
     }
 }

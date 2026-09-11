@@ -5,12 +5,28 @@
 
 #![doc = include_str!("README.md")]
 #![doc(html_logo_url = "https://slint.dev/logo/slint-logo-square-light.svg")]
-#![recursion_limit = "2048"]
+// Bumped from 2048 to accommodate the number of rust!() invocations inside
+// the large cpp! {{ }} block in qt_window.rs (gesture/input event handling).
+#![recursion_limit = "4096"]
+#![cfg_attr(slint_nightly_test, feature(non_exhaustive_omitted_patterns_lint))]
+#![cfg_attr(slint_nightly_test, warn(non_exhaustive_omitted_patterns))]
 
 extern crate alloc;
 
 use i_slint_core::platform::PlatformError;
 use std::rc::Rc;
+#[cfg(not(no_qt))]
+use std::sync::{Arc, atomic::AtomicUsize};
+
+#[cfg(not(no_qt))]
+thread_local! {
+    /// Set once by [`Backend::bind_context`]; read from rust!() callbacks fired by the
+    /// Qt event filter installed on `qApp` so palette/theme/font changes can push the new
+    /// values onto the process-wide [`i_slint_core::SlintContext`] without going through
+    /// any specific [`qt_window::QtWindow`].
+    static QT_CONTEXT: std::cell::OnceCell<i_slint_core::SlintContextWeak> =
+        const { std::cell::OnceCell::new() };
+}
 
 #[cfg(not(no_qt))]
 mod qt_accessible;
@@ -127,7 +143,18 @@ pub type NativeGlobals = ();
 
 pub const HAS_NATIVE_STYLE: bool = cfg!(not(no_qt));
 
-pub struct Backend;
+pub struct Backend {
+    #[cfg(not(no_qt))]
+    /// The generation is used to determine if a quit_event_loop call is meant for the current
+    /// event loop or is from a stale event.
+    event_loop_generation: Arc<AtomicUsize>,
+}
+
+impl Default for Backend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Backend {
     pub fn new() -> Self {
@@ -140,11 +167,29 @@ impl Backend {
                 ensure_initialized(true);
             }}
         }
-        Self {}
+        Self {
+            #[cfg(not(no_qt))]
+            event_loop_generation: Default::default(),
+        }
     }
 }
 
 impl i_slint_core::platform::Platform for Backend {
+    #[cfg(not(no_qt))]
+    fn bind_context(&self, ctx: i_slint_core::SlintContextWeak, _: i_slint_core::InternalToken) {
+        QT_CONTEXT.with(|cell| {
+            let _ = cell.set(ctx);
+        });
+        // Read the host shell's current values once and push them to the context, then
+        // install an `qApp`-level event filter that re-pushes whenever Qt reports a
+        // theme/palette/font change. The previous design did the read in `QtWindow::new` and
+        // the change-tracking in each window's `changeEvent`, which is wasteful when
+        // there are multiple windows and outright broken when there are zero windows.
+        update_palette_state();
+        update_font_state();
+        install_app_state_observer();
+    }
+
     fn create_window_adapter(
         &self,
     ) -> Result<Rc<dyn i_slint_core::window::WindowAdapter>, PlatformError> {
@@ -152,7 +197,7 @@ impl i_slint_core::platform::Platform for Backend {
         return Err("Qt platform requested but Slint is compiled without Qt support".into());
         #[cfg(not(no_qt))]
         {
-            Ok(qt_window::QtWindow::new())
+            Ok(qt_window::QtWindow::new(std::rc::Weak::<qt_window::QtWindow>::new()))
         }
     }
 
@@ -162,6 +207,8 @@ impl i_slint_core::platform::Platform for Backend {
             // Schedule any timers with Qt that were set up before this event loop start.
             crate::qt_window::timer_event();
             use cpp::cpp;
+            // Note: fetch_add wraps on overflow, which is what we want here.
+            self.event_loop_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             cpp! {unsafe [] {
                 ensure_initialized(true);
                 qApp->exec();
@@ -174,7 +221,7 @@ impl i_slint_core::platform::Platform for Backend {
 
     fn process_events(
         &self,
-        _timeout: core::time::Duration,
+        _timeout: Option<core::time::Duration>,
         _: i_slint_core::InternalToken,
     ) -> Result<core::ops::ControlFlow<()>, PlatformError> {
         #[cfg(not(no_qt))]
@@ -182,7 +229,7 @@ impl i_slint_core::platform::Platform for Backend {
             // Schedule any timers with Qt that were set up before this event loop start.
             crate::qt_window::timer_event();
             use cpp::cpp;
-            let timeout_ms: i32 = _timeout.as_millis() as _;
+            let timeout_ms: i32 = _timeout.map_or(-1, |d| d.as_millis() as i32);
             let loop_was_quit = cpp! {unsafe [timeout_ms as "int"] -> bool as "bool" {
                 ensure_initialized(true);
                 qApp->processEvents(QEventLoop::AllEvents, timeout_ms);
@@ -200,18 +247,27 @@ impl i_slint_core::platform::Platform for Backend {
 
     #[cfg(not(no_qt))]
     fn new_event_loop_proxy(&self) -> Option<Box<dyn i_slint_core::platform::EventLoopProxy>> {
-        struct Proxy;
+        struct Proxy(Arc<AtomicUsize>);
         impl i_slint_core::platform::EventLoopProxy for Proxy {
             fn quit_event_loop(&self) -> Result<(), i_slint_core::api::EventLoopError> {
-                use cpp::cpp;
-                cpp! {unsafe [] {
-                    // Use a quit event to avoid qApp->quit() calling
-                    // [NSApp terminate:nil] and us never returning from the
-                    // event loop - slint-viewer relies on the ability to
-                    // return from run().
-                    QCoreApplication::postEvent(qApp, new QEvent(QEvent::Quit));
-                } }
-                Ok(())
+                let generation_now = self.0.load(std::sync::atomic::Ordering::Relaxed);
+                let generation = Arc::clone(&self.0);
+                // Note: Invoke QCoreApplication::exit(0) from the event loop as its thread-safety
+                // is unspecified.
+                self.invoke_from_event_loop(Box::new(move || {
+                    if generation.load(std::sync::atomic::Ordering::Relaxed) == generation_now {
+                        use cpp::cpp;
+                        cpp! {unsafe [] {
+                            // Note: Use exit instead of qApp->quit().
+                            //
+                            // As per commit 0c02f133f3daee146b805149e69bba8cee6727b2 in qtbase (qt6),
+                            // quit() on QCoreApplication on macOS calls [NSApp terminate], which will
+                            // not return to main. The latter however is documented behavior, and
+                            // slint-viewer for example relies on the ability to return from run().
+                            QCoreApplication::exit(0);
+                        } }
+                    }
+                }))
             }
 
             fn invoke_from_event_loop(
@@ -226,7 +282,7 @@ impl i_slint_core::platform::Platform for Backend {
                        ~EventHolder() {
                            if (fnbox.a != nullptr || fnbox.b != nullptr) {
                                rust!(Slint_delete_event_holder [fnbox: *mut dyn FnOnce() as "TraitObject"] {
-                                   drop(Box::from_raw(fnbox))
+                                   unsafe { drop(Box::from_raw(fnbox)) }
                                });
                            }
                        }
@@ -241,7 +297,7 @@ impl i_slint_core::platform::Platform for Backend {
                                 TraitObject fnbox = std::move(this->fnbox);
                                 this->fnbox = {nullptr, nullptr};
                                 rust!(Slint_call_event_holder [fnbox: *mut dyn FnOnce() as "TraitObject"] {
-                                   let b = Box::from_raw(fnbox);
+                                   let b = unsafe { Box::from_raw(fnbox) };
                                    b();
                                    // in case the callback started a new timer
                                    crate::qt_window::restart_timer();
@@ -258,7 +314,7 @@ impl i_slint_core::platform::Platform for Backend {
                 Ok(())
             }
         }
-        Some(Box::new(Proxy))
+        Some(Box::new(Proxy(Arc::clone(&self.event_loop_generation))))
     }
 
     #[cfg(not(no_qt))]
@@ -310,6 +366,119 @@ impl i_slint_core::platform::Platform for Backend {
         };
         core::time::Duration::from_millis(duration_ms as u64)
     }
+
+    #[cfg(not(no_qt))]
+    fn cursor_flash_cycle(&self) -> core::time::Duration {
+        let duration_ms = unsafe {
+            cpp::cpp! {[] -> i32 as "int" { return qApp->cursorFlashTime(); }}
+        };
+        if duration_ms > 0 {
+            core::time::Duration::from_millis(duration_ms as u64)
+        } else {
+            core::time::Duration::ZERO
+        }
+    }
+
+    #[cfg(not(no_qt))]
+    fn open_url(&self, url: &str) -> Result<(), i_slint_core::platform::PlatformError> {
+        let url: qttypes::QString = url.into();
+        let success = unsafe {
+            cpp::cpp! { [url as "QString"] -> bool as "bool" {
+                return QDesktopServices::openUrl(url);
+            }}
+        };
+        if success {
+            Ok(())
+        } else {
+            Err(i_slint_core::platform::PlatformError::Other("Failed to open URL".into()))
+        }
+    }
+}
+
+#[cfg(not(no_qt))]
+/// `None` when unbound: Qt's timer entry points come from C++ statics whose lifetime is not
+/// tied to the context, so callers skip rather than assert.
+pub(crate) fn context() -> Option<i_slint_core::SlintContext> {
+    QT_CONTEXT.with(|cell| cell.get().and_then(|ctx| ctx.upgrade()))
+}
+
+#[cfg(not(no_qt))]
+fn update_palette_state() {
+    use cpp::cpp;
+    let dark = cpp! {unsafe [] -> bool as "bool" {
+        return qApp->palette().color(QPalette::Window).valueF() < 0.5;
+    }};
+    let argb = cpp! {unsafe [] -> u32 as "QRgb" {
+        #if QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+            return qApp->palette().color(QPalette::Accent).rgba();
+        #else
+            return qApp->palette().color(QPalette::Highlight).rgba();
+        #endif
+    }};
+    let scheme = if dark {
+        i_slint_core::items::ColorScheme::Dark
+    } else {
+        i_slint_core::items::ColorScheme::Light
+    };
+    let accent = i_slint_core::graphics::Color::from_argb_encoded(argb);
+    QT_CONTEXT.with(|cell| {
+        if let Some(ctx) = cell.get().and_then(|w| w.upgrade()) {
+            ctx.set_color_scheme(scheme);
+            ctx.set_accent_color(accent);
+        }
+    });
+}
+
+#[cfg(not(no_qt))]
+fn update_font_state() {
+    use cpp::cpp;
+    let default_font_size = cpp! {unsafe [] -> i32 as "int" {
+        return QFontInfo(qApp->font()).pixelSize();
+    }};
+    QT_CONTEXT.with(|cell| {
+        if let Some(ctx) = cell.get().and_then(|w| w.upgrade()) {
+            ctx.set_platform_default_font_size(Some(i_slint_core::lengths::LogicalLength::new(
+                default_font_size as f32,
+            )));
+        }
+    });
+}
+
+#[cfg(not(no_qt))]
+fn install_app_state_observer() {
+    use cpp::cpp;
+    cpp! {{
+        #include <QtCore/QEvent>
+        #include <QtCore/QObject>
+        #include <QtGui/QFontInfo>
+        #include <QtWidgets/QApplication>
+
+        struct SlintAppStateObserver : QObject {
+            using QObject::QObject;
+            bool eventFilter(QObject *watched, QEvent *event) override {
+                if (watched == qApp) {
+                    if (event->type() == QEvent::ApplicationPaletteChange
+                        || event->type() == QEvent::ThemeChange) {
+                        rust!(Slint_qt_palette_changed [] {
+                            crate::update_palette_state();
+                        });
+                    } else if (event->type() == QEvent::ApplicationFontChange) {
+                        rust!(Slint_qt_font_changed [] {
+                            crate::update_font_state();
+                        });
+                    }
+                }
+                return false;
+            }
+        };
+    }};
+    cpp! {unsafe [] {
+        ensure_initialized(true);
+        // Parented to qApp so it lives as long as the application and is cleaned up
+        // automatically on exit. installEventFilter doesn't take ownership.
+        auto *observer = new SlintAppStateObserver(qApp);
+        qApp->installEventFilter(observer);
+    }};
 }
 
 /// This helper trait can be used to obtain access to a pointer to a QtWidget for a given
@@ -325,7 +494,7 @@ impl QtWidgetAccessor for i_slint_core::api::Window {
         i_slint_core::window::WindowInner::from_pub(self)
             .window_adapter()
             .internal(i_slint_core::InternalToken)
-            .and_then(|wa| wa.as_any().downcast_ref::<qt_window::QtWindow>())
+            .and_then(|wa| (wa as &dyn core::any::Any).downcast_ref::<qt_window::QtWindow>())
             .map(qt_window::QtWindow::widget_ptr)
     }
 }

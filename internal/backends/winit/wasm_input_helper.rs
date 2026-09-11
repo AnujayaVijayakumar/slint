@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore autocapitalize compositionend compositionupdate keyup
 //! Helper for wasm that adds a hidden `<input>`  and process its events
 //!
 //! Without it, the key event are sent to the canvas and processed by winit.
@@ -20,13 +21,13 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-use i_slint_core::input::{KeyEvent, KeyEventType};
+use i_slint_core::SharedString;
+use i_slint_core::input::{InternalKeyEvent, KeyEvent, KeyEventType};
 use i_slint_core::platform::WindowEvent;
 use i_slint_core::window::{WindowAdapter, WindowInner};
-use i_slint_core::SharedString;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::convert::FromWasmAbi;
-use wasm_bindgen::JsCast;
 
 pub struct WasmInputHelper {
     input: web_sys::HtmlInputElement,
@@ -66,68 +67,19 @@ impl WasmInputHelper {
         let mut h = Self { input, canvas: canvas.clone() };
 
         // macos, or ipad with an attached keyboard, etc.
-        let is_apple = window.navigator().platform().ok().map_or(false, |platform| {
-            let platform = platform.to_ascii_lowercase();
-            platform.contains("mac") || platform.contains("iphone") || platform.contains("ipad")
-        });
+        let is_apple = i_slint_core::is_apple_platform();
 
         let shared_state = Rc::new(RefCell::new(WasmInputState::default()));
-        #[cfg(web_sys_unstable_apis)]
-        {
-            let win = window_adapter.clone();
-            h.add_event_listener("paste", move |e: web_sys::ClipboardEvent| {
-                if let Some(window_adapter) = win.upgrade() {
-                    let Some(text) = e.clipboard_data().and_then(|data| data.get_data("text").ok())
-                    else {
-                        return;
-                    };
-                    e.prevent_default();
-                    let synthetic_clipboard_data = RefCell::new(text);
-                    CURRENT_WASM_CLIPBOARD_DATA.set(&synthetic_clipboard_data, || {
-                        if let Some(focus_item) = WindowInner::from_pub(&window_adapter.window())
-                            .focus_item
-                            .borrow()
-                            .upgrade()
-                        {
-                            if let Some(text_input) =
-                                focus_item.downcast::<i_slint_core::items::TextInput>()
-                            {
-                                text_input.as_pin_ref().paste(&window_adapter, &focus_item);
-                            }
-                        }
-                    })
-                }
-            });
-            let win = window_adapter.clone();
-            h.add_event_listener("copy", move |e: web_sys::ClipboardEvent| {
-                if let Some(window_adapter) = win.upgrade() {
-                    e.prevent_default();
-
-                    let synthetic_clipboard_data = RefCell::new(String::default());
-                    CURRENT_WASM_CLIPBOARD_DATA.set(&synthetic_clipboard_data, || {
-                        if let Some(focus_item) = WindowInner::from_pub(&window_adapter.window())
-                            .focus_item
-                            .borrow()
-                            .upgrade()
-                        {
-                            if let Some(text_input) =
-                                focus_item.downcast::<i_slint_core::items::TextInput>()
-                            {
-                                let text =
-                                    text_input.as_pin_ref().copy(&window_adapter, &focus_item);
-                            }
-                        }
-                    });
-                    if let Some(data) = e.clipboard_data() {
-                        data.set_data("text", &synthetic_clipboard_data.into_inner()).ok();
-                    }
-                }
-            });
-
-            let win = window_adapter.clone();
-            h.add_event_listener("cut", move |e: web_sys::ClipboardEvent| {
-                if let Some(window_adapter) = win.upgrade() {
-                    e.prevent_default();
+        let win = window_adapter.clone();
+        h.add_event_listener("paste", move |e: web_sys::ClipboardEvent| {
+            if let Some(window_adapter) = win.upgrade() {
+                let Some(text) = e.clipboard_data().and_then(|data| data.get_data("text").ok())
+                else {
+                    return;
+                };
+                e.prevent_default();
+                let synthetic_clipboard_data = RefCell::new(text);
+                CURRENT_WASM_CLIPBOARD_DATA.set(&synthetic_clipboard_data, || {
                     if let Some(focus_item) = WindowInner::from_pub(&window_adapter.window())
                         .focus_item
                         .borrow()
@@ -136,31 +88,83 @@ impl WasmInputHelper {
                         if let Some(text_input) =
                             focus_item.downcast::<i_slint_core::items::TextInput>()
                         {
-                            let (anchor, cursor) =
-                                text_input.as_pin_ref().selection_anchor_and_cursor();
-                            if anchor == cursor {
-                                return;
-                            }
-                            let text = text_input.as_pin_ref().text();
-                            if let Some(data) = e.clipboard_data() {
-                                data.set_data("text", &text[anchor..cursor]).ok();
-                            }
-                            text_input.as_pin_ref().delete_selection(
-                                &window_adapter,
-                                &focus_item,
-                                i_slint_core::items::TextChangeNotify::TriggerCallbacks,
-                            );
+                            text_input.as_pin_ref().paste(&window_adapter, &focus_item);
                         }
                     }
+                })
+            }
+        });
+        let win = window_adapter.clone();
+        h.add_event_listener("copy", move |e: web_sys::ClipboardEvent| {
+            if let Some(window_adapter) = win.upgrade() {
+                e.prevent_default();
+
+                let synthetic_clipboard_data = RefCell::new(String::default());
+                CURRENT_WASM_CLIPBOARD_DATA.set(&synthetic_clipboard_data, || {
+                    if let Some(focus_item) = WindowInner::from_pub(&window_adapter.window())
+                        .focus_item
+                        .borrow()
+                        .upgrade()
+                    {
+                        if let Some(text_input) =
+                            focus_item.downcast::<i_slint_core::items::TextInput>()
+                        {
+                            let text = text_input.as_pin_ref().copy(&window_adapter, &focus_item);
+                        }
+                    }
+                });
+                if let Some(data) = e.clipboard_data() {
+                    data.set_data("text", &synthetic_clipboard_data.into_inner()).ok();
                 }
-            });
-        }
+            }
+        });
 
         let win = window_adapter.clone();
-        h.add_event_listener("blur", move |_: web_sys::Event| {
+        h.add_event_listener("cut", move |e: web_sys::ClipboardEvent| {
+            if let Some(window_adapter) = win.upgrade() {
+                e.prevent_default();
+                if let Some(focus_item) =
+                    WindowInner::from_pub(&window_adapter.window()).focus_item.borrow().upgrade()
+                {
+                    if let Some(text_input) =
+                        focus_item.downcast::<i_slint_core::items::TextInput>()
+                    {
+                        let (anchor, cursor) =
+                            text_input.as_pin_ref().selection_anchor_and_cursor();
+                        if anchor == cursor {
+                            return;
+                        }
+                        let text = text_input.as_pin_ref().text();
+                        if let Some(data) = e.clipboard_data() {
+                            data.set_data("text", &text[anchor..cursor]).ok();
+                        }
+                        text_input.as_pin_ref().delete_selection(
+                            &window_adapter,
+                            &focus_item,
+                            i_slint_core::items::TextChangeNotify::TriggerCallbacks,
+                        );
+                    }
+                }
+            }
+        });
+
+        let win = window_adapter.clone();
+        h.add_event_listener("blur", move |e: web_sys::FocusEvent| {
             // Make sure that the window gets marked as unfocused when the focus leaves the input
             if let Some(window_adapter) = win.upgrade() {
-                if !canvas.matches(":focus").unwrap_or(false) {
+                let canvas_receiving_focus = e.related_target().is_some_and(|target| {
+                    // related_target is the element receiving focus, see https://developer.mozilla.org/en-US/docs/Web/API/FocusEvent/relatedTarget
+                    target
+                        .dyn_ref::<web_sys::Node>()
+                        .is_some_and(|node| canvas.is_same_node(Some(node)))
+                });
+                // the correct thing to do to see what is focused (or more accurately, *going* to
+                // be focused) during a blur event is to look at relatedTarget. Some old
+                // browsers may not implement relatedTarget correctly, so this falls back to
+                // .matches(), hoping that the browser focuses the target before dispatching
+                // the blur event
+                let canvas_already_focused = canvas.matches(":focus").unwrap_or(false);
+                if !canvas_receiving_focus && !canvas_already_focused {
                     window_adapter.window().dispatch_event(WindowEvent::WindowActiveChanged(false));
                 }
             }
@@ -229,12 +233,14 @@ impl WasmInputHelper {
         let input = h.input.clone();
         h.add_event_listener("compositionend", move |e: web_sys::CompositionEvent| {
             if let (Some(window_adapter), Some(data)) = (win.upgrade(), e.data()) {
-                let window_inner = WindowInner::from_pub(window_adapter.window());
-                window_inner.process_key_input(KeyEvent {
-                    text: data.into(),
+                let mut key_event = KeyEvent::default();
+                key_event.text = data.into();
+
+                window_adapter.window().dispatch_event(WindowEvent::internal(InternalKeyEvent {
+                    key_event,
                     event_type: KeyEventType::CommitComposition,
                     ..Default::default()
-                });
+                }));
                 input.set_value("");
             }
         });
@@ -242,12 +248,11 @@ impl WasmInputHelper {
         let win = window_adapter.clone();
         h.add_event_listener("compositionupdate", move |e: web_sys::CompositionEvent| {
             if let (Some(window_adapter), Some(data)) = (win.upgrade(), e.data()) {
-                let window_inner = WindowInner::from_pub(window_adapter.window());
-                window_inner.process_key_input(KeyEvent {
+                window_adapter.window().dispatch_event(WindowEvent::internal(InternalKeyEvent {
                     preedit_text: data.into(),
                     event_type: KeyEventType::UpdateComposition,
                     ..Default::default()
-                });
+                }));
             }
         });
 
@@ -299,14 +304,18 @@ fn event_text(e: &web_sys::KeyboardEvent, is_apple: bool) -> Option<SharedString
     use i_slint_core::platform::Key;
 
     macro_rules! check_non_printable_code {
-        ($($char:literal # $name:ident # $($_qt:ident)|* # $($_winit:ident $(($_pos:ident))?)|* # $($_xkb:ident)|* ;)*) => {
+        ($($char:literal # $name:ident # $($shifted:ident)? $(=> $($_muda:ident)? # $($qt:ident)|* # $($_winit:ident $(($_pos:ident))?)|* # $($_xkb:ident)|* )? ;)*) => {
             match key.as_str() {
                 "Tab" if e.shift_key() => return Some(Key::Backtab.into()),
                 "Meta" if is_apple => return Some(Key::Control.into()),
                 "Control" if is_apple => return Some(Key::Meta.into()),
-                $(stringify!($name) => {
+                // Only emit a case for each special key (e.g. the ones that have any of the
+                // qt/winit/xkb variants) to avoid emitting a lot of non-special keys.
+                $($(stringify!($name) => {
+                    // phony let to make sure this only emits a match arm on special keys
+                    $(let _ = stringify!($qt);)*
                     return Some($char.into());
-                })*
+                })?)*
                 // Why did we diverge from DOM there?
                 "ArrowLeft" => return Some(Key::LeftArrow.into()),
                 "ArrowUp" => return Some(Key::UpArrow.into()),
@@ -317,7 +326,7 @@ fn event_text(e: &web_sys::KeyboardEvent, is_apple: bool) -> Option<SharedString
             }
         };
     }
-    i_slint_common::for_each_special_keys!(check_non_printable_code);
+    i_slint_common::for_each_keys!(check_non_printable_code);
 
     let mut chars = key.chars();
     match chars.next() {

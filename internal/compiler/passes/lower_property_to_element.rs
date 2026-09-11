@@ -6,32 +6,34 @@
 
 use crate::diagnostics::BuildDiagnostics;
 use crate::expression_tree::{BindingExpression, Expression, NamedReference};
-use crate::langtype::Type;
+use crate::langtype::{PropertyLookupMode, Type};
 use crate::object_tree::{self, Component, Element, ElementRc};
 use crate::typeregister::TypeRegister;
-use smol_str::{format_smolstr, SmolStr, ToSmolStr};
+use smol_str::{SmolStr, ToSmolStr, format_smolstr};
 use std::rc::Rc;
 
-/// If any element in `component` declares a binding to `property_name`, then a new
+/// If any element in `component` declares a binding to any of `property_names`, then a new
 /// element of type `element_name` is created, injected as a parent to the element and bindings
-/// to property_name and all properties in  extra_properties are mapped.
+/// to all properties in property_names and extra_properties are mapped.
 /// Default value for the property extra_properties is queried with the `default_value_for_extra_properties`
 pub(crate) fn lower_property_to_element(
     component: &Rc<Component>,
-    property_name: &'static str,
+    property_names: impl Iterator<Item = &'static str> + Clone,
     extra_properties: impl Iterator<Item = &'static str> + Clone,
-    default_value_for_extra_properties: Option<&dyn Fn(&ElementRc, &str) -> Expression>,
+    default_value_for_extra_properties: Option<&dyn Fn(&ElementRc, &str) -> Option<Expression>>,
     element_name: &SmolStr,
     type_register: &TypeRegister,
     diag: &mut BuildDiagnostics,
 ) {
-    if let Some(b) = component.root_element.borrow().bindings.get(property_name) {
-        diag.push_warning(
-            format!(
-                "The {property_name} property cannot be used on the root element, it will not be applied"
-            ),
-            &*b.borrow(),
-        );
+    for property_name in property_names.clone() {
+        if let Some(b) = component.root_element.borrow().binding(property_name) {
+            diag.push_warning(
+                format!(
+                    "The {property_name} property cannot be used on the root element, it will not be applied"
+                ),
+                &*b,
+            );
+        }
     }
 
     object_tree::recurse_elem_including_sub_components_no_borrow(component, &(), &mut |elem, _| {
@@ -46,13 +48,19 @@ pub(crate) fn lower_property_to_element(
         };
 
         let has_property_binding = |e: &ElementRc| {
-            e.borrow().base_type.lookup_property(property_name).property_type != Type::Invalid
-                && (e.borrow().bindings.contains_key(property_name)
-                    || e.borrow()
-                        .property_analysis
-                        .borrow()
-                        .get(property_name)
-                        .is_some_and(|a| a.is_set || a.is_linked))
+            property_names.clone().any(|property_name| {
+                e.borrow()
+                    .base_type
+                    .lookup_property(property_name, PropertyLookupMode::ComponentLocal)
+                    .property_type
+                    != Type::Invalid
+                    && (e.borrow().binding(property_name).is_some()
+                        || e.borrow()
+                            .property_analysis
+                            .borrow()
+                            .get(property_name)
+                            .is_some_and(|a| a.is_set || a.is_linked))
+            })
         };
 
         for mut child in old_children {
@@ -63,8 +71,7 @@ pub(crate) fn lower_property_to_element(
                         &child,
                         create_property_element(
                             &root_elem,
-                            property_name,
-                            extra_properties.clone(),
+                            property_names.clone().chain(extra_properties.clone()),
                             default_value_for_extra_properties,
                             element_name,
                             type_register,
@@ -74,8 +81,7 @@ pub(crate) fn lower_property_to_element(
             } else if has_property_binding(&child) {
                 let new_child = create_property_element(
                     &child,
-                    property_name,
-                    extra_properties.clone(),
+                    property_names.clone().chain(extra_properties.clone()),
                     default_value_for_extra_properties,
                     element_name,
                     type_register,
@@ -92,32 +98,92 @@ pub(crate) fn lower_property_to_element(
 
 fn create_property_element(
     child: &ElementRc,
-    property_name: &'static str,
-    extra_properties: impl Iterator<Item = &'static str>,
-    default_value_for_extra_properties: Option<&dyn Fn(&ElementRc, &str) -> Expression>,
+    properties: impl Iterator<Item = &'static str>,
+    default_value_for_extra_properties: Option<&dyn Fn(&ElementRc, &str) -> Option<Expression>>,
     element_name: &SmolStr,
     type_register: &TypeRegister,
 ) -> ElementRc {
-    let bindings = core::iter::once(property_name)
-        .chain(extra_properties)
+    let bindings = properties
         .map(|property_name| {
-            let mut bind =
-                BindingExpression::new_two_way(NamedReference::new(child, property_name.into()));
-            if let Some(default_value_for_extra_properties) = default_value_for_extra_properties {
-                if !child.borrow().bindings.contains_key(property_name) {
-                    bind.expression = default_value_for_extra_properties(child, property_name)
-                }
+            let property_name = SmolStr::new_static(property_name);
+            let mut bind = BindingExpression::new_two_way(
+                NamedReference::new(child, property_name.clone()).into(),
+            );
+            if let Some(default_value_for_extra_properties) = default_value_for_extra_properties
+                && child.borrow().binding(&property_name).is_none()
+                && let Some(e) = default_value_for_extra_properties(child, &property_name)
+            {
+                bind.expression = e;
             }
-            (property_name.into(), bind.into())
+            (property_name, bind.into())
         })
         .collect();
 
     let element = Element {
-        id: format_smolstr!("{}-{}", child.borrow().id, property_name),
+        id: format_smolstr!("{}-{}", child.borrow().id, element_name),
         base_type: type_register.lookup_element(element_name).unwrap(),
         enclosing_component: child.borrow().enclosing_component.clone(),
         bindings,
+        is_injected_wrapper_element: true,
         ..Default::default()
     };
     element.make_rc()
+}
+
+pub fn transform_property_default_value(
+    element: &ElementRc,
+    property_name: &str,
+) -> Option<Expression> {
+    let transform_origin = crate::typeregister::transform_origin_property();
+
+    let prop_div_2 = |prop: &str| Expression::BinaryExpression {
+        lhs: Expression::PropertyReference(NamedReference::new(element, prop.into())).into(),
+        op: '/',
+        rhs: Expression::NumberLiteral(2., Default::default()).into(),
+        source_location: None,
+    };
+
+    match property_name {
+        "transform-origin" => Some(Expression::Struct {
+            ty: transform_origin.1.clone(),
+            values: [
+                (SmolStr::new_static("x"), prop_div_2("width")),
+                (SmolStr::new_static("y"), prop_div_2("height")),
+            ]
+            .into_iter()
+            .collect(),
+        }),
+        "transform-scale-x" | "transform-scale-y" => {
+            if element.borrow().is_binding_set("transform-scale", true) {
+                Some(Expression::PropertyReference(NamedReference::new(
+                    element,
+                    SmolStr::new_static("transform-scale"),
+                )))
+            } else {
+                Some(Expression::NumberLiteral(1., Default::default()))
+            }
+        }
+        "transform-scale" => None,
+        "transform-rotation" => Some(Expression::NumberLiteral(0., Default::default())),
+        _ => unreachable!(),
+    }
+}
+
+/// Wrapper around lower_property_to_element for the Transform element
+pub fn lower_transform_properties(
+    component: &Rc<Component>,
+    tr: &TypeRegister,
+    diag: &mut BuildDiagnostics,
+) {
+    let transform_origin = crate::typeregister::transform_origin_property();
+
+    lower_property_to_element(
+        component,
+        crate::typeregister::RESERVED_TRANSFORM_PROPERTIES.iter().map(|(prop_name, _)| *prop_name),
+        std::iter::once(transform_origin.0),
+        Some(&|e, prop| transform_property_default_value(e, prop)),
+        &SmolStr::new_static("Transform"),
+        tr,
+        diag,
+    );
 }

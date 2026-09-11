@@ -37,10 +37,10 @@ export component MainUI inherits Window {
     in property <[Tile]> tiles;
 
     public function set_viewport(ox: length, oy: length, width: length, height: length) {
-        fli.viewport-x = ox;
-        fli.viewport-y = oy;
-        fli.viewport-width = width;
-        fli.viewport-height = height;
+        fli.content-x = ox;
+        fli.content-y = oy;
+        fli.content-width = width;
+        fli.content-height = height;
     }
 
     VerticalLayout {
@@ -51,15 +51,15 @@ export component MainUI inherits Window {
                 source: t.tile;
             }
             flicked => {
-                root.flicked(fli.viewport-x, fli.viewport-y);
+                root.flicked(fli.content-x, fli.content-y);
             }
             TouchArea {
                 scroll-event(e) => {
                     if e.delta-y > 0 {
-                        root.zoom-in(self.mouse-x + fli.viewport-x, self.mouse-y + fli.viewport-y);
+                        root.zoom-in(self.mouse-x + fli.content-x, self.mouse-y + fli.content-y);
                         return accept;
                     } else if e.delta-y < 0 {
-                        root.zoom-out(self.mouse-x + fli.viewport-x, self.mouse-y + fli.viewport-y);
+                        root.zoom-out(self.mouse-x + fli.content-x, self.mouse-y + fli.content-y);
                         return accept;
                     }
                     return reject;
@@ -216,7 +216,7 @@ impl World {
                         })
                         .await
                         .unwrap();
-                        buffer.map(|buffer| slint::Image::from_rgba8(buffer)).unwrap_or_default()
+                        buffer.map(slint::Image::from_rgba8).unwrap_or_default()
                     })
                 });
             }

@@ -1,20 +1,19 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore bitmapfont glversion
+#![allow(unsafe_code)]
 #![warn(missing_docs)]
 /*!
     Graphics Abstractions.
 
     This module contains the abstractions and convenience types used for rendering.
-
-    The run-time library also makes use of [RenderingCache] to store the rendering primitives
-    created by the backend in a type-erased manner.
 */
 extern crate alloc;
-use crate::api::PlatformError;
-use crate::lengths::LogicalLength;
 use crate::Coord;
 use crate::SharedString;
+use crate::api::PlatformError;
+use crate::lengths::LogicalLength;
 use alloc::boxed::Box;
 
 pub use euclid;
@@ -34,9 +33,11 @@ pub type Transform = euclid::default::Transform2D<Coord>;
 pub(crate) mod color;
 pub use color::*;
 
-#[cfg(feature = "std")]
+#[cfg(feature = "shared-fontique")]
+use i_slint_common::sharedfontique::{self, fontique};
+#[cfg(feature = "path")]
 mod path;
-#[cfg(feature = "std")]
+#[cfg(feature = "path")]
 pub use path::*;
 
 mod brush;
@@ -56,8 +57,26 @@ pub mod boxshadowcache;
 pub mod border_radius;
 pub use border_radius::*;
 
-#[cfg(feature = "unstable-wgpu-25")]
-pub mod wgpu_25;
+#[cfg(feature = "wgpu-29")]
+pub mod wgpu_29;
+#[cfg(feature = "wgpu-30")]
+pub mod wgpu_30;
+
+/// Adjusts a rectangle and a border width for drawing the border entirely inside the
+/// rectangle's geometry: renderers stroke a border centered on the path, so the rectangle
+/// is inset by half the border width. If the border width exceeds half of the rectangle's
+/// width, it is clamped so that the border just fills the rectangle.
+pub fn adjust_rect_and_border_for_inner_drawing<U>(
+    rect: &mut euclid::Rect<f32, U>,
+    border_width: &mut euclid::Length<f32, U>,
+) {
+    use crate::lengths::RectLengths;
+    // If the border width exceeds the width, just fill the rectangle.
+    *border_width = border_width.min(rect.width_length() / 2.);
+    // adjust the size so that the border is drawn within the geometry
+    rect.origin += euclid::Size2D::from_lengths(*border_width / 2., *border_width / 2.);
+    rect.size -= euclid::Size2D::from_lengths(*border_width, *border_width);
+}
 
 /// CachedGraphicsData allows the graphics backend to store an arbitrary piece of data associated with
 /// an item, which is typically computed by accessing properties. The dependency_tracker is used to allow
@@ -81,61 +100,6 @@ impl<T> CachedGraphicsData<T> {
     }
 }
 
-/// The RenderingCache, in combination with CachedGraphicsData, allows back ends to store data that's either
-/// intensive to compute or has bad CPU locality. Back ends typically keep a RenderingCache instance and use
-/// the item's cached_rendering_data() integer as index in the vec_arena::Arena.
-///
-/// This is used only for the [`crate::item_rendering::PartialRenderingCache`]
-pub struct RenderingCache<T> {
-    slab: slab::Slab<CachedGraphicsData<T>>,
-    generation: usize,
-}
-
-impl<T> Default for RenderingCache<T> {
-    fn default() -> Self {
-        Self { slab: Default::default(), generation: 1 }
-    }
-}
-
-impl<T> RenderingCache<T> {
-    /// Returns the generation of the cache. The generation starts at 1 and is increased
-    /// whenever the cache is cleared, for example when the GL context is lost.
-    pub fn generation(&self) -> usize {
-        self.generation
-    }
-
-    /// Retrieves a mutable reference to the cached graphics data at index.
-    pub fn get_mut(&mut self, index: usize) -> Option<&mut CachedGraphicsData<T>> {
-        self.slab.get_mut(index)
-    }
-
-    /// Returns true if a cache entry exists for the given index.
-    pub fn contains(&self, index: usize) -> bool {
-        self.slab.contains(index)
-    }
-
-    /// Inserts data into the cache and returns the index for retrieval later.
-    pub fn insert(&mut self, data: CachedGraphicsData<T>) -> usize {
-        self.slab.insert(data)
-    }
-
-    /// Retrieves an immutable reference to the cached graphics data at index.
-    pub fn get(&self, index: usize) -> Option<&CachedGraphicsData<T>> {
-        self.slab.get(index)
-    }
-
-    /// Removes the cached graphics data at the given index.
-    pub fn remove(&mut self, index: usize) -> CachedGraphicsData<T> {
-        self.slab.remove(index)
-    }
-
-    /// Removes all entries from the cache and increases the cache's generation count, so
-    /// that stale index access can be avoided.
-    pub fn clear(&mut self) {
-        self.slab.clear();
-        self.generation += 1;
-    }
-}
 /// FontRequest collects all the developer-configurable properties for fonts, such as family, weight, etc.
 /// It is submitted as a request to the platform font system (i.e. CoreText on macOS) and in exchange the
 /// backend returns a `Box<dyn Font>`.
@@ -151,20 +115,64 @@ pub struct FontRequest {
     /// The additional spacing (or shrinking if negative) between glyphs. This is usually not submitted to
     /// the font-subsystem but collected here for API convenience
     pub letter_spacing: Option<LogicalLength>,
+    /// The line height as a factor applied to the font's natural line height.
+    /// `None` uses the natural line height unchanged (a factor of 1).
+    pub line_height_factor: Option<f32>,
     /// Whether to select an italic face of the font family.
     pub italic: bool,
 }
 
-#[cfg(feature = "shared-fontdb")]
 impl FontRequest {
-    /// Returns the relevant properties of this FontRequest propagated into a fontdb Query.
-    pub fn to_fontdb_query(&self) -> i_slint_common::sharedfontdb::fontdb::Query<'_> {
-        use i_slint_common::sharedfontdb::fontdb::{Query, Style, Weight};
-        Query {
-            style: if self.italic { Style::Italic } else { Style::Normal },
-            weight: Weight(self.weight.unwrap_or(/* CSS normal*/ 400) as _),
+    /// Returns the configured line height given the font's natural line height
+    /// (in any unit), or `None` when the natural line height applies unchanged.
+    pub fn line_height_for_natural_height(&self, natural_line_height: f32) -> Option<f32> {
+        self.line_height_factor.map(|factor| natural_line_height * factor)
+    }
+}
+
+#[cfg(feature = "shared-fontique")]
+impl FontRequest {
+    /// Attempts to query the fontique font collection for a matching font.
+    pub fn query_fontique(
+        &self,
+        collection: &mut fontique::Collection,
+        source_cache: &mut fontique::SourceCache,
+    ) -> Option<fontique::QueryFont> {
+        let mut query = collection.query(source_cache);
+        query.set_families(
+            self.family
+                .as_ref()
+                .map(|family| fontique::QueryFamily::from(family.as_str()))
+                .into_iter()
+                .chain(
+                    sharedfontique::FALLBACK_FAMILIES
+                        .into_iter()
+                        .map(fontique::QueryFamily::Generic),
+                ),
+        );
+
+        query.set_attributes(fontique::Attributes {
+            weight: self
+                .weight
+                .as_ref()
+                .map(|&weight| fontique::FontWeight::new(weight as f32))
+                .unwrap_or_default(),
+            style: if self.italic {
+                fontique::FontStyle::Italic
+            } else {
+                fontique::FontStyle::Normal
+            },
             ..Default::default()
-        }
+        });
+
+        let mut font = None;
+
+        query.matches_with(|queried_font| {
+            font = Some(queried_font.clone());
+            fontique::QueryStatus::Stop
+        });
+
+        font
     }
 }
 
@@ -181,6 +189,7 @@ pub enum RequestedOpenGLVersion {
 /// Internal enum specify which graphics API should be used, when
 /// the backend selector requests that from a built-in backend.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum RequestedGraphicsAPI {
     /// OpenGL (ES)
     OpenGL(RequestedOpenGLVersion),
@@ -190,17 +199,22 @@ pub enum RequestedGraphicsAPI {
     Vulkan,
     /// Direct 3D
     Direct3D,
-    #[cfg(feature = "unstable-wgpu-25")]
-    /// WGPU 25.x
-    WGPU25(wgpu_25::WGPUConfiguration),
+    #[cfg(feature = "unstable-wgpu-29")]
+    /// WGPU 29.x
+    WGPU29(wgpu_29::api::WGPUConfiguration),
+    #[cfg(feature = "unstable-wgpu-30")]
+    /// WGPU 30.x
+    WGPU30(wgpu_30::api::WGPUConfiguration),
 }
 
-impl TryFrom<RequestedGraphicsAPI> for RequestedOpenGLVersion {
+impl TryFrom<&RequestedGraphicsAPI> for RequestedOpenGLVersion {
     type Error = PlatformError;
 
-    fn try_from(requested_graphics_api: RequestedGraphicsAPI) -> Result<Self, Self::Error> {
+    fn try_from(requested_graphics_api: &RequestedGraphicsAPI) -> Result<Self, Self::Error> {
         match requested_graphics_api {
-            RequestedGraphicsAPI::OpenGL(requested_open_glversion) => Ok(requested_open_glversion),
+            RequestedGraphicsAPI::OpenGL(requested_open_glversion) => {
+                Ok(requested_open_glversion.clone())
+            }
             RequestedGraphicsAPI::Metal => {
                 Err("Metal rendering is not supported with an OpenGL renderer".into())
             }
@@ -210,9 +224,13 @@ impl TryFrom<RequestedGraphicsAPI> for RequestedOpenGLVersion {
             RequestedGraphicsAPI::Direct3D => {
                 Err("Direct3D rendering is not supported with an OpenGL renderer".into())
             }
-            #[cfg(feature = "unstable-wgpu-25")]
-            RequestedGraphicsAPI::WGPU25(..) => {
-                Err("WGPU 25.x rendering is not supported with an OpenGL renderer".into())
+            #[cfg(feature = "unstable-wgpu-29")]
+            RequestedGraphicsAPI::WGPU29(..) => {
+                Err("WGPU 29.x rendering is not supported with an OpenGL renderer".into())
+            }
+            #[cfg(feature = "unstable-wgpu-30")]
+            RequestedGraphicsAPI::WGPU30(..) => {
+                Err("WGPU 30.x rendering is not supported with an OpenGL renderer".into())
             }
         }
     }
@@ -226,13 +244,24 @@ impl From<RequestedOpenGLVersion> for RequestedGraphicsAPI {
 
 /// Private API exposed to just the renderers to create GraphicsAPI instance with
 /// non-exhaustive enum variant.
-#[cfg(feature = "unstable-wgpu-25")]
-pub fn create_graphics_api_wgpu_25(
-    instance: wgpu_25::wgpu::Instance,
-    device: wgpu_25::wgpu::Device,
-    queue: wgpu_25::wgpu::Queue,
+#[cfg(feature = "unstable-wgpu-29")]
+pub fn create_graphics_api_wgpu_29(
+    instance: wgpu_29::wgpu::Instance,
+    device: wgpu_29::wgpu::Device,
+    queue: wgpu_29::wgpu::Queue,
 ) -> crate::api::GraphicsAPI<'static> {
-    crate::api::GraphicsAPI::WGPU25 { instance, device, queue }
+    crate::api::GraphicsAPI::WGPU29 { instance, device, queue }
+}
+
+/// Private API exposed to just the renderers to create GraphicsAPI instance with
+/// non-exhaustive enum variant.
+#[cfg(feature = "unstable-wgpu-30")]
+pub fn create_graphics_api_wgpu_30(
+    instance: wgpu_30::wgpu::Instance,
+    device: wgpu_30::wgpu::Device,
+    queue: wgpu_30::wgpu::Queue,
+) -> crate::api::GraphicsAPI<'static> {
+    crate::api::GraphicsAPI::WGPU30 { instance, device, queue }
 }
 
 /// Internal module for use by cbindgen and the C++ platform API layer.

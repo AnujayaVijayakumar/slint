@@ -6,7 +6,7 @@ use lsp_types::{
     SemanticToken, SemanticTokenModifier, SemanticTokenType, SemanticTokens, SemanticTokensResult,
 };
 
-use crate::common::DocumentCache;
+use crate::editor_preview::DocumentCache;
 
 /// Give all the used types/modifier a number in an indexed array
 macro_rules! declare_legend {
@@ -33,7 +33,7 @@ pub fn get_semantic_tokens(
     let doc = document_cache.get_document(&text_document.uri)?;
     let doc_node = doc.node.as_ref()?;
     let mut token = doc_node.first_token()?;
-    let mut data = vec![];
+    let mut data = Vec::new();
     let mut delta_start = 0;
     let mut delta_line = 0;
     loop {
@@ -49,6 +49,7 @@ pub fn get_semantic_tokens(
                 SyntaxKind::RepeatedElement => Some((self::KEYWORD, 0)),
                 SyntaxKind::RepeatedIndex => Some((self::VARIABLE, 1 << self::DEFINITION)),
                 SyntaxKind::ConditionalElement => Some((self::KEYWORD, 0)),
+                SyntaxKind::MatchElement => Some((self::KEYWORD, 0)),
                 SyntaxKind::CallbackDeclaration => Some((self::KEYWORD, 0)),
                 SyntaxKind::CallbackConnection => Some((self::FUNCTION, 0)),
                 SyntaxKind::PropertyDeclaration => Some((self::KEYWORD, 0)),
@@ -162,11 +163,17 @@ pub fn get_semantic_tokens(
             SyntaxKind::At => Some((self::MACRO, 0)),
             _ => None,
         };
+        let len = |txt: &str| -> u32 {
+            match document_cache.format {
+                crate::editor_preview::ByteFormat::Utf8 => txt.len() as u32,
+                crate::editor_preview::ByteFormat::Utf16 => txt.encode_utf16().count() as u32,
+            }
+        };
         if let Some((token_type, token_modifiers_bitset)) = t_m {
             data.push(SemanticToken {
                 delta_line,
                 delta_start,
-                length: token.text().encode_utf16().count() as u32,
+                length: len(token.text()),
                 token_type,
                 token_modifiers_bitset,
             });
@@ -176,10 +183,10 @@ pub fn get_semantic_tokens(
         let text = token.text();
         let l = text.bytes().filter(|x| *x == b'\n').count();
         if l == 0 {
-            delta_start += text.encode_utf16().count() as u32;
+            delta_start += len(text);
         } else {
             delta_line += l as u32;
-            delta_start = text[(text.rfind('\n').unwrap() + 1)..].encode_utf16().count() as u32;
+            delta_start = len(&text[(text.rfind('\n').unwrap() + 1)..]);
         }
         token = match token.next_token() {
             None => break,

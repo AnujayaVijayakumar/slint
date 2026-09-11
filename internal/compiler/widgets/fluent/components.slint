@@ -77,8 +77,6 @@ export component ListItem {
         background: transparent;
         border-radius: 4px;
 
-        animate background { duration: 150ms; }
-
         i-layout := HorizontalLayout {
             padding-left: 16px;
             padding-right: 16px;
@@ -87,8 +85,6 @@ export component ListItem {
             i-text := Text {
                 text: root.item.text;
                 color: FluentPalette.control-foreground;
-                font-size: FluentFontSettings.body.font-size;
-                font-weight: FluentFontSettings.body.font-weight;
                 vertical-alignment: center;
                 horizontal-alignment: left;
                 overflow: elide;
@@ -105,8 +101,6 @@ export component ListItem {
             height: 0px;
             background: FluentPalette.accent-background;
             border-radius: 2px;
-
-            animate height { duration: 150ms; easing: ease-out; }
         }
     }
 

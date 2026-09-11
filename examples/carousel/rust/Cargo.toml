@@ -3,9 +3,9 @@
 
 [package]
 name = "carousel"
-version = "1.13.0"
+version = "1.18.0"
 authors = ["Slint Developers <info@slint.dev>"]
-edition = "2021"
+edition.workspace = true
 build = "build.rs"
 publish = false
 license = "MIT"
@@ -15,7 +15,7 @@ path = "main.rs"
 name = "carousel"
 
 [dependencies]
-slint = { path = "../../../api/rs/slint", default-features = false, features = ["compat-1-2"] }
+slint = { path = "../../../api/rs/slint", default-features = false, features = ["compat-1-18"] }
 mcu-board-support = { path = "../../mcu-board-support", optional = true }
 
 [build-dependencies]

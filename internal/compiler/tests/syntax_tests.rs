@@ -2,25 +2,39 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 //! This test is trying to compile all the *.slint files in the sub directories and check that compilation
-//! errors are properly reported
+//! errors are properly reported.
 //!
 //! The .slint files can have comments like this:
 //! ```ignore
-//!  hi ho
-//!  // ^error{expected_message}
+//!  hi foo
+//!  // > <error{expected_message}
 //! ```
 //!
-//! Meaning that there must an error with that error message in the position on the line above at the column pointed by the caret.
-//! If there are two carets: ` ^^error{expected_message}`  then it means two line above, and so on with more carets.
-//! `^warning{expected_message}` is also supported.
+//! Meaning that there must an error with that error message spanning the characters on the line above between the `>` and `<` characters.
+//! The `>` and `<` indicators may also appear individually, if the diagnostic spans multiple lines.
+//!
+//! A `^` character means that the diagnostic must only span that single character.
+//! A `|` character means that the diagnostic must return a length of 0 and not span any
+//! characters (although most LSP clients will render it as spanning at least 1 character).
+//!
+//! If there are additional `^` characters: `> <^error{expected_message}`  then it means the comment refers to a diagnostic two lines above, instead of one, and so on with more carets.
+//!
+//! If there are additional `<` characters: `> <<error{expected_message}` then it means the range
+//! should be an additional character to the left, which is useful if the diagnostic starts or ends
+//! in the first or second column, where otherwise the `//` is located.
+//!
+//! Warnings with `> <warning{expected_message}` are also supported.
 //!
 //! The newlines are replaced by `↵` in the error message. Also the manifest dir (CARGO_MANIFEST_DIR) is replaced by `📂`.
 //!
 //! When the env variable `SLINT_SYNTAX_TEST_UPDATE` is set to `1`, the source code will be modified to add the comments
-//! The env variable `SLINT_TEST_FILTER` accepts a regexp and will filter out tests not maching that pattern
+//! The env variable `SLINT_TEST_FILTER` accepts a regexp and will filter out tests not matching that pattern
 
-use i_slint_compiler::diagnostics::{BuildDiagnostics, Diagnostic, DiagnosticLevel};
 use i_slint_compiler::ComponentSelection;
+use i_slint_compiler::diagnostics::{
+    self, BuildDiagnostics, ByteFormat, Diagnostic, DiagnosticLevel,
+};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 #[test]
@@ -42,42 +56,87 @@ fn syntax_tests() -> std::io::Result<()> {
 
     let pattern = std::env::var("SLINT_TEST_FILTER").ok().map(|p| regex::Regex::new(&p).unwrap());
 
+    let syntax_dir = format!("{}/tests/syntax", env!("CARGO_MANIFEST_DIR"));
     let mut test_entries = Vec::new();
-    for entry in std::fs::read_dir(format!("{}/tests/syntax", env!("CARGO_MANIFEST_DIR")))? {
+    for entry in std::fs::read_dir(&syntax_dir)? {
         let entry = entry?;
         if entry.file_type().is_ok_and(|f| f.is_dir()) {
             let path = entry.path();
+            // Skip slint-sc tests when the feature is not enabled
+            #[cfg(not(feature = "slint-sc"))]
+            if path.file_name().is_some_and(|n| n == "slint-sc") {
+                continue;
+            }
             for test_entry in path.read_dir()? {
                 let test_entry = test_entry?;
                 let path = test_entry.path();
-                if let Some(ext) = path.extension() {
-                    if (ext == "60" || ext == "slint")
-                        && pattern
-                            .as_ref()
-                            .map(|p| p.is_match(&path.to_string_lossy()))
-                            .unwrap_or(true)
-                    {
-                        test_entries.push(path);
-                    }
+                if let Some(ext) = path.extension()
+                    && (ext == "60" || ext == "slint")
+                    && pattern.as_ref().map(|p| p.is_match(&path.to_string_lossy())).unwrap_or(true)
+                {
+                    test_entries.push(path);
                 }
             }
         }
     }
 
-    let success = test_entries
+    let results: Vec<(String, bool)> = test_entries
         .par_iter()
-        .try_fold(
-            || true,
-            |mut success, path| {
-                success &= process_file(path, update)?;
-                Ok::<bool, std::io::Error>(success)
-            },
-        )
-        .try_reduce(|| true, |success, result| Ok(success & result))?;
+        .map(|path| {
+            let ok = process_file(path, update)?;
+            let name = path
+                .strip_prefix(&syntax_dir)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            Ok::<_, std::io::Error>((name, ok))
+        })
+        .collect::<Result<_, _>>()?;
 
-    assert!(success);
+    if let Some(report) = std::env::var_os("SLINT_TEST_REPORT") {
+        let entries: Vec<(String, String, bool)> = results
+            .iter()
+            // The repository-relative source of each test file, for linking.
+            .map(|(name, ok)| (name.clone(), format!("internal/compiler/tests/syntax/{name}"), *ok))
+            .collect();
+        write_report(&entries, "syntax-tests", std::path::Path::new(&report))?;
+    }
+
+    assert!(results.iter().all(|(_, ok)| *ok));
 
     Ok(())
+}
+
+/// Write the per-case `(name, source path, passed)` results as CTRF-style
+/// JSON, for the safety manual's Test Results page.
+fn write_report(
+    results: &[(String, String, bool)],
+    tool: &str,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    let tests: Vec<_> = results
+        .iter()
+        .map(|(name, file_path, ok)| {
+            serde_json::json!({
+                "name": name,
+                "filePath": file_path,
+                "status": if *ok { "passed" } else { "failed" },
+            })
+        })
+        .collect();
+    let failed = results.iter().filter(|(_, _, ok)| !ok).count();
+    let report = serde_json::json!({
+        "results": {
+            "tool": { "name": tool },
+            "summary": {
+                "tests": results.len(),
+                "passed": results.len() - failed,
+                "failed": failed,
+            },
+            "tests": tests,
+        }
+    });
+    std::fs::write(path, serde_json::to_string_pretty(&report).unwrap())
 }
 
 fn process_file(path: &std::path::Path, update: bool) -> std::io::Result<bool> {
@@ -88,12 +147,115 @@ fn process_file(path: &std::path::Path, update: bool) -> std::io::Result<bool> {
             "{path:?} does not contains BOM while it should"
         )));
     }
+    if path.to_str().unwrap_or("").contains("crlf-") && !source.contains("\r\n") {
+        // make sure that the CRLF line terminators weren't normalized away by some tools
+        return Err(std::io::Error::other(format!(
+            "{path:?} does not contain CRLF line terminators while it should"
+        )));
+    }
     std::panic::catch_unwind(|| process_file_source(path, source, false, update)).unwrap_or_else(
         |err| {
             println!("Panic while processing {}: {:?}", path.display(), err);
             Ok(false)
         },
     )
+}
+
+struct ExpectedDiagnostic {
+    start: Option<usize>,
+    end: Option<usize>,
+    level: DiagnosticLevel,
+    message: String,
+    comment_range: Range<usize>,
+}
+
+fn extract_expected_diags(source: &str) -> Vec<ExpectedDiagnostic> {
+    let mut expected = Vec::new();
+    // Find expected errors in the file. The first caret (^) points to the expected column. The number of
+    // carets refers to the number of lines to go back. This is useful when one line of code produces multiple
+    // errors or warnings.
+    let re = regex::Regex::new(
+        r"\n *//[^\n\^\|<>]*((\^)|(\|)|((>)?( *<)?))(\^*)(<*)(error|warning|note)\{([^\n]*)\}",
+    )
+    .unwrap();
+
+    for m in re.captures_iter(source) {
+        let line_begin_offset = m.get(0).unwrap().start();
+        let start_column = m.get(1).unwrap().start()
+            - line_begin_offset
+            // Allow shifting columns with <
+            - m.get(8).map(|group| group.as_str().len()).unwrap_or_default();
+
+        let lines_to_source = m.get(7).map(|group| group.as_str().len()).unwrap_or_default() + 1;
+        let warning_or_error = m.get(9).unwrap().as_str();
+        let expected_message = m
+            .get(10)
+            .unwrap()
+            .as_str()
+            .replace('↵', "\n")
+            .replace('📂', env!("CARGO_MANIFEST_DIR"));
+        let comment_range = m.get(0).unwrap().range();
+
+        let mut line_counter = 0;
+        let mut line_offset = source[..line_begin_offset].rfind('\n').unwrap_or(0);
+        let mut offset = loop {
+            line_counter += 1;
+            if line_counter >= lines_to_source {
+                break line_offset + start_column;
+            }
+            if let Some(o) = source[..line_offset].rfind('\n') {
+                line_offset = o;
+            } else {
+                break 1;
+            };
+        };
+
+        let mut start = None;
+        let mut end = None;
+        if m.get(2).is_some() {
+            // ^warning{...}
+            start = Some(offset);
+            end = Some(offset);
+        } else if m.get(3).is_some() {
+            // |warning{...}
+            start = Some(offset);
+            end = Some(offset - 1);
+        } else {
+            // >
+            if m.get(5).is_some() {
+                start = Some(offset);
+                offset += 1;
+            }
+            // < (including spaces before)
+            if let Some(range_length) = m.get(6).map(|group| group.as_str().len()) {
+                end = Some(offset + range_length - 1);
+            }
+        }
+
+        // Windows edge-case, if the end falls on a newline, it should span the entire
+        // newline character, which is two characters, not one.
+        if let Some(end_offset) = end
+            && source.get(end_offset..=(end_offset + 1)) == Some("\r\n")
+        {
+            end = Some(end_offset + 1);
+        }
+
+        let expected_diag_level = match warning_or_error {
+            "warning" => DiagnosticLevel::Warning,
+            "error" => DiagnosticLevel::Error,
+            "note" => DiagnosticLevel::Note,
+            _ => panic!("Unsupported diagnostic level {warning_or_error}"),
+        };
+
+        expected.push(ExpectedDiagnostic {
+            start,
+            end,
+            level: expected_diag_level,
+            message: expected_message,
+            comment_range,
+        });
+    }
+    expected
 }
 
 fn process_diagnostics(
@@ -107,7 +269,7 @@ fn process_diagnostics(
 
     let path = canonical(path);
 
-    let mut diags = compile_diagnostics
+    let diags = compile_diagnostics
         .iter()
         .filter(|d| {
             canonical(
@@ -123,44 +285,14 @@ fn process_diagnostics(
         .filter_map(|(i, c)| if c == b'\n' { Some(i) } else { None })
         .collect::<Vec<usize>>();
 
-    let diag_copy = diags.clone();
-    let mut captures = Vec::new();
+    let mut expected = extract_expected_diags(source);
+    let captures: Vec<_> =
+        expected.iter().map(|expected| &expected.comment_range).cloned().collect();
 
     // Find expected errors in the file. The first caret (^) points to the expected column. The number of
     // carets refers to the number of lines to go back. This is useful when one line of code produces multiple
     // errors or warnings.
-    let re = regex::Regex::new(r"\n *//[^\n\^]*(\^+)(error|warning)\{([^\n]*)\}").unwrap();
-    for m in re.captures_iter(source) {
-        let line_begin_offset = m.get(0).unwrap().start();
-        let column = m.get(1).unwrap().start() - line_begin_offset;
-        let lines_to_source = m.get(1).unwrap().as_str().len();
-        let warning_or_error = m.get(2).unwrap().as_str();
-        let expected_message =
-            m.get(3).unwrap().as_str().replace('↵', "\n").replace('📂', env!("CARGO_MANIFEST_DIR"));
-        if update {
-            captures.push(m.get(0).unwrap().range());
-        }
-
-        let mut line_counter = 0;
-        let mut line_offset = source[..line_begin_offset].rfind('\n').unwrap_or(0);
-        let offset = loop {
-            line_counter += 1;
-            if line_counter >= lines_to_source {
-                break line_offset + column;
-            }
-            if let Some(o) = source[..line_offset].rfind('\n') {
-                line_offset = o;
-            } else {
-                break 1;
-            };
-        };
-
-        let expected_diag_level = match warning_or_error {
-            "warning" => DiagnosticLevel::Warning,
-            "error" => DiagnosticLevel::Error,
-            _ => panic!("Unsupported diagnostic level {warning_or_error}"),
-        };
-
+    for diag in &diags {
         fn compare_message(message: &str, expected_message: &str) -> bool {
             if message == expected_message {
                 return true;
@@ -173,41 +305,80 @@ fn process_diagnostics(
             false
         }
 
-        match diags.iter().position(|e| {
-            let (l, c) = e.line_column();
-            let o = lines.get(l.wrapping_sub(2)).unwrap_or(&0) + c;
-            o == offset
-                && compare_message(e.message(), &expected_message)
-                && e.level() == expected_diag_level
-        }) {
-            Some(idx) => {
-                diags.remove(idx);
+        let (l, c) = diag.line_column();
+        let diag_start = lines.get(l.wrapping_sub(2)).unwrap_or(&0) + c;
+        // end_line_column is not (yet) available via the public API, so use the private API
+        // instead.
+        let (l, c) = diagnostics::diagnostic_end_line_column_with_format(diag, ByteFormat::Utf8);
+        let diag_end = lines.get(l.wrapping_sub(2)).unwrap_or(&0) + c - 1;
+
+        let expected_start = expected.iter().position(|expected| {
+            Some(diag_start) == expected.start
+                && compare_message(diag.message(), &expected.message)
+                && diag.level() == expected.level
+                && (expected.end.is_none() || Some(diag_end) == expected.end)
+        });
+        let expected_end = expected.iter().position(|expected| {
+            Some(diag_end) == expected.end
+                && compare_message(diag.message(), &expected.message)
+                && diag.level() == expected.level
+                && (expected.start.is_none() || Some(diag_start) == expected.start)
+        });
+
+        let found_match = match (expected_start, expected_end) {
+            (Some(start), Some(end)) => {
+                // Found both start and end, success!
+                // Make sure to remove the larger index first, so the
+                // smaller index remains valid.
+                expected.remove(start.max(end));
+                if start != end {
+                    expected.remove(start.min(end));
+                }
+                true
             }
-            None => {
-                success = false;
-                println!("{path:?}: {warning_or_error} not found at offset {offset}: {expected_message:?}");
+            (Some(start), None) => {
+                println!("{path:?}: Could not find end of error/warning: {diag:#?}");
+                expected.remove(start);
+                false
+            }
+            (None, Some(end)) => {
+                println!("{path:?}: Could not find start of error/warning: {diag:#?}");
+                expected.remove(end);
+                false
+            }
+            // TODO: Remove start/end if only one was found
+            (None, None) => {
+                println!("{path:?}: Unexpected error/warning: {diag:#?}, {diag_start}, {diag_end}",);
+                false
+            }
+        };
+
+        if !found_match {
+            success = false;
+
+            #[cfg(feature = "display-diagnostics")]
+            if !_silent {
+                let mut to_report = BuildDiagnostics::default();
+                to_report.push_compiler_error((*diag).clone());
+                to_report.print();
             }
         }
     }
 
-    if !diags.is_empty() {
-        println!("{path:?}: Unexpected errors/warnings: {diags:#?}");
-
-        #[cfg(feature = "display-diagnostics")]
-        if !_silent {
-            let mut to_report = BuildDiagnostics::default();
-            for d in diags {
-                to_report.push_compiler_error(d.clone());
-            }
-            to_report.print();
-        }
-
+    for expected in expected {
         success = false;
+        println!(
+            "{path:?}: {level:?} not found at offset {start:?}-{end:?}: {message:?}",
+            level = expected.level,
+            start = expected.start,
+            end = expected.end,
+            message = expected.message
+        );
     }
 
     if !success && update {
         let mut source = source.to_string();
-        self::update(diag_copy, &mut source, lines, &captures);
+        self::update(&diags, &mut source, lines, &captures);
         std::fs::write(path, source).unwrap();
     }
 
@@ -216,7 +387,7 @@ fn process_diagnostics(
 
 /// Rewrite the source to remove the old comments and add accurate error comments
 fn update(
-    mut diags: Vec<&Diagnostic>,
+    diags: &[&Diagnostic],
     source: &mut String,
     mut lines: Vec<usize>,
     to_remove: &[std::ops::Range<usize>],
@@ -230,42 +401,65 @@ fn update(
         }
     }
 
-    diags.sort_by_key(|d| {
-        let (l, c) = d.line_column();
-        (usize::MAX - l, c)
-    });
-
-    let mut last_line = 0;
-    let mut last_line_adjust = 0;
+    let mut last_line_adjust = Vec::from_iter(std::iter::repeat_n(0, lines.len()));
 
     for d in diags {
-        let (l, c) = d.line_column();
-        if c < 3 {
-            panic!("Error message cannot be on the column < 3: {d:?}")
-        }
+        let mut insert_range_at = |range: &str, l, c: usize| {
+            let column_adjust = if c < 3 { "<".repeat(3 - c) } else { "".to_string() };
+            let byte_offset = lines[l - 1] + 1;
+            let level = match d.level() {
+                DiagnosticLevel::Error => "error",
+                DiagnosticLevel::Warning => "warning",
+                DiagnosticLevel::Note => "note",
+                _ => todo!(),
+            };
+            let to_insert = format!(
+                "//{indent}{range}{adjust}{column_adjust}{level}{{{message}}}\n",
+                indent = " ".repeat(c.max(3) - 3),
+                adjust = "^".repeat(last_line_adjust[l - 1]),
+                message = d.message().replace('\n', "↵").replace(env!("CARGO_MANIFEST_DIR"), "📂")
+            );
+            if byte_offset > source.len() {
+                source.push('\n');
+            }
+            source.insert_str(byte_offset, &to_insert);
+            for line_offset in lines.iter_mut().skip(l - 1) {
+                *line_offset += to_insert.len();
+            }
+            last_line_adjust[l - 1] += 1;
+        };
 
-        if last_line == l {
-            last_line_adjust += 1;
+        let (line_start, column_start) = d.line_column();
+        // end_line_column is not (yet) available via the public API, so use the private API
+        // instead.
+        let (line_end, column_end) =
+            diagnostics::diagnostic_end_line_column_with_format(d, ByteFormat::Utf8);
+
+        // The end column is exclusive, therefore use - 1 here
+        let range = if d.length() <= 1 {
+            // Single-character diagnostic, use "^" for the marker for 1-character diagnostics,
+            // use "|" for 0-character diagnostics
+            if d.length() == 0 { "|" } else { "^" }.to_owned()
         } else {
-            last_line = l;
-            last_line_adjust = 0;
-        }
+            let end = if line_start == line_end {
+                // Same line, we can insert the closing "<"
+                " ".repeat(column_end - column_start - 2) + "<"
+            } else {
+                // End is on a different line, we'll emit it later
+                "".to_owned()
+            };
+            format!(">{end}")
+        };
 
-        let byte_offset = lines[l - 1] + 1;
+        insert_range_at(&range, line_start, column_start);
 
-        let to_insert = format!(
-            "//{indent}^{adjust}{error_or_warning}{{{message}}}\n",
-            indent = " ".repeat(c - 3),
-            adjust = "^".repeat(last_line_adjust),
-            error_or_warning =
-                if d.level() == DiagnosticLevel::Error { "error" } else { "warning" },
-            message = d.message().replace('\n', "↵").replace(env!("CARGO_MANIFEST_DIR"), "📂")
-        );
-        if byte_offset > source.len() {
-            source.push('\n');
+        // Insert the closing `<` at another line if necessary
+        // Edge-case: If a single-character diagnostic is on a newline character (\n), its
+        // end_line_column is technically on a new line, but the single ^ marker is enough, so no
+        // closing character is needed.
+        if line_start != line_end && d.length() > 1 {
+            insert_range_at("<", line_end, column_end - 1);
         }
-        source.insert_str(byte_offset, &to_insert);
-        lines[l - 1] += to_insert.len();
     }
 }
 
@@ -284,14 +478,34 @@ fn process_file_source(
         i_slint_compiler::parser::parse(source.clone(), Some(path), &mut parse_diagnostics);
 
     let has_parse_error = parse_diagnostics.has_errors();
-    let mut compiler_config = i_slint_compiler::CompilerConfiguration::new(
-        i_slint_compiler::generator::OutputFormat::Interpreter,
-    );
+    // Only the tests in the `slint-sc` directory are Slint SC tests; don't
+    // match the whole path, which depends on the name of the checkout.
+    #[cfg(feature = "slint-sc")]
+    let output_format =
+        if path.parent().and_then(|p| p.file_name()).is_some_and(|n| n == "slint-sc") {
+            i_slint_compiler::generator::OutputFormat::SlintSc
+        } else {
+            i_slint_compiler::generator::OutputFormat::Interpreter
+        };
+    #[cfg(not(feature = "slint-sc"))]
+    let output_format = i_slint_compiler::generator::OutputFormat::Interpreter;
+    #[cfg(feature = "slint-sc")]
+    let is_slint_sc = matches!(output_format, i_slint_compiler::generator::OutputFormat::SlintSc);
+    #[cfg(not(feature = "slint-sc"))]
+    let is_slint_sc = false;
+    let mut compiler_config = i_slint_compiler::CompilerConfiguration::new(output_format);
+    compiler_config.library_paths = [(
+        "test-lib".into(),
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/typeloader/library").into(),
+    )]
+    .into_iter()
+    .collect();
     compiler_config.embed_resources = i_slint_compiler::EmbedResourcesKind::OnlyBuiltinResources;
     compiler_config.enable_experimental = true;
     compiler_config.style = Some("fluent".into());
     compiler_config.components_to_generate =
-        if source.contains("config:generate_all_exported_windows") {
+        if is_slint_sc || source.contains("config:generate_all_exported_windows") {
+            // Slint SC always compiles the exported windows
             ComponentSelection::ExportedWindows
         } else {
             // Otherwise we'd have lots of warnings about not inheriting Window
@@ -365,7 +579,33 @@ export component Foo inherits Window foo { width: 10px; }
     assert!(process(
         r#"
 export component Foo inherits Window foo { width: 10px; }
-//                                   ^error{Syntax error: expected '{'}
+//                                   > <error{Syntax error: expected '{'}
+    "#
+    )?);
+
+    // also when it's shifted up by an additional ^
+    assert!(process(
+        r#"
+export component Foo inherits Window foo { width: 10px; }
+
+//                                   > <^error{Syntax error: expected '{'}
+    "#
+    )?);
+
+    // also when it's shifted left by additional <
+    assert!(process(
+        r#"
+export component Foo inherits Window foo { width: 10px; }
+//                                      > <<<<error{Syntax error: expected '{'}
+    "#
+    )?);
+
+    // or split into multiple lines
+    assert!(process(
+        r#"
+export component Foo inherits Window foo { width: 10px; }
+//                                   >error{Syntax error: expected '{'}
+//                                     <^error{Syntax error: expected '{'}
     "#
     )?);
 
@@ -373,7 +613,7 @@ export component Foo inherits Window foo { width: 10px; }
     assert!(!process(
         r#"
 export component Foo inherits Window foo { width: 10px; }
-//                                    ^error{Syntax error: expected '{'}
+//                                    > <error{Syntax error: expected '{'}
     "#
     )?);
 
@@ -382,7 +622,7 @@ export component Foo inherits Window foo { width: 10px; }
         r#"
 export component Foo inherits Window foo { width: 10px; }
 
-//                                   ^error{Syntax error: expected '{'}
+//                                   > <error{Syntax error: expected '{'}
     "#
     )?);
 
@@ -390,7 +630,7 @@ export component Foo inherits Window foo { width: 10px; }
     assert!(!process(
         r#"
 export component Foo inherits Window foo { width: 10px; }
-//                                   ^error{foo_bar}
+//                                   > <error{foo_bar}
     "#
     )?);
 
@@ -399,13 +639,16 @@ export component Foo inherits Window foo { width: 10px; }
         r#"
 
 export component Foo inherits Window foo { width: 10px; }
-//                                   ^^error{Syntax error: expected '{'}
+//                                   > <^^error{Syntax error: expected '{'}
     "#
     )?);
 
     // Even on windows, it should work
     assert!(process(
-        "\r\nexport component Foo inherits Window foo { width: 10px; }\r\n//                                   ^error{Syntax error: expected '{'}\r\n"
+        "\r\n\
+export component Foo inherits Window foo { width: 10px; }\r\n\
+//                                   > <error{Syntax error: expected '{'}\r\n\
+"
     )?);
 
     Ok(())

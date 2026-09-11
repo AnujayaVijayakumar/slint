@@ -3,7 +3,7 @@
 
 
 export SubElements := Rectangle {
-//                 ^warning{':=' to declare a component is deprecated. The new syntax declare components with 'component MyComponent {'. Read the documentation for more info}
+//                 ><warning{':=' to declare a component is deprecated. The new syntax declare components with 'component MyComponent {'. Read the documentation for more info}
 
     background: blue;
 
@@ -13,7 +13,22 @@ export SubElements := Rectangle {
 
     Image {
         source: @image-url("builtin:/common/does-not-exist.svg");
-//              ^error{Cannot find image file builtin:/common/does-not-exist.svg}
+//              >                                              <error{Cannot find image file builtin:/common/does-not-exist.svg}
+    }
+
+    Image {
+        source: @image-url("data:text/plain;base64,SGVsbG8=");
+//              >                                           <error{Unsupported media type: text/plain. Only image/* data URLs are supported}
+    }
+
+    Image {
+        source: @image-url("data:not-valid");
+//              >                          <error{Invalid data URI: data url is missing comma delimiting attributes and body}
+    }
+
+    Image {
+        source: @image-url("data:image/png;base64,!!!invalid-base64!!!");
+//              >                                                      <error{Invalid data URI payload: symbol with codepoint 33 not expected}
     }
 
     Rectangle {

@@ -1,4 +1,3 @@
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: MIT -->
 
 ### `todo-mvc`
 
@@ -6,4 +5,4 @@ A simple todo application based on the [Model View Controller](https://en.wikipe
 
 | `.slint` Design | Rust Source | Online wasm Preview | Open in SlintPad |
 | --- | --- | --- | --- |
-| [`index.slint`](./ui/index.slint) | [`main.rs`](./rust/main.rs) | [Online simulation](https://slint.dev/snapshots/master/demos/todo-mvc/) | [Preview in Online Code Editor](https://slint.dev/snapshots/master/editor?load_url=https://raw.githubusercontent.com/slint-ui/slint/master/examples/todo-mvc/ui/index.slint) |
+| [`index.slint`](./ui/index.slint) | [`main.rs`](./rust/src/main.rs) | [Online simulation](https://slint.dev/snapshots/master/demos/todo-mvc/) | [Preview in Online Code Editor](https://slint.dev/snapshots/master/editor?load_url=https://raw.githubusercontent.com/slint-ui/slint/master/examples/todo-mvc/ui/index.slint) |

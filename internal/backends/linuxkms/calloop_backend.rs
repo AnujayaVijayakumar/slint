@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore CLOEXEC GETFL NOCTTY NONBLOCK
 use std::cell::RefCell;
 #[cfg(not(feature = "libseat"))]
 use std::fs::OpenOptions;
@@ -16,9 +17,13 @@ use std::sync::{Arc, Mutex};
 use calloop::EventLoop;
 use i_slint_core::platform::PlatformError;
 
+use crate::BackendBuilder;
 use crate::fullscreenwindowadapter::FullscreenWindowAdapter;
 
-#[cfg(not(any(target_family = "windows", target_vendor = "apple", target_arch = "wasm32")))]
+#[cfg(all(
+    feature = "libinput",
+    not(any(target_family = "windows", target_vendor = "apple", target_arch = "wasm32"))
+))]
 mod input;
 
 #[derive(Clone)]
@@ -63,39 +68,46 @@ impl i_slint_core::platform::EventLoopProxy for Proxy {
 }
 
 pub struct Backend {
+    context: std::cell::OnceCell<i_slint_core::SlintContextWeak>,
     #[cfg(feature = "libseat")]
     seat: Rc<RefCell<libseat::Seat>>,
     window: RefCell<Option<Rc<FullscreenWindowAdapter>>>,
     user_event_receiver: RefCell<Option<calloop::channel::Channel<Box<dyn FnOnce() + Send>>>>,
     proxy: Proxy,
-    renderer_factory: for<'a> fn(
-        &'a crate::DeviceOpener,
-    ) -> Result<
-        Box<dyn crate::fullscreenwindowadapter::FullscreenRenderer>,
-        PlatformError,
-    >,
+    renderer_factory:
+        fn(
+            &crate::DeviceOpener,
+            Option<&i_slint_core::graphics::RequestedGraphicsAPI>,
+        )
+            -> Result<Box<dyn crate::fullscreenwindowadapter::FullscreenRenderer>, PlatformError>,
+    requested_graphics_api: Option<i_slint_core::graphics::RequestedGraphicsAPI>,
     sel_clipboard: RefCell<Option<String>>,
     clipboard: RefCell<Option<String>>,
+    #[cfg(feature = "libinput")]
+    libinput_event_hook: Option<Box<dyn Fn(&::input::Event) -> bool>>,
 }
 
 impl Backend {
-    pub fn new() -> Result<Self, PlatformError> {
-        Self::new_with_renderer_by_name(None)
-    }
-    pub fn new_with_renderer_by_name(renderer_name: Option<&str>) -> Result<Self, PlatformError> {
+    pub fn build(builder: BackendBuilder) -> Result<Self, PlatformError> {
         let (user_event_sender, user_event_receiver) = calloop::channel::channel();
 
-        let renderer_factory = match renderer_name {
-            #[cfg(feature = "renderer-skia-vulkan")]
-            Some("skia-vulkan") => crate::renderer::skia::SkiaRendererAdapter::new_vulkan,
+        let renderer_factory = match builder.renderer_name.as_deref() {
+            #[cfg(enable_skia_wgpu)]
+            Some("skia-vulkan") | Some("skia-wgpu") => {
+                crate::renderer::skia::SkiaRendererAdapter::new_wgpu
+            }
             #[cfg(feature = "renderer-skia-opengl")]
             Some("skia-opengl") => crate::renderer::skia::SkiaRendererAdapter::new_opengl,
-            #[cfg(any(feature = "renderer-skia-opengl", feature = "renderer-skia-vulkan"))]
+            #[cfg(enable_skia)]
             Some("skia-software") => crate::renderer::skia::SkiaRendererAdapter::new_software,
             #[cfg(feature = "renderer-femtovg")]
             Some("femtovg") => crate::renderer::femtovg::FemtoVGRendererAdapter::new,
+            #[cfg(feature = "renderer-femtovg-wgpu")]
+            Some("femtovg-wgpu") => crate::renderer::femtovg_wgpu::FemtoVGWgpuRendererAdapter::new,
             #[cfg(feature = "renderer-software")]
             Some("software") => crate::renderer::sw::SoftwareRendererAdapter::new,
+            #[cfg(feature = "renderer-vello")]
+            Some("vello") => crate::renderer::vello::VelloRendererAdapter::new,
             None => crate::renderer::try_skia_then_femtovg_then_software,
             Some(renderer_name) => {
                 eprintln!(
@@ -130,24 +142,32 @@ impl Backend {
             if seat.dispatch(5000).map_err(|e| format!("Error waiting for seat activation: {e}"))?
                 == 0
             {
-                return Err(format!("Timeout while waiting to activate session").into());
+                return Err("Timeout while waiting to activate session".to_string().into());
             }
         }
 
         Ok(Backend {
+            context: Default::default(),
             #[cfg(feature = "libseat")]
             seat: Rc::new(RefCell::new(seat)),
             window: Default::default(),
             user_event_receiver: RefCell::new(Some(user_event_receiver)),
             proxy: Proxy::new(user_event_sender),
             renderer_factory,
+            requested_graphics_api: builder.requested_graphics_api,
             sel_clipboard: Default::default(),
             clipboard: Default::default(),
+            #[cfg(feature = "libinput")]
+            libinput_event_hook: builder.libinput_event_hook,
         })
     }
 }
 
 impl i_slint_core::platform::Platform for Backend {
+    fn bind_context(&self, ctx: i_slint_core::SlintContextWeak, _: i_slint_core::InternalToken) {
+        let _ = self.context.set(ctx);
+    }
+
     fn create_window_adapter(
         &self,
     ) -> Result<std::rc::Rc<dyn i_slint_core::window::WindowAdapter>, PlatformError> {
@@ -194,7 +214,8 @@ impl i_slint_core::platform::Platform for Backend {
                     .map_err(|e| format!("Failed to parse SLINT_KMS_ROTATION: {e}"))
             })?;
 
-        let renderer = (self.renderer_factory)(&device_accessor)?;
+        let renderer =
+            (self.renderer_factory)(&device_accessor, self.requested_graphics_api.as_ref())?;
         let adapter = FullscreenWindowAdapter::new(renderer, rotation)?;
 
         *self.window.borrow_mut() = Some(adapter.clone());
@@ -209,19 +230,31 @@ impl i_slint_core::platform::Platform for Backend {
         let loop_signal = event_loop.get_signal();
 
         *self.proxy.loop_signal.lock().unwrap() = Some(loop_signal.clone());
+        if let Some(adapter) = self.window.borrow().as_ref() {
+            adapter.set_loop_signal(loop_signal.clone());
+        }
         let quit_loop = self.proxy.quit_loop.clone();
 
+        #[cfg(feature = "libinput")]
         let mouse_position_property = input::LibInputHandler::init(
             &self.window,
             &event_loop.handle(),
             #[cfg(feature = "libseat")]
             &self.seat,
+            &self.libinput_event_hook,
         )?;
 
+        // Without libinput there is no pointer to track, so the cursor property
+        // stays empty for the lifetime of the loop.
+        #[cfg(not(feature = "libinput"))]
+        let mouse_position_property = Rc::pin(i_slint_core::Property::<
+            Option<i_slint_core::api::LogicalPosition>,
+        >::new(None));
+
         let Some(user_event_receiver) = self.user_event_receiver.borrow_mut().take() else {
-            return Err(
-                format!("Re-entering the linuxkms event loop is currently not supported").into()
-            );
+            return Err("Re-entering the linuxkms event loop is currently not supported"
+                .to_string()
+                .into());
         };
 
         let callbacks_to_invoke_per_iteration = Rc::new(RefCell::new(Vec::new()));
@@ -246,8 +279,14 @@ impl i_slint_core::platform::Platform for Backend {
 
         quit_loop.store(false, std::sync::atomic::Ordering::Release);
 
+        let ctx = self
+            .context
+            .get()
+            .and_then(|ctx| ctx.upgrade())
+            .expect("the event loop runs inside the context that owns this backend");
+
         while !quit_loop.load(std::sync::atomic::Ordering::Acquire) {
-            i_slint_core::platform::update_timers_and_animations();
+            ctx.update_timers_and_animations();
 
             // Only after updating the animation tick, invoke callbacks from invoke_from_event_loop(). They
             // might set animated properties, which requires an up-to-date start time.
@@ -259,7 +298,7 @@ impl i_slint_core::platform::Platform for Backend {
                 adapter.clone().render_if_needed(mouse_position_property.as_ref())?;
             };
 
-            let next_timeout = i_slint_core::platform::duration_until_next_timer_update();
+            let next_timeout = ctx.duration_until_next_timer_update();
             event_loop
                 .dispatch(next_timeout, &mut loop_data)
                 .map_err(|e| format!("Error dispatch events: {e}"))?;
@@ -296,5 +335,3 @@ impl i_slint_core::platform::Platform for Backend {
 
 #[derive(Default)]
 pub struct LoopData {}
-
-pub type EventLoopHandle<'a> = calloop::LoopHandle<'a, LoopData>;

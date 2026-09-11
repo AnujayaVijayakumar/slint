@@ -1,4 +1,3 @@
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0 -->
 
 # Contributing
 
@@ -73,8 +72,8 @@ Once all tests are passing this list can be removed.
   - [x] Empty expression
   - [ ] Empty expression with semi-colon
 
-## Contributor License Agreement
+## License
 
-The same license agreement exists for the tree-sitter parser as the rest of the repository
+Contributions to the tree-sitter parser are licensed under the same terms as the rest of the repository.
 
-See: [Contributor License Agreement (CLA)](https://cla-assistant.io/slint-ui/slint)
+See the [main CONTRIBUTING.md](https://github.com/slint-ui/slint/blob/master/CONTRIBUTING.md#license) for details.

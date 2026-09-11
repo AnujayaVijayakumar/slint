@@ -3,13 +3,38 @@
 
 // cSpell: ignore datetime dotdot gettext
 
-use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
+use anyhow::anyhow;
 use std::cell::RefCell;
 use std::str::FromStr;
 use std::sync::LazyLock;
 use std::{path::Path, path::PathBuf};
+
+/// Compute a relative path from `from` to `to` using ".." components.
+fn diff_paths(to: &Path, from: &Path) -> PathBuf {
+    let to = to.canonicalize().unwrap_or_else(|_| to.to_path_buf());
+    let from = from.canonicalize().unwrap_or_else(|_| from.to_path_buf());
+    let mut to_parts = to.components().peekable();
+    let mut from_parts = from.components().peekable();
+    // Skip common prefix
+    while let (Some(a), Some(b)) = (to_parts.peek(), from_parts.peek()) {
+        if a == b {
+            to_parts.next();
+            from_parts.next();
+        } else {
+            break;
+        }
+    }
+    let mut result = PathBuf::new();
+    for _ in from_parts {
+        result.push("..");
+    }
+    for part in to_parts {
+        result.push(part);
+    }
+    result
+}
 
 #[derive(Copy, Clone, Debug)]
 struct LicenseTagStyle {
@@ -25,6 +50,19 @@ struct LicenseTagStyle {
 
 impl LicenseTagStyle {
     fn c_style_comment_style() -> Self {
+        Self {
+            tag_start: "/* Copyright © ",
+            line_prefix: "",
+            line_indentation: " ",
+            line_break: "\n",
+            tag_end: SPDX_LICENSE_LINE,
+            overall_start: "",
+            overall_end: " */\n",
+            is_real_end: false,
+        }
+    }
+
+    fn cpp_style_comment_style() -> Self {
         Self {
             tag_start: "// Copyright © ",
             line_prefix: "//",
@@ -66,13 +104,13 @@ impl LicenseTagStyle {
     fn html_comment_style() -> Self {
         Self {
             tag_start: "<!-- Copyright © ",
-            line_prefix: " ",
-            line_indentation: "",
-            line_break: " ;",
-            tag_end: " -->",
-            overall_start: "<!--",
+            line_prefix: "<!--",
+            line_indentation: " ",
+            line_break: " -->\n",
+            tag_end: "-->\n<!--",
+            overall_start: "",
             overall_end: " -->\n",
-            is_real_end: true,
+            is_real_end: false,
         }
     }
 
@@ -90,6 +128,7 @@ impl LicenseTagStyle {
     }
 }
 
+#[derive(Debug)]
 struct SourceFileWithTags<'a> {
     source: &'a str,
     tag_style: &'a LicenseTagStyle,
@@ -128,19 +167,13 @@ impl<'a> SourceFileWithTags<'a> {
 
         // Find default gettext copyright statements
         let location = location.or_else(|| {
-            let Some(start) =
-                source.find("# SOME DESCRIPTIVE TITLE").or_else(|| source.find("# Copyright (C) "))
-            else {
-                return None;
-            };
+            let start = source
+                .find("# SOME DESCRIPTIVE TITLE")
+                .or_else(|| source.find("# Copyright (C) "))?;
             let end_line = "# This file is distributed under the same license as the ";
-            let Some(end) = source[start..].find(end_line) else {
-                return None;
-            };
+            let end = source[start..].find(end_line)?;
             let end = start + end + end_line.len();
-            let Some(end_nl) = source[end..].find('\n') else {
-                return None;
-            };
+            let end_nl = source[end..].find('\n')?;
             Some(std::ops::Range { start, end: end + end_nl + 1 })
         });
 
@@ -160,7 +193,7 @@ impl<'a> SourceFileWithTags<'a> {
         &self.source[tag_loc.start..tag_loc.end]
     }
 
-    fn has_license_header(&self, expected_tag: &LicenseHeader) -> bool {
+    fn tag_matches(&self, expected_tag: &LicenseHeader, license: &str) -> bool {
         let tag_loc = match &self.tag_location {
             Some(loc) => loc,
             None => return false,
@@ -172,9 +205,8 @@ impl<'a> SourceFileWithTags<'a> {
         let mut tag_entries = found_tag.split(self.tag_style.line_break);
         let Some(_copyright_entry) = tag_entries.next() else { return false };
         // Require _some_ license ...
-        let Some(_) = tag_entries.next() else { return false };
-        // ... as well as the SPDX license line at the start
-        expected_tag.0 == SPDX_LICENSE_LINE
+        let Some(license_entry) = tag_entries.next() else { return false };
+        expected_tag.to_string(self.tag_style, license) == license_entry
     }
 
     fn replace_tag(&self, replacement: &LicenseHeader, license: &str) -> String {
@@ -228,7 +260,7 @@ impl<'a> SourceFileWithTags<'a> {
 
 #[test]
 fn test_license_tag_c_style() {
-    let style = LicenseTagStyle::c_style_comment_style();
+    let style = LicenseTagStyle::cpp_style_comment_style();
     {
         let source = format!(
             r#"// Copyright © something <bar@something.com>
@@ -375,14 +407,16 @@ fn test_license_tag_html_style() {
     let style = LicenseTagStyle::html_comment_style();
     {
         let source = format!(
-            r#"<!-- Copyright © something <bar@something.com> ; SP{}-License-Identifier: {} -->
+            r#"<!-- Copyright © something <bar@something.com> -->
+<!-- SP{}-License-Identifier: {} -->
 blah"#,
             "DX", EXPECTED_SPDX_EXPRESSION
         );
         let test_source = SourceFileWithTags::new(&source, &style);
         assert_eq!(
             test_source.replace_tag(&LicenseHeader("TEST_LICENSE"), "foo"),
-            r#"<!-- Copyright © something <bar@something.com> ; TEST_LICENSE -->
+            r#"<!-- Copyright © something <bar@something.com> -->
+<!-- TEST_LICENSE -->
 
 blah"#
                 .to_string()
@@ -390,7 +424,8 @@ blah"#
     }
     {
         let source = format!(
-            r#"<!-- Copyright © something <bar@something.com> ; SP{}-License-Identifier: {} -->
+            r#"<!-- Copyright © something <bar@something.com> -->
+<!-- SP{}-License-Identifier: {} -->
 
 blah"#,
             "DX", EXPECTED_SPDX_EXPRESSION
@@ -398,7 +433,8 @@ blah"#,
         let test_source = SourceFileWithTags::new(&source, &style);
         assert_eq!(
             test_source.replace_tag(&LicenseHeader("TEST_LICENSE"), "bar"),
-            r#"<!-- Copyright © something <bar@something.com> ; TEST_LICENSE -->
+            r#"<!-- Copyright © something <bar@something.com> -->
+<!-- TEST_LICENSE -->
 
 blah"#
                 .to_string()
@@ -408,7 +444,8 @@ blah"#
         let test_source = SourceFileWithTags::new("blah", &style);
         assert_eq!(
             test_source.replace_tag(&LicenseHeader("TEST_LICENSE"), "bar"),
-            r#"<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; TEST_LICENSE -->
+            r#"<!-- Copyright © SixtyFPS GmbH <info@slint.dev> -->
+<!-- TEST_LICENSE -->
 
 blah"#
                 .to_string()
@@ -418,8 +455,10 @@ blah"#
         let test_source = SourceFileWithTags::new("\nblah", &style);
         assert_eq!(
             test_source.replace_tag(&LicenseHeader(SPDX_LICENSE_LINE), "bar"),
-            String::from("<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; ")
-                + SPDX_LICENSE_LINE
+            String::from(
+                "<!-- Copyright © SixtyFPS GmbH <info@slint.dev> -->
+<!-- "
+            ) + SPDX_LICENSE_LINE
                 + r#"bar -->
 
 blah"#
@@ -429,7 +468,8 @@ blah"#
         let test_source = SourceFileWithTags::new("", &style);
         assert_eq!(
             test_source.replace_tag(&LicenseHeader("TEST_LICENSE"), "bar"),
-            r#"<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; TEST_LICENSE -->
+            r#"<!-- Copyright © SixtyFPS GmbH <info@slint.dev> -->
+<!-- TEST_LICENSE -->
 "#
             .to_string()
         );
@@ -453,7 +493,6 @@ static LICENSE_LOCATION_FOR_FILE: LazyLock<Vec<(regex::Regex, LicenseLocation)>>
             ("^\\.github/.*\\.md$", LicenseLocation::NoLicense),
             ("^\\.mailmap$", LicenseLocation::NoLicense),
             ("^\\.mise/tasks/", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
-            ("^api/cpp/docs/conf\\.py$", LicenseLocation::NoLicense),
             ("^docs/reference/Pipfile$", LicenseLocation::NoLicense),
             ("^docs/reference/conf\\.py$", LicenseLocation::NoLicense),
             ("^editors/vscode/src/snippets\\.ts$", LicenseLocation::NoLicense), // liberal license
@@ -463,8 +502,11 @@ static LICENSE_LOCATION_FOR_FILE: LazyLock<Vec<(regex::Regex, LicenseLocation)>>
                 "^editors/tree-sitter-slint/test-to-corpus\\.py$",
                 LicenseLocation::Tag(LicenseTagStyle::shell_comment_style()),
             ),
-            ("^Cargo\\.lock$", LicenseLocation::NoLicense),
-            ("^demos/printerdemo/zephyr/VERSION$", LicenseLocation::NoLicense),
+            ("(^|/)Cargo\\.lock$", LicenseLocation::NoLicense),
+            ("(^|/)flake\\.nix$", LicenseLocation::NoLicense),
+            ("(^|/)flake\\.lock$", LicenseLocation::NoLicense),
+            ("(^|/)uv\\.lock$", LicenseLocation::NoLicense),
+            ("^demos/.*/zephyr/VERSION$", LicenseLocation::NoLicense),
             ("^examples/mcu-board-support/pico2_st7789/rp_pico2.rs$", LicenseLocation::NoLicense), // third-party file
             // filename based matches:
             (
@@ -473,6 +515,7 @@ static LICENSE_LOCATION_FOR_FILE: LazyLock<Vec<(regex::Regex, LicenseLocation)>>
             ),
             ("(^|/)Cargo\\.toml$", LicenseLocation::Crate),
             ("(^|/)Dockerfile", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
+            ("(^|/)Doxyfile$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("(^|/)LICENSE$", LicenseLocation::NoLicense),
             ("(^|/)LICENSE\\.QT$", LicenseLocation::NoLicense),
             ("(^|/)README$", LicenseLocation::NoLicense),
@@ -487,25 +530,34 @@ static LICENSE_LOCATION_FOR_FILE: LazyLock<Vec<(regex::Regex, LicenseLocation)>>
             ("(^|/)biome\\.json$", LicenseLocation::NoLicense),
             ("(^|/)package-lock\\.json$", LicenseLocation::NoLicense),
             ("(^|/)py.typed$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
+            (
+                "(^|/)api/cpp/esp-idf/slint/esp-println\\.x$",
+                LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style()),
+            ),
             // Path prefix matches:
-            ("^editors/tree-sitter-slint/corpus/", LicenseLocation::NoLicense), // liberal license
-            ("^api/cpp/docs/_static/", LicenseLocation::NoLicense),
-            ("^api/cpp/docs/_templates/", LicenseLocation::NoLicense),
+            ("^editors/tree-sitter-slint/test/corpus/", LicenseLocation::NoLicense), // liberal license
+            ("^editors/tree-sitter-slint/src/", LicenseLocation::NoLicense), // liberal license (generated by tree-sitter)
             ("^docs/quickstart/theme/", LicenseLocation::NoLicense),
             ("^editors/tree-sitter-slint/queries/", LicenseLocation::NoLicense), // liberal license
             // directory based matches
             ("(^|/)LICENSES/", LicenseLocation::NoLicense),
             // Extension matches:
-            ("\\.60$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
-            ("\\.60\\.disabled$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
-            ("\\.astro$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.60$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
+            ("\\.60\\.disabled$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
+            ("\\.appxmanifest\\.in$", LicenseLocation::NoLicense),
+            ("\\.astro$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.cmake$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.cmake.in$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.conf$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
-            ("\\.cpp$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.cpp$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.css$", LicenseLocation::NoLicense),
+            ("\\.desktop$", LicenseLocation::NoLicense),
+            ("\\.dict$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.gitattributes$", LicenseLocation::NoLicense),
             ("\\.gitignore$", LicenseLocation::NoLicense),
+            ("\\.gltf$", LicenseLocation::NoLicense),
+            ("\\.gpg$", LicenseLocation::NoLicense),
+            ("\\.icns$", LicenseLocation::NoLicense),
             ("\\.ico$", LicenseLocation::NoLicense),
             ("\\.vscodeignore$", LicenseLocation::NoLicense),
             ("\\.dockerignore$", LicenseLocation::NoLicense),
@@ -513,54 +565,60 @@ static LICENSE_LOCATION_FOR_FILE: LazyLock<Vec<(regex::Regex, LicenseLocation)>>
             ("\\.prettierignore$", LicenseLocation::NoLicense),
             ("\\.bazelignore$", LicenseLocation::NoLicense),
             ("\\.npmignore$", LicenseLocation::NoLicense),
-            ("\\.h$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.h$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.html$", LicenseLocation::NoLicense),
-            ("\\.java$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.java$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.jpg$", LicenseLocation::NoLicense),
-            ("\\.js$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.js$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
+            ("\\.cjs$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.json$", LicenseLocation::NoLicense),
+            ("\\.kts$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.jsonc$", LicenseLocation::NoLicense),
             ("\\.license$", LicenseLocation::NoLicense),
-            ("\\.md$", LicenseLocation::Tag(LicenseTagStyle::html_comment_style())),
-            ("\\.mdx$", LicenseLocation::Tag(LicenseTagStyle::html_comment_style())),
-            ("\\.mjs$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
-            ("\\.mts$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.md$", LicenseLocation::NoLicense),
+            ("\\.mdx$", LicenseLocation::NoLicense),
+            ("\\.mjs$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
+            ("\\.mts$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.hbs$", LicenseLocation::Tag(LicenseTagStyle::html_comment_style())),
-            ("\\.overlay$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.overlay$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.pdf$", LicenseLocation::NoLicense),
             ("\\.png$", LicenseLocation::NoLicense),
             ("\\.mo$", LicenseLocation::NoLicense),
             ("\\.po$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.pot$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
-            ("\\.rs$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.rs$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.rst$", LicenseLocation::Tag(LicenseTagStyle::rst_comment_style())),
             ("\\.sh$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.bash$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.scm$", LicenseLocation::Tag(LicenseTagStyle::scheme_comment_style())),
-            ("\\.slint$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.slint$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             (
                 "\\.slint\\.disabled$",
-                LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style()),
+                LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style()),
             ),
             ("\\.sublime-commands$", LicenseLocation::NoLicense),
             ("\\.sublime-settings$", LicenseLocation::NoLicense),
             ("\\.sublime-syntax$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.svg$", LicenseLocation::NoLicense),
             ("\\.tmPreferences$", LicenseLocation::NoLicense),
-            ("\\.toml$", LicenseLocation::NoLicense),
-            ("\\.ts$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
-            ("\\.tsx$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.toml$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
+            ("\\.ts$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
+            ("\\.cts$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
+            ("\\.tsx$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.ttf$", LicenseLocation::NoLicense),
             ("\\.txt$", LicenseLocation::NoLicense),
             ("\\.ui$", LicenseLocation::NoLicense),
             ("\\.webp$", LicenseLocation::NoLicense),
-            ("\\.wgsl$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.wgsl$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
+            ("\\.woff$", LicenseLocation::NoLicense),
             ("\\.xml$", LicenseLocation::NoLicense),
+            ("\\.xml\\.in$", LicenseLocation::NoLicense),
             ("\\.yaml$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.yml$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.py$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("\\.pyi$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
-            ("\\.proto$", LicenseLocation::Tag(LicenseTagStyle::c_style_comment_style())),
+            ("\\.properties$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
+            ("\\.proto$", LicenseLocation::Tag(LicenseTagStyle::cpp_style_comment_style())),
             ("\\.bazelrc$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("MODULE.bazel$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
             ("BUILD.bazel$", LicenseLocation::Tag(LicenseTagStyle::shell_comment_style())),
@@ -576,14 +634,18 @@ static LICENSE_LOCATION_FOR_FILE: LazyLock<Vec<(regex::Regex, LicenseLocation)>>
 static LICENSE_FOR_FILE: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock::new(|| {
     [
         ("^editors/tree-sitter-slint/grammar.js$", MIT_LICENSE),
-        ("^editors/zed/", GPL_OR_LATER),
+        ("^editors/zed/", MIT_LICENSE),
         ("^helper_crates/const-field-offset/", MIT_OR_APACHE2_LICENSE),
         ("^helper_crates/vtable/", MIT_OR_APACHE2_LICENSE),
         ("^api/cpp/esp-idf/LICENSE$", TRIPLE_LICENSE),
         ("^examples/", MIT_LICENSE),
         ("^demos/", MIT_LICENSE),
+        ("^docs/slint-doc-generator/", TRIPLE_LICENSE),
         ("^docs/", MIT_LICENSE),
-        ("^api/cpp/docs/", MIT_LICENSE),
+        ("^ui-libraries/material", MIT_LICENSE),
+        ("^tests/manual/module-builds/", MIT_LICENSE),
+        ("^tools/figma-inspector/", MIT_LICENSE),
+        ("^api/slint-sc/", DUAL_LICENSE_NO_ROYALTY_FREE),
         ("(^|/)(README|CONTRIBUTING|CHANGELOG|LICENSE)\\.md", TRIPLE_LICENSE),
         (".*\\.md$", MIT_LICENSE),
         (".*", TRIPLE_LICENSE),
@@ -596,9 +658,9 @@ static LICENSE_FOR_FILE: LazyLock<Vec<(regex::Regex, &'static str)>> = LazyLock:
 
 const TRIPLE_LICENSE: &str =
     "GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0";
+const DUAL_LICENSE_NO_ROYALTY_FREE: &str = "GPL-3.0-only OR LicenseRef-Slint-Software-3.0";
 const MIT_LICENSE: &str = "MIT";
 const MIT_OR_APACHE2_LICENSE: &str = "MIT OR Apache-2.0";
-const GPL_OR_LATER: &str = "GPL-3.0-or-later";
 
 // This is really just the SPDX expression after the copyright line. The existence of the
 // Copyright prefix is enforced by the tag scanning (tag_start).
@@ -798,7 +860,7 @@ impl CargoToml {
                         return Err(anyhow!(
                             "Using workspace {}.workspace = true in workspace",
                             field
-                        ))
+                        ));
                     }
                     Some(true) => { /* nothing to do */ }
                     Some(false) => {
@@ -820,7 +882,10 @@ impl CargoToml {
                         Some(text) => {
                             if text != expected_str {
                                 if fix_it {
-                                    eprintln!("Fixing up {:?} as instructed. It has unexpected data in {field}.", self.path);
+                                    eprintln!(
+                                        "Fixing up {:?} as instructed. It has unexpected data in {field}.",
+                                        self.path
+                                    );
                                     self.doc["package"][field] = toml_edit::value(expected_str);
                                     self.edited = true;
                                 } else {
@@ -884,7 +949,7 @@ impl LicenseHeaderCheck {
         for path in &collect_files()? {
             let result = self
                 .check_file(path.as_path())
-                .with_context(|| format!("checking {}", &path.to_string_lossy()));
+                .with_context(|| format!("checking {}", path.to_string_lossy()));
 
             if result.is_err() {
                 seen_errors = true;
@@ -916,7 +981,7 @@ impl LicenseHeaderCheck {
             } else {
                 Err(anyhow!("Missing tag"))
             }
-        } else if source.has_license_header(&EXPECTED_HEADER) {
+        } else if source.tag_matches(&EXPECTED_HEADER, license) {
             Ok(())
         } else if self.fix_it {
             eprintln!("Fixing up {path:?} as instructed. It has a wrong license header.");
@@ -936,7 +1001,7 @@ impl LicenseHeaderCheck {
 
         if doc.is_workspace() {
             let mut wv = self.workspace_version.borrow_mut();
-            if &*wv == "" {
+            if (*wv).is_empty() {
                 *wv = doc.workspace_version()?.to_string();
             }
             let expected_version = wv.clone();
@@ -976,7 +1041,118 @@ impl LicenseHeaderCheck {
 
         self.check_dependencies(&doc, &expected_version)?;
 
+        // Check that a LICENSES directory exists with the right symlinks
+        let crate_dir = path.parent().unwrap();
+        self.check_licenses_dir(crate_dir, license)?;
+
         doc.save_if_changed()
+    }
+
+    fn check_licenses_dir(&self, crate_dir: &Path, license: &str) -> Result<()> {
+        let root = super::root_dir();
+        let root_licenses = root.join("LICENSES");
+        let licenses_dir = crate_dir.join("LICENSES");
+
+        // Read root LICENSES/ once and build a stem-to-filename map
+        let root_license_files: Vec<(String, String)> = std::fs::read_dir(&root_licenses)
+            .context("Cannot read root LICENSES directory")?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let path = e.path();
+                let stem = path.file_stem()?.to_string_lossy().to_string();
+                let filename = path.file_name()?.to_string_lossy().to_string();
+                Some((stem, filename))
+            })
+            .collect();
+
+        let spdx_ids: Vec<&str> =
+            license.split(" OR ").flat_map(|s| s.split(" AND ")).map(|s| s.trim()).collect();
+
+        let mut expected_filenames: Vec<String> = Vec::new();
+        for id in &spdx_ids {
+            let filename =
+                root_license_files.iter().find(|(stem, _)| stem == id).map(|(_, f)| f.clone());
+            match filename {
+                Some(f) => expected_filenames.push(f),
+                None => {
+                    return Err(anyhow!(
+                        "No license file found in root LICENSES/ for SPDX id '{}'",
+                        id
+                    ));
+                }
+            }
+        }
+
+        if !licenses_dir.exists() {
+            if self.fix_it {
+                eprintln!(
+                    "Fixing up {:?} as instructed. Creating missing LICENSES directory.",
+                    crate_dir
+                );
+                std::fs::create_dir(&licenses_dir)
+                    .context("Failed to create LICENSES directory")?;
+            } else {
+                return Err(anyhow!(
+                    "Missing LICENSES directory for published crate {:?}",
+                    crate_dir
+                ));
+            }
+        }
+
+        // Compute relative path after directory exists so canonicalize works
+        let rel_prefix = diff_paths(&root_licenses, &licenses_dir);
+
+        for filename in &expected_filenames {
+            let symlink_path = licenses_dir.join(filename);
+            let expected_target = rel_prefix.join(filename);
+
+            if let Ok(meta) = std::fs::symlink_metadata(&symlink_path) {
+                if !meta.file_type().is_symlink() {
+                    return Err(anyhow!("{:?} exists but is not a symlink", symlink_path));
+                }
+                let target = std::fs::read_link(&symlink_path)
+                    .context("Cannot read LICENSE symlink target")?;
+                if target == expected_target {
+                    continue;
+                }
+                if self.fix_it {
+                    eprintln!(
+                        "Fixing up {:?} as instructed. Symlink points to wrong target.",
+                        symlink_path
+                    );
+                    std::fs::remove_file(&symlink_path)
+                        .context("Failed to remove incorrect symlink")?;
+                } else {
+                    return Err(anyhow!(
+                        "{:?} points to {:?}, expected {:?}",
+                        symlink_path,
+                        target,
+                        expected_target
+                    ));
+                }
+            }
+
+            if self.fix_it {
+                eprintln!(
+                    "Fixing up {:?} as instructed. Creating symlink -> {:?}.",
+                    symlink_path, expected_target
+                );
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&expected_target, &symlink_path)
+                    .context("Failed to create LICENSE symlink")?;
+                #[cfg(windows)]
+                std::os::windows::fs::symlink_file(&expected_target, &symlink_path)
+                    .context("Failed to create LICENSE symlink")?;
+            } else {
+                return Err(anyhow!(
+                    "Missing LICENSE symlink {:?} -> {:?}",
+                    symlink_path,
+                    expected_target
+                ));
+            }
+        }
+
+        Ok(())
     }
 
     fn check_dependencies(&self, doc: &CargoToml, expected_version: &str) -> Result<()> {
@@ -1049,9 +1225,9 @@ impl LicenseHeaderCheck {
             .find_map(
                 |(regex, license)| if regex.is_match(path_str) { Some(license) } else { None },
             )
-            .with_context(|| {
-                "Cannot determine the expected license. Please fix the license checking xtask."
-            })?;
+            .with_context(
+                || "Cannot determine the expected license. Please fix the license checking xtask.",
+            )?;
 
         match location {
             LicenseLocation::Tag(tag_style) => self.check_file_tags(path, tag_style, license),

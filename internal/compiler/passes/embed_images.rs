@@ -1,39 +1,52 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+use crate::EmbedResourcesKind;
 use crate::diagnostics::BuildDiagnostics;
 use crate::embedded_resources::*;
 use crate::expression_tree::{Expression, ImageReference};
 use crate::object_tree::*;
-use crate::EmbedResourcesKind;
-#[cfg(feature = "software-renderer")]
+#[cfg(feature = "renderer-software")]
 use image::GenericImageView;
 use smol_str::SmolStr;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
-use std::pin::Pin;
-use std::rc::Rc;
+use std::collections::HashMap;
+use typed_index_collections::TiVec;
+use url::Url;
+
+/// The fonts shared with `embed_glyphs` to rasterize SVG `<text>`. Only the
+/// software renderer embeds textures, so elsewhere this is an unused placeholder.
+#[cfg(feature = "renderer-software")]
+pub(crate) type SharedFontCollection = super::embed_glyphs::SharedFontCollection;
+#[cfg(not(feature = "renderer-software"))]
+pub(crate) type SharedFontCollection = ();
 
 pub async fn embed_images(
     doc: &Document,
     embed_files: EmbedResourcesKind,
-    scale_factor: f64,
-    resource_url_mapper: &Option<Rc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = Option<String>>>>>>,
+    scale_factor: f32,
+    resource_url_mapper: &Option<crate::ResourceUrlMapper>,
+    font_collection: Option<&SharedFontCollection>,
     diag: &mut BuildDiagnostics,
 ) {
-    if embed_files == EmbedResourcesKind::Nothing && resource_url_mapper.is_none() {
+    // Slint SC always embeds: the images referenced by `@image-url()` are
+    // decoded into the generated code, whatever `embed_files` says.
+    if embed_files == EmbedResourcesKind::Nothing
+        && resource_url_mapper.is_none()
+        && !diag.is_slint_sc()
+    {
         return;
     }
 
     let global_embedded_resources = &doc.embedded_file_resources;
+    let mut path_to_id = HashMap::<SmolStr, EmbeddedResourcesIdx>::new();
 
     let mut all_components = Vec::new();
     doc.visit_all_used_components(|c| all_components.push(c.clone()));
     let all_components = all_components;
 
     let mapped_urls = {
-        let mut urls = HashMap::<SmolStr, Option<SmolStr>>::new();
+        let mut urls = HashMap::<Url, Option<Url>>::new();
 
         if let Some(mapper) = resource_url_mapper {
             // Collect URLs (sync!):
@@ -44,8 +57,8 @@ pub async fn embed_images(
             }
 
             // Map URLs (async -- well, not really):
-            for i in urls.iter_mut() {
-                *i.1 = (*mapper)(i.0).await.map(SmolStr::new);
+            for (url, mapped) in urls.iter_mut() {
+                *mapped = (*mapper)(url).await;
             }
         }
 
@@ -59,22 +72,46 @@ pub async fn embed_images(
                 e,
                 &mapped_urls,
                 global_embedded_resources,
+                &mut path_to_id,
                 embed_files,
                 scale_factor,
                 diag,
+                font_collection,
             )
         });
     }
 }
 
-fn collect_image_urls_from_expression(
-    e: &Expression,
-    urls: &mut HashMap<SmolStr, Option<SmolStr>>,
-) {
-    if let Expression::ImageReference { ref resource_ref, .. } = e {
-        if let ImageReference::AbsolutePath(path) = resource_ref {
-            urls.insert(path.clone(), None);
+/// The URL handed to the resource mapper, and the key of the mapped-resource
+/// map, for a reference the mapper may rewrite. A local [`ImageReference::Path`]
+/// becomes a `file://` URL; an [`ImageReference::Url`] is used as-is. Everything
+/// else (`data:` URIs, already-embedded references) returns `None` and is left
+/// untouched.
+fn reference_mapper_url(resource_ref: &ImageReference) -> Option<Url> {
+    match resource_ref {
+        ImageReference::Url(url) => Some(url.clone()),
+        ImageReference::Path(path) => {
+            // `Url::from_file_path` is absent on `wasm32-unknown-unknown`, which
+            // only ever sees URL references and so never reaches this branch.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                Url::from_file_path(path).ok()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = path;
+                None
+            }
         }
+        _ => None,
+    }
+}
+
+fn collect_image_urls_from_expression(e: &Expression, urls: &mut HashMap<Url, Option<Url>>) {
+    if let Expression::ImageReference { resource_ref, .. } = e
+        && let Some(url) = reference_mapper_url(resource_ref)
+    {
+        urls.insert(url, None);
     };
 
     e.visit(|e| collect_image_urls_from_expression(e, urls));
@@ -82,34 +119,79 @@ fn collect_image_urls_from_expression(
 
 fn embed_images_from_expression(
     e: &mut Expression,
-    urls: &HashMap<SmolStr, Option<SmolStr>>,
-    global_embedded_resources: &RefCell<BTreeMap<SmolStr, EmbeddedResources>>,
+    urls: &HashMap<Url, Option<Url>>,
+    global_embedded_resources: &RefCell<TiVec<EmbeddedResourcesIdx, EmbeddedResources>>,
+    path_to_id: &mut HashMap<SmolStr, EmbeddedResourcesIdx>,
     embed_files: EmbedResourcesKind,
-    scale_factor: f64,
+    scale_factor: f32,
     diag: &mut BuildDiagnostics,
+    font_collection: Option<&SharedFontCollection>,
 ) {
-    if let Expression::ImageReference { ref mut resource_ref, source_location, nine_slice: _ } = e {
-        if let ImageReference::AbsolutePath(path) = resource_ref {
-            // used mapped path:
-            let mapped_path =
-                urls.get(path).unwrap_or(&Some(path.clone())).clone().unwrap_or(path.clone());
-            *path = mapped_path;
-            if embed_files != EmbedResourcesKind::Nothing
-                && (embed_files != EmbedResourcesKind::OnlyBuiltinResources
-                    || path.starts_with("builtin:/"))
-            {
-                let image_ref = embed_image(
-                    global_embedded_resources,
+    if let Expression::ImageReference { resource_ref, source_location, nine_slice: _ } = e {
+        // Apply the resource mapper. A Path/Url may be replaced with the mapped
+        // URL (e.g. a `data:` URL), so re-classify the reference.
+        if let Some(url) = reference_mapper_url(resource_ref)
+            && let Some(mapped) = urls.get(&url).cloned().flatten()
+        {
+            *resource_ref = ImageReference::from_mapped_url(mapped);
+        }
+
+        match resource_ref {
+            ImageReference::DataUri(data) => {
+                // Data URIs have no external file to track, so skip for
+                // Nothing (interpreter) and ListAllResources (dependency tracking).
+                // Slint SC rejected the data URI when resolving @image-url(),
+                // so there is nothing left to embed.
+                if !matches!(
                     embed_files,
-                    path,
-                    scale_factor,
-                    diag,
-                    source_location,
-                );
-                if embed_files != EmbedResourcesKind::ListAllResources {
+                    EmbedResourcesKind::Nothing | EmbedResourcesKind::ListAllResources
+                ) && !diag.is_slint_sc()
+                {
+                    let image_ref = embed_data_uri(
+                        global_embedded_resources,
+                        path_to_id,
+                        data,
+                        embed_files,
+                        scale_factor,
+                        diag,
+                        source_location,
+                        font_collection,
+                    );
                     *resource_ref = image_ref;
                 }
             }
+            ImageReference::Path(_) | ImageReference::Url(_) => {
+                let is_builtin = matches!(
+                    resource_ref,
+                    ImageReference::Url(url) if url.scheme() == "builtin"
+                );
+                // Slint SC rejected URL references when resolving @image-url(),
+                // so only paths are left to embed there.
+                let embed_for_slint_sc =
+                    diag.is_slint_sc() && matches!(resource_ref, ImageReference::Path(_));
+                if embed_for_slint_sc
+                    || (embed_files != EmbedResourcesKind::Nothing
+                        && (embed_files != EmbedResourcesKind::OnlyBuiltinResources || is_builtin))
+                {
+                    let path = resource_ref.source().expect("Path/Url have a source");
+                    let image_ref = embed_image(
+                        global_embedded_resources,
+                        path_to_id,
+                        embed_files,
+                        path,
+                        scale_factor,
+                        diag,
+                        source_location,
+                        font_collection,
+                    );
+                    if embed_files != EmbedResourcesKind::ListAllResources {
+                        *resource_ref = image_ref;
+                    }
+                }
+            }
+            ImageReference::None
+            | ImageReference::EmbeddedData { .. }
+            | ImageReference::EmbeddedTexture { .. } => {}
         }
     };
 
@@ -118,84 +200,113 @@ fn embed_images_from_expression(
             e,
             urls,
             global_embedded_resources,
+            path_to_id,
             embed_files,
             scale_factor,
             diag,
+            font_collection,
         )
     });
 }
 
 fn embed_image(
-    global_embedded_resources: &RefCell<BTreeMap<SmolStr, EmbeddedResources>>,
+    global_embedded_resources: &RefCell<TiVec<EmbeddedResourcesIdx, EmbeddedResources>>,
+    path_to_id: &mut HashMap<SmolStr, EmbeddedResourcesIdx>,
     embed_files: EmbedResourcesKind,
     path: &str,
-    _scale_factor: f64,
+    _scale_factor: f32,
     diag: &mut BuildDiagnostics,
     source_location: &Option<crate::diagnostics::SourceLocation>,
+    _font_collection: Option<&SharedFontCollection>,
 ) -> ImageReference {
-    let mut resources = global_embedded_resources.borrow_mut();
-    let maybe_id = resources.len();
-    let e = match resources.entry(path.into()) {
-        std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
-        std::collections::btree_map::Entry::Vacant(e) => {
-            // Check that the file exists, so that later we can unwrap safely in the generators, etc.
-            if embed_files == EmbedResourcesKind::ListAllResources {
-                // Really do nothing with the image!
-                e.insert(EmbeddedResources { id: maybe_id, kind: EmbeddedResourcesKind::ListOnly });
-                return ImageReference::None;
-            } else if let Some(_file) = crate::fileaccess::load_file(std::path::Path::new(path)) {
-                #[allow(unused_mut)]
-                let mut kind = EmbeddedResourcesKind::RawData;
-                #[cfg(feature = "software-renderer")]
-                if embed_files == EmbedResourcesKind::EmbedTextures {
-                    match load_image(_file, _scale_factor) {
-                        Ok((img, source_format, original_size)) => {
-                            kind = EmbeddedResourcesKind::TextureData(generate_texture(
-                                img,
-                                source_format,
-                                original_size,
-                            ))
-                        }
-                        Err(err) => {
-                            diag.push_error(
-                                format!("Cannot load image file {path}: {err}"),
-                                source_location,
-                            );
-                            return ImageReference::None;
-                        }
-                    }
-                }
-                e.insert(EmbeddedResources { id: maybe_id, kind })
-            } else {
-                diag.push_error(format!("Cannot find image file {path}"), source_location);
-                return ImageReference::None;
-            }
-        }
+    let extension = || {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|x| x.to_string())
+            .unwrap_or_default()
     };
 
-    match e.kind {
-        #[cfg(feature = "software-renderer")]
-        EmbeddedResourcesKind::TextureData { .. } => {
-            ImageReference::EmbeddedTexture { resource_id: e.id }
-        }
-        _ => ImageReference::EmbeddedData {
-            resource_id: e.id,
-            extension: std::path::Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|x| x.to_string())
-                .unwrap_or_default(),
-        },
+    if let Some(&resource_id) = path_to_id.get(path) {
+        return match global_embedded_resources.borrow()[resource_id].kind {
+            #[cfg(feature = "renderer-software")]
+            EmbeddedResourcesKind::TextureData { .. } => {
+                ImageReference::EmbeddedTexture { resource_id }
+            }
+            #[cfg(feature = "slint-sc")]
+            EmbeddedResourcesKind::StaticPixels { .. } => {
+                ImageReference::EmbeddedTexture { resource_id }
+            }
+            _ => ImageReference::EmbeddedData { resource_id, extension: extension() },
+        };
     }
+
+    let mut resources = global_embedded_resources.borrow_mut();
+    let mut push = |kind| {
+        let id = resources.push_and_get_key(EmbeddedResources { path: Some(path.into()), kind });
+        path_to_id.insert(path.into(), id);
+        id
+    };
+
+    if embed_files == EmbedResourcesKind::ListAllResources {
+        push(EmbeddedResourcesKind::ListOnly);
+        return ImageReference::None;
+    }
+
+    let Some(_file) = crate::fileaccess::load_file(std::path::Path::new(path)) else {
+        diag.push_error(format!("Cannot find image file {path}"), source_location);
+        return ImageReference::None;
+    };
+
+    #[cfg(feature = "slint-sc")]
+    if diag.slint_sc {
+        // The Slint SC runtime has no image decoder: decode now and embed the
+        // pixels into the generated code.
+        if matches!(extension().to_ascii_lowercase().as_str(), "svg" | "svgz") {
+            diag.slint_sc_error("SVG images are", source_location);
+            return ImageReference::None;
+        }
+        return match image::load_from_memory(&_file.read()) {
+            Ok(decoded) => {
+                let resource_id = push(EmbeddedResourcesKind::StaticPixels(decoded.into_rgba8()));
+                ImageReference::EmbeddedTexture { resource_id }
+            }
+            Err(err) => {
+                diag.push_error(format!("Cannot load image file {path}: {err}"), source_location);
+                ImageReference::None
+            }
+        };
+    }
+
+    #[cfg(feature = "renderer-software")]
+    if embed_files == EmbedResourcesKind::EmbedTextures {
+        return match load_image(_file, _scale_factor, _font_collection) {
+            Ok((img, source_format, original_size)) => {
+                let resource_id = push(EmbeddedResourcesKind::TextureData(generate_texture(
+                    img,
+                    source_format,
+                    original_size,
+                )));
+                ImageReference::EmbeddedTexture { resource_id }
+            }
+            Err(err) => {
+                diag.push_error(format!("Cannot load image file {path}: {err}"), source_location);
+                ImageReference::None
+            }
+        };
+    }
+
+    let resource_id = push(EmbeddedResourcesKind::FileData);
+    ImageReference::EmbeddedData { resource_id, extension: extension() }
 }
 
-#[cfg(feature = "software-renderer")]
+#[cfg(feature = "renderer-software")]
 trait Pixel {
     //fn alpha(&self) -> f32;
     //fn rgb(&self) -> (u8, u8, u8);
     fn is_transparent(&self) -> bool;
 }
-#[cfg(feature = "software-renderer")]
+#[cfg(feature = "renderer-software")]
 impl Pixel for image::Rgba<u8> {
     /*fn alpha(&self) -> f32 { self[3] as f32 / 255. }
     fn rgb(&self) -> (u8, u8, u8) { (self[0], self[1], self[2]) }*/
@@ -204,7 +315,7 @@ impl Pixel for image::Rgba<u8> {
     }
 }
 
-#[cfg(feature = "software-renderer")]
+#[cfg(feature = "renderer-software")]
 fn generate_texture(
     image: image::RgbaImage,
     source_format: SourceFormat,
@@ -282,15 +393,8 @@ fn generate_texture(
                     }
                 }
                 ColorState::Rgb([a, b, c]) => {
-                    let abs_diff = |t, u| {
-                        if t < u {
-                            u - t
-                        } else {
-                            t - u
-                        }
-                    };
                     let px = get_pixel();
-                    if abs_diff(a, px[0]) > 2 || abs_diff(b, px[1]) > 2 || abs_diff(c, px[2]) > 2 {
+                    if a.abs_diff(px[0]) > 2 || b.abs_diff(px[1]) > 2 || c.abs_diff(px[2]) > 2 {
                         color = ColorState::Different
                     }
                 }
@@ -316,7 +420,7 @@ fn generate_texture(
     }
 }
 
-#[cfg(feature = "software-renderer")]
+#[cfg(feature = "renderer-software")]
 fn convert_image(
     image: image::RgbaImage,
     source_format: SourceFormat,
@@ -356,80 +460,98 @@ fn convert_image(
     }
 }
 
-#[cfg(feature = "software-renderer")]
+#[cfg(feature = "renderer-software")]
 enum SourceFormat {
     RgbaPremultiplied,
     Rgba,
 }
 
-#[cfg(feature = "software-renderer")]
-fn load_image(
-    file: crate::fileaccess::VirtualFile,
-    scale_factor: f64,
+/// usvg renders SVG `<text>` against its own font database. The compiler has no
+/// `SlintContext`, so resolve those fonts against the collection shared with
+/// `embed_glyphs` (system fonts plus imported fonts) through the shared bridge.
+#[cfg(feature = "renderer-software")]
+fn svg_font_options(
+    font_collection: Option<&SharedFontCollection>,
+) -> resvg::usvg::Options<'static> {
+    use i_slint_common::sharedfontique::svg as svg_fonts;
+
+    let Some(font_collection) = font_collection.cloned() else {
+        return resvg::usvg::Options::default();
+    };
+    svg_fonts::options(move |families, attributes, require_char| {
+        let mut fonts = font_collection.lock().ok()?;
+        let collection = &mut fonts.collection;
+        svg_fonts::query_font(
+            &mut collection.inner,
+            &mut collection.source_cache,
+            families,
+            attributes,
+            require_char,
+        )
+    })
+}
+
+#[cfg(feature = "renderer-software")]
+fn load_image_from_bytes(
+    data: &[u8],
+    extension: Option<&str>,
+    scale_factor: f32,
+    font_collection: Option<&SharedFontCollection>,
 ) -> image::ImageResult<(image::RgbaImage, SourceFormat, Size)> {
     use resvg::{tiny_skia, usvg};
-    use std::ffi::OsStr;
-    if file.canon_path.extension() == Some(OsStr::new("svg"))
-        || file.canon_path.extension() == Some(OsStr::new("svgz"))
-    {
-        let tree = i_slint_common::sharedfontdb::FONT_DB.with_borrow(|db| {
-            let option = usvg::Options { fontdb: (*db).clone(), ..Default::default() };
-            match file.builtin_contents {
-                Some(data) => usvg::Tree::from_data(data, &option),
-                None => usvg::Tree::from_data(
-                    std::fs::read(&file.canon_path).map_err(image::ImageError::IoError)?.as_slice(),
-                    &option,
-                ),
-            }
-            .map_err(|e| {
+
+    let is_svg = matches!(extension, Some("svg") | Some("svgz"));
+
+    if is_svg {
+        let tree = {
+            usvg::Tree::from_data(data, &svg_font_options(font_collection)).map_err(|e| {
                 image::ImageError::Decoding(image::error::DecodingError::new(
                     image::error::ImageFormatHint::Name("svg".into()),
                     e,
                 ))
-            })
-        })?;
-        let scale_factor = scale_factor as f32;
-        // TODO: ideally we should find the size used for that `Image`
+            })?
+        };
+
         let original_size = tree.size();
-        let width = original_size.width() * scale_factor;
-        let height = original_size.height() * scale_factor;
+        let width = (original_size.width() * scale_factor) as u32;
+        let height = (original_size.height() * scale_factor) as u32;
 
         let mut buffer = vec![0u8; width as usize * height as usize * 4];
+
         let size_error = || {
             image::ImageError::Limits(image::error::LimitError::from_kind(
                 image::error::LimitErrorKind::DimensionError,
             ))
         };
+
         let mut skia_buffer =
-            tiny_skia::PixmapMut::from_bytes(buffer.as_mut_slice(), width as u32, height as u32)
+            tiny_skia::PixmapMut::from_bytes(buffer.as_mut_slice(), width, height)
                 .ok_or_else(size_error)?;
+
         resvg::render(
             &tree,
-            tiny_skia::Transform::from_scale(scale_factor as _, scale_factor as _),
+            tiny_skia::Transform::from_scale(scale_factor, scale_factor),
             &mut skia_buffer,
         );
-        return image::RgbaImage::from_raw(width as u32, height as u32, buffer)
-            .ok_or_else(size_error)
-            .map(|img| {
+
+        return image::RgbaImage::from_raw(width, height, buffer).ok_or_else(size_error).map(
+            |img| {
                 (
                     img,
                     SourceFormat::RgbaPremultiplied,
                     Size { width: original_size.width() as _, height: original_size.height() as _ },
                 )
-            });
+            },
+        );
     }
-    if let Some(buffer) = file.builtin_contents {
-        image::load_from_memory(buffer)
-    } else {
-        image::open(file.canon_path)
-    }
-    .map(|mut image| {
+
+    image::load_from_memory(data).map(|mut image| {
         let (original_width, original_height) = image.dimensions();
 
-        if scale_factor < 1. {
+        if scale_factor < 1.0 {
             image = image.resize_exact(
-                (original_width as f64 * scale_factor) as u32,
-                (original_height as f64 * scale_factor) as u32,
+                (original_width as f32 * scale_factor) as u32,
+                (original_height as f32 * scale_factor) as u32,
                 image::imageops::FilterType::Gaussian,
             );
         }
@@ -440,4 +562,92 @@ fn load_image(
             Size { width: original_width, height: original_height },
         )
     })
+}
+
+#[cfg(feature = "renderer-software")]
+fn load_image(
+    file: crate::fileaccess::VirtualFile,
+    scale_factor: f32,
+    font_collection: Option<&SharedFontCollection>,
+) -> image::ImageResult<(image::RgbaImage, SourceFormat, Size)> {
+    use std::ffi::OsStr;
+
+    let extension = file.canon_path.extension().and_then(OsStr::to_str);
+
+    let data = if let Some(buffer) = file.builtin_contents {
+        buffer.to_vec()
+    } else {
+        std::fs::read(&file.canon_path)?
+    };
+
+    load_image_from_bytes(&data, extension, scale_factor, font_collection)
+}
+
+fn embed_data_uri(
+    global_embedded_resources: &RefCell<TiVec<EmbeddedResourcesIdx, EmbeddedResources>>,
+    path_to_id: &mut HashMap<SmolStr, EmbeddedResourcesIdx>,
+    data_uri: &str,
+    _embed_files: EmbedResourcesKind,
+    _scale_factor: f32,
+    diag: &mut BuildDiagnostics,
+    source_location: &Option<crate::diagnostics::SourceLocation>,
+    _font_collection: Option<&SharedFontCollection>,
+) -> ImageReference {
+    if let Some(&resource_id) = path_to_id.get(data_uri) {
+        let resources = global_embedded_resources.borrow();
+        return match &resources[resource_id].kind {
+            #[cfg(feature = "renderer-software")]
+            EmbeddedResourcesKind::TextureData { .. } => {
+                ImageReference::EmbeddedTexture { resource_id }
+            }
+            EmbeddedResourcesKind::DataUriPayload(_, ext) => {
+                ImageReference::EmbeddedData { resource_id, extension: ext.clone() }
+            }
+            _ => ImageReference::None,
+        };
+    }
+
+    let (decoded_data, extension) = match crate::data_uri::decode_data_uri(data_uri) {
+        Ok(result) => result,
+        Err(e) => {
+            diag.push_error(e, source_location);
+            return ImageReference::None;
+        }
+    };
+
+    let mut resources = global_embedded_resources.borrow_mut();
+    let mut push = |kind| {
+        let id = resources.push_and_get_key(EmbeddedResources { path: None, kind });
+        path_to_id.insert(data_uri.into(), id);
+        id
+    };
+
+    #[cfg(feature = "renderer-software")]
+    if _embed_files == EmbedResourcesKind::EmbedTextures {
+        match load_image_from_bytes(
+            &decoded_data,
+            Some(&extension),
+            _scale_factor,
+            _font_collection,
+        )
+        .map_err(|e| e.to_string())
+        {
+            Ok((img, source_format, original_size)) => {
+                let resource_id = push(EmbeddedResourcesKind::TextureData(generate_texture(
+                    img,
+                    source_format,
+                    original_size,
+                )));
+                return ImageReference::EmbeddedTexture { resource_id };
+            }
+            Err(err) => {
+                diag.push_error(format!("Cannot load data URI image: {err}"), source_location);
+                return ImageReference::None;
+            }
+        }
+    }
+
+    let resource_id = push(EmbeddedResourcesKind::DataUriPayload(decoded_data, extension.clone()));
+
+    ImageReference::EmbeddedData { resource_id, extension }
 }

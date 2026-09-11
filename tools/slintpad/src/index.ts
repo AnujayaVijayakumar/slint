@@ -4,7 +4,7 @@
 // cSpell: ignore cupertino lumino permalink
 
 import { EditorWidget, initialize as initializeEditor } from "./editor_widget";
-import { LspWaiter, type Lsp } from "./lsp";
+import { LspWaiter, type Lsp, type LoadPhase } from "./lsp";
 import { PreviewWidget } from "./preview_widget";
 
 import {
@@ -18,199 +18,75 @@ import {
     report_export_error_dialog,
     export_gist_dialog,
     about_dialog,
+    set_panic_share_url_getter,
 } from "./dialogs";
 
 import { CommandRegistry } from "@lumino/commands";
 import { Menu, MenuBar, SplitPanel, Widget } from "@lumino/widgets";
 
-const lsp_waiter = new LspWaiter();
+import { type InvokeSlintpadCallback, SlintPadCallbackFunction } from "./lsp";
+
+const loader = document.getElementById("loader");
+const loader_message = document.getElementById("loader-message");
+const loader_progress = document.getElementById(
+    "loader-progress",
+) as HTMLProgressElement | null;
+
+function update_loader(phase: LoadPhase) {
+    if (loader_message === null || loader_progress === null) {
+        return;
+    }
+    if (phase.kind === "downloading") {
+        if (phase.total) {
+            const percent = Math.round((phase.received / phase.total) * 100);
+            loader_message.textContent = `Downloading Slint runtime… ${percent}%`;
+            loader_progress.max = phase.total;
+            loader_progress.value = phase.received;
+        } else {
+            const kb = Math.round(phase.received / 1024);
+            loader_message.textContent = `Downloading Slint runtime… ${kb} KB`;
+            loader_progress.removeAttribute("value");
+        }
+    } else if (phase.kind === "compiling") {
+        loader_message.textContent = "Compiling…";
+        loader_progress.removeAttribute("value");
+    } else if (phase.kind === "initializing") {
+        loader_message.textContent = "Initializing…";
+        loader_progress.removeAttribute("value");
+    }
+}
+
+const lsp_waiter = new LspWaiter(update_loader);
 
 const commands = new CommandRegistry();
-
-function create_demo_menu(editor: EditorWidget): Menu {
-    const menu = new Menu({ commands });
-    menu.title.label = "Open Demo";
-
-    for (const demo of editor.known_demos()) {
-        const command_name = "slint:set_demo_" + demo[1];
-        commands.addCommand(command_name, {
-            label: demo[1],
-            execute: () => {
-                return editor.set_demo(demo[0]);
-            },
-        });
-        menu.addItem({ command: command_name });
-    }
-    return menu;
-}
-
-function create_settings_menu(): Menu {
-    const menu = new Menu({ commands });
-    menu.title.label = "Settings";
-
-    commands.addCommand("slint:store_github_token", {
-        label: "Manage Github login",
-        iconClass: "fa-brands fa-github",
-        execute: () => {
-            void manage_github_access();
-        },
-    });
-
-    menu.addItem({ command: "slint:store_github_token" });
-
-    return menu;
-}
-
-function create_project_menu(
-    editor: EditorWidget,
-    preview: PreviewWidget,
-): Menu {
-    const menu = new Menu({ commands });
-    menu.title.label = "Project";
-
-    commands.addCommand("slint:open_url", {
-        label: "Open URL",
-        iconClass: "fa fa-link",
-        mnemonic: 1,
-        execute: () => {
-            const url = prompt("Please enter the URL to open");
-            void editor.project_from_url(url);
-        },
-    });
-
-    commands.addKeyBinding({
-        keys: ["Accel O"],
-        selector: "body",
-        command: "slint:open_url",
-    });
-
-    commands.addCommand("slint:add_file", {
-        label: "Add File",
-        iconClass: "fa-regular fa-file",
-        mnemonic: 1,
-        execute: () => {
-            let name = prompt("Please enter the file name");
-            if (name == null) {
-                return;
-            }
-            if (!name.endsWith(".slint")) {
-                name = name + ".slint";
-            }
-            editor.add_empty_file_to_project(name);
-        },
-    });
-
-    commands.addKeyBinding({
-        keys: ["Accel N"],
-        selector: "body",
-        command: "slint:add_file",
-    });
-
-    menu.addItem({ command: "slint:open_url" });
-    menu.addItem({ type: "submenu", submenu: create_demo_menu(editor) });
-    menu.addItem({ type: "separator" });
-    menu.addItem({ command: "slint:add_file" });
-    menu.addItem({
-        type: "submenu",
-        submenu: create_share_menu(editor, preview),
-    });
-    menu.addItem({ type: "separator" });
-    menu.addItem({ type: "submenu", submenu: create_settings_menu() });
-    menu.addItem({ type: "separator" });
-
-    commands.addCommand("slint:about", {
-        label: "About",
-        iconClass: "fa-info-circle",
-        execute: () => about_dialog(),
-    });
-    menu.addItem({ command: "slint:about" });
-
-    return menu;
-}
-
-function create_share_menu(editor: EditorWidget, preview: PreviewWidget): Menu {
-    const menu = new Menu({ commands });
-    menu.title.label = "Share";
-
-    commands.addCommand("slint:copy_permalink", {
-        label: "Copy Permalink to Clipboard",
-        iconClass: "fa fa-share",
-        mnemonic: 1,
-        isEnabled: () => {
-            return editor.open_document_urls.length === 1;
-        },
-        execute: () => {
-            const params = new URLSearchParams();
-            params.set("snippet", editor.current_editor_content);
-            params.set("style", preview.current_style());
-            const this_url = new URL(window.location.toString());
-            this_url.search = params.toString();
-
-            report_export_url_dialog(this_url.toString());
-        },
-    });
-    commands.addCommand("slint:create_gist", {
-        label: "Export to github Gist",
-        iconClass: "fa-brands fa-github",
-        mnemonic: 1,
-        isEnabled: () => {
-            return editor.open_document_urls.length > 0;
-        },
-        execute: async () => {
-            let has_token = has_github_access_token();
-            if (!has_token) {
-                await manage_github_access();
-            }
-            has_token = has_github_access_token();
-
-            if (has_token) {
-                await export_gist_dialog((desc, is_public) => {
-                    export_to_gist(editor, desc, is_public)
-                        .then((url) => {
-                            const params = new URLSearchParams();
-                            params.set("load_url", url);
-                            const extra_url = new URL(
-                                window.location.toString(),
-                            );
-                            extra_url.search = params.toString();
-
-                            report_export_url_dialog(url, extra_url.toString());
-                        })
-                        .catch((e) => report_export_error_dialog(e));
-                });
-            } else {
-                alert(
-                    "You need a github access token set up to export as a gist.",
-                );
-            }
-        },
-    });
-
-    menu.addItem({ command: "slint:create_gist" });
-    menu.addItem({ command: "slint:copy_permalink" });
-
-    return menu;
-}
 
 const url_params = new URLSearchParams(window.location.search);
 const url_style = url_params.get("style");
 
 function setup(lsp: Lsp) {
     const editor = new EditorWidget(lsp);
+    set_panic_share_url_getter(() => editor.share_url());
     const preview = new PreviewWidget(
         lsp,
         (url: string) => editor.map_url(url),
         url_style ?? "",
+        (func_type, args) => {
+            if (func_type === SlintPadCallbackFunction.OpenDemoUrl) {
+                void editor.set_demo(args as string);
+            } else if (func_type === SlintPadCallbackFunction.ShowAbout) {
+                about_dialog();
+            } else if (func_type === SlintPadCallbackFunction.CopyPermalink) {
+                void editor.copy_permalink_to_clipboard();
+            } else if (func_type === SlintPadCallbackFunction.NewFile) {
+                void editor.set_demo("");
+            }
+        },
     );
-
-    const menu_bar = new MenuBar();
-    menu_bar.id = "menuBar";
-    menu_bar.addMenu(create_project_menu(editor, preview));
 
     const main = new SplitPanel({ orientation: "horizontal" });
     main.id = "main";
-    main.addWidget(editor);
     main.addWidget(preview);
+    main.addWidget(editor);
 
     window.onresize = () => {
         main.update();
@@ -220,18 +96,20 @@ function setup(lsp: Lsp) {
         commands.processKeydownEvent(event);
     });
 
-    Widget.attach(menu_bar, document.body);
     Widget.attach(main, document.body);
 }
 
 function main() {
     initializeEditor()
         .then((_) => {
+            if (loader_message !== null) {
+                loader_message.textContent = "Starting language server…";
+            }
             lsp_waiter
                 .wait_for_lsp()
                 .then((lsp) => {
                     setup(lsp);
-                    document.body.getElementsByClassName("loader")[0].remove();
+                    loader?.remove();
                 })
                 .catch((e) => {
                     console.info("LSP fail:", e);
@@ -239,7 +117,7 @@ function main() {
                     div.className = "browser-error";
                     div.innerHTML =
                         "<p>Failed to start the slint language server</p>";
-                    document.body.getElementsByClassName("loader")[0].remove();
+                    loader?.remove();
                     document.body.appendChild(div);
                 });
         })

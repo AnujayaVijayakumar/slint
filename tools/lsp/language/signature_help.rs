@@ -1,12 +1,12 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-use crate::common::DocumentCache;
+use crate::editor_preview::DocumentCache;
 use i_slint_compiler::expression_tree::Callable;
 use i_slint_compiler::langtype::{Function, Type};
 use i_slint_compiler::lookup::{LookupObject as _, LookupResult, LookupResultCallable};
 use i_slint_compiler::namedreference::NamedReference;
-use i_slint_compiler::parser::{syntax_nodes, SyntaxKind, SyntaxNode, SyntaxToken};
+use i_slint_compiler::parser::{SyntaxKind, SyntaxNode, SyntaxToken, syntax_nodes};
 use lsp_types::{ParameterInformation, ParameterLabel, SignatureHelp, SignatureInformation};
 
 pub(crate) fn get_signature_help(
@@ -15,34 +15,34 @@ pub(crate) fn get_signature_help(
 ) -> Option<SignatureHelp> {
     let pos = token.text_range().start();
     let mut node = token.parent();
-    let mut result = vec![];
+    let mut result = Vec::new();
 
     loop {
-        if let Some(node) = syntax_nodes::FunctionCallExpression::new(node.clone()) {
-            if let Some(f) = node.Expression().next() {
-                let mut active_parameter = None;
-                for t in node.children_with_tokens() {
-                    if t.text_range().start() > pos {
-                        break;
+        if let Some(node) = syntax_nodes::FunctionCallExpression::new(node.clone())
+            && let Some(f) = node.Expression().next()
+        {
+            let mut active_parameter = None;
+            for t in node.children_with_tokens() {
+                if t.text_range().start() > pos {
+                    break;
+                }
+                match t.kind() {
+                    SyntaxKind::LParent => {
+                        active_parameter = Some(0);
                     }
-                    match t.kind() {
-                        SyntaxKind::LParent => {
-                            active_parameter = Some(0);
+                    SyntaxKind::Comma => {
+                        if let Some(active_parameter) = active_parameter.as_mut() {
+                            *active_parameter += 1;
                         }
-                        SyntaxKind::Comma => {
-                            if let Some(active_parameter) = active_parameter.as_mut() {
-                                *active_parameter += 1;
-                            }
-                        }
-                        SyntaxKind::RParent => {
-                            active_parameter = None;
-                        }
-                        _ => (),
-                    };
-                }
-                if let Some(si) = signature_info(document_cache, f.into(), active_parameter) {
-                    result.push(si);
-                }
+                    }
+                    SyntaxKind::RParent => {
+                        active_parameter = None;
+                    }
+                    _ => (),
+                };
+            }
+            if let Some(si) = signature_info(document_cache, f.into(), active_parameter) {
+                result.push(si);
             }
         }
 
@@ -114,7 +114,16 @@ fn signature_from_nr(
 ) -> Option<SignatureInformation> {
     match nr.ty() {
         Type::Function(f) | Type::Callback(f) => {
-            Some(signature_from_function_ty(nr.name(), &f, 0, active_parameter))
+            // `nr.name()` is the storage key, mangled for a declaration that shadows an inherited
+            // member; show the source name instead.
+            let name = nr
+                .element()
+                .borrow()
+                .property_declarations
+                .get(nr.name())
+                .and_then(|d| d.shadowed_name.clone())
+                .unwrap_or_else(|| nr.name().clone());
+            Some(signature_from_function_ty(&name, &f, 0, active_parameter))
         }
         _ => None,
     }
@@ -135,11 +144,7 @@ fn signature_from_function_ty(
             .filter(|(x, _)| *x != &Type::ElementReference)
             .map(
                 |(ty, name)| {
-                    if !name.is_empty() {
-                        format!("{name}: {ty}")
-                    } else {
-                        ty.to_string()
-                    }
+                    if !name.is_empty() { format!("{name}: {ty}") } else { ty.to_string() }
                 },
             )
             .collect(),
@@ -173,10 +178,23 @@ mod tests {
 
     /// Given a source text containing the unicode emoji `🔺`, the emoji will be removed and then an signature help request will be done as if the cursor was there
     fn query_signature_help(file: &str) -> Option<SignatureHelp> {
+        query_signature_help_impl(file, false)
+    }
+
+    /// Like [`query_signature_help`], but with experimental compiler features enabled.
+    fn query_signature_help_experimental(file: &str) -> Option<SignatureHelp> {
+        query_signature_help_impl(file, true)
+    }
+
+    fn query_signature_help_impl(file: &str, experimental: bool) -> Option<SignatureHelp> {
         const CURSOR_EMOJI: char = '🔺';
         let offset = (file.find(CURSOR_EMOJI).unwrap() as u32).into();
         let source = file.replace(CURSOR_EMOJI, "");
-        let (mut dc, uri, _) = crate::language::test::loaded_document_cache(source);
+        let (mut dc, uri, _) = if experimental {
+            crate::language::test::loaded_document_cache_with_experimental(source)
+        } else {
+            crate::language::test::loaded_document_cache(source)
+        };
 
         let doc = dc.get_document(&uri).unwrap();
         let token = crate::language::token_at_offset(doc.node.as_ref().unwrap(), offset)?;
@@ -203,7 +221,7 @@ export component Abc {
                     SignatureInformation {
                         label: "Sqrt()".into(),
                         documentation: None,
-                        parameters: Some(vec![]),
+                        parameters: Some(Vec::new()),
                         active_parameter: Some(0),
                     },
                     make_signature_info(
@@ -270,6 +288,34 @@ export component Abc {
                 signatures: vec![make_signature_info(
                     "current-row-changed",
                     vec!["current-row: int".into()],
+                    Some(0),
+                )],
+                active_signature: None,
+                active_parameter: None
+            }
+        );
+    }
+
+    #[test]
+    fn shadowed_function() {
+        // `Derived` shadows the `@shadowable` `act` of `Base` with a different signature. Signature
+        // help at a call in `Derived` must describe `Derived`'s function, under its source name.
+        let source = r#"
+component Base {
+    @shadowable public function act(a: int) -> int { a }
+}
+export component Derived inherits Base {
+    public function act(a: string, b: bool) -> string { a }
+    public function caller() -> string { self.act(🔺) }
+}
+    "#;
+        let sh = query_signature_help_experimental(source).unwrap();
+        assert_eq!(
+            sh,
+            SignatureHelp {
+                signatures: vec![make_signature_info(
+                    "act",
+                    vec!["a: string".into(), "b: bool".into()],
                     Some(0),
                 )],
                 active_signature: None,

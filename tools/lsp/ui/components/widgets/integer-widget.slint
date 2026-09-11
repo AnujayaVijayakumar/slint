@@ -1,31 +1,19 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-import { ChildIndicator, NameLabel, ResettingLineEdit } from "./basics.slint";
+import { ChildIndicator, ResettingLineEdit } from "./basics.slint";
 
 import { PropertyValue } from "../../api.slint";
 import { EditorSpaceSettings } from "../../components/styling.slint";
 
 export component IntegerWidget inherits GridLayout {
     in property <bool> enabled;
-    in property <string> property-name;
     in property <PropertyValue> property-value;
 
     callback update-display-string(value: string);
 
     callback test-integer-binding(text: string) -> bool;
     callback set-integer-binding(text: string);
-
-    spacing-vertical: EditorSpaceSettings.default-spacing;
-
-    Row {
-        NameLabel {
-            col: 1;
-
-            property-name: root.property-name;
-            property-value: root.property-value;
-        }
-    }
 
     Row {
         childIndicator := ChildIndicator {
@@ -43,7 +31,6 @@ export component IntegerWidget inherits GridLayout {
             edited(text) => {
                 self.can-compile = test-integer-binding(text);
             }
-
             accepted(text) => {
                 root.update-display-string(text);
                 root.set-integer-binding(text);
@@ -51,4 +38,3 @@ export component IntegerWidget inherits GridLayout {
         }
     }
 }
-

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 use i_slint_core::{
-    input::{key_codes, FocusEventResult, FocusReason, KeyEventType},
+    cursor::MouseCursorInner,
+    input::{FocusEventResult, FocusReason, InternalKeyEvent, KeyEventType, key_codes},
     items::PointerEventButton,
 };
 
@@ -17,6 +18,7 @@ pub(super) struct NativeSliderData {
     pub pressed: u8,
     pub pressed_x: f32,
     pub pressed_val: f32,
+    pub pressed_max: f32,
 }
 
 type FloatArg = (f32,);
@@ -46,6 +48,7 @@ void initQSliderOptions(QStyleOptionSlider &option, bool pressed, bool enabled, 
     option.activeSubControls = { active_controls };
     if (vertical) {
         option.orientation = Qt::Vertical;
+        option.upsideDown = vertical;
     } else {
         option.orientation = Qt::Horizontal;
         option.state |= QStyle::State_Horizontal;
@@ -67,15 +70,19 @@ void initQSliderOptions(QStyleOptionSlider &option, bool pressed, bool enabled, 
 
 impl Item for NativeSlider {
     fn init(self: Pin<&Self>, _self_rc: &ItemRc) {
-        let animation_tracker_property_ptr = Self::FIELD_OFFSETS.animation_tracker.apply_pin(self);
+        let animation_tracker_property_ptr =
+            Self::FIELD_OFFSETS.animation_tracker().apply_pin(self);
         self.widget_ptr.set(cpp! { unsafe [animation_tracker_property_ptr as "void*"] -> SlintTypeErasedWidgetPtr as "std::unique_ptr<SlintTypeErasedWidget>" {
             return make_unique_animated_widget<QSlider>(animation_tracker_property_ptr);
         }})
     }
 
+    fn deinit(self: Pin<&Self>, _window_adapter: &Rc<dyn WindowAdapter>) {}
+
     fn layout_info(
         self: Pin<&Self>,
         orientation: Orientation,
+        _cross_axis_constraint: Coord,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> LayoutInfo {
@@ -152,6 +159,7 @@ impl Item for NativeSlider {
         _: &MouseEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventFilterResult {
         InputEventFilterResult::ForwardEvent
     }
@@ -162,6 +170,7 @@ impl Item for NativeSlider {
         event: &MouseEvent,
         window_adapter: &Rc<dyn WindowAdapter>,
         self_rc: &i_slint_core::items::ItemRc,
+        _: &mut MouseCursorInner,
     ) -> InputEventResult {
         let size: qttypes::QSize = get_size!(self_rc);
         let enabled = self.enabled();
@@ -199,16 +208,13 @@ impl Item for NativeSlider {
             option.rect = { QPoint{}, size };
             return style->hitTestComplexControl(QStyle::CC_Slider, &option, pos, widget);
         });
+        #[cfg_attr(slint_nightly_test, allow(non_exhaustive_omitted_patterns))]
         let result = match event {
             _ if !enabled => {
                 data.pressed = 0;
                 InputEventResult::EventIgnored
             }
-            MouseEvent::Pressed {
-                position: pos,
-                button: PointerEventButton::Left,
-                click_count: _,
-            } => {
+            MouseEvent::Pressed { position: pos, button: PointerEventButton::Left, .. } => {
                 if !self.has_focus() {
                     WindowInner::from_pub(window_adapter.window()).set_focus_item(
                         self_rc,
@@ -223,35 +229,55 @@ impl Item for NativeSlider {
             }
             MouseEvent::Exit | MouseEvent::Released { button: PointerEventButton::Left, .. } => {
                 if data.pressed != 0 {
-                    Self::FIELD_OFFSETS.released.apply_pin(self).call(&(self.value(),));
+                    Self::FIELD_OFFSETS.released().apply_pin(self).call(&(self.value(),));
                 }
                 data.pressed = 0;
                 InputEventResult::EventAccepted
             }
-            MouseEvent::Moved { position: pos } => {
-                let (coord, size) =
-                    if vertical { (pos.y, size.height) } else { (pos.x, size.width) };
+            MouseEvent::Moved { position: pos, .. } => {
                 if data.pressed != 0 {
-                    // FIXME: use QStyle::subControlRect to find out the actual size of the groove
-                    let new_val = data.pressed_val
-                        + ((coord as f32) - data.pressed_x) * (self.maximum() - self.minimum())
-                            / size as f32;
+                    let s = cpp!(unsafe [
+                        size as "QSize",
+                        enabled as "bool",
+                        value as "int",
+                        min as "int",
+                        max as "int",
+                        active_controls as "int",
+                        pressed as "bool",
+                        vertical as "bool",
+                        widget as "QWidget*"
+                    ] -> qttypes::QSize as "QSize" {
+                        QStyleOptionSlider option;
+                        initQSliderOptions(option, pressed, enabled, active_controls, min, max, value, vertical);
+                        option.rect = { QPoint{}, size };
+                        auto gr = qApp->style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderGroove, widget);
+                        auto sr = qApp->style()->subControlRect(QStyle::CC_Slider, &option, QStyle::SC_SliderHandle, widget);
+                        return gr.size() - sr.size();
+                    });
+                    let (coord, size) = if vertical { (pos.y, s.height) } else { (pos.x, s.width) };
+                    let delta = (coord as f32) - data.pressed_x;
+                    let delta = if vertical { -delta } else { delta };
+                    let new_val =
+                        data.pressed_val + delta * (self.maximum() - self.minimum()) / size as f32;
                     self.set_value(new_val);
                     InputEventResult::GrabMouse
                 } else {
                     InputEventResult::EventIgnored
                 }
             }
-            MouseEvent::Wheel { delta_x, delta_y, .. } => {
-                let new_val = self.value() + delta_x + delta_y;
-                self.set_value(new_val);
-                InputEventResult::EventAccepted
-            }
             MouseEvent::Pressed { button, .. } | MouseEvent::Released { button, .. } => {
                 debug_assert_ne!(*button, PointerEventButton::Left);
                 InputEventResult::EventIgnored
             }
-            MouseEvent::DragMove(..) | MouseEvent::Drop(..) => InputEventResult::EventIgnored,
+            MouseEvent::PinchGesture { .. } | MouseEvent::RotationGesture { .. } => {
+                InputEventResult::EventIgnored
+            }
+            MouseEvent::DragMove { .. } | MouseEvent::Drop { .. } => InputEventResult::EventIgnored,
+            // Note: The Qt slider used to accept scroll events, however the other styles do not.
+            // As the scroll event handling is problematic when a slider is placed in a Flickable,
+            // ignore scroll events for now.
+            // Users can add a surrounding TouchArea that adds scrolling to the slider if they want to support that.
+            MouseEvent::Wheel { .. } => InputEventResult::EventIgnored,
         };
         data.active_controls = new_control;
 
@@ -259,35 +285,44 @@ impl Item for NativeSlider {
         result
     }
 
+    fn capture_key_event(
+        self: Pin<&Self>,
+        _event: &InternalKeyEvent,
+        _window_adapter: &Rc<dyn WindowAdapter>,
+        _self_rc: &ItemRc,
+    ) -> KeyEventResult {
+        KeyEventResult::EventIgnored
+    }
+
     fn key_event(
         self: Pin<&Self>,
-        event: &KeyEvent,
+        event: &InternalKeyEvent,
         _window_adapter: &Rc<dyn WindowAdapter>,
         _self_rc: &ItemRc,
     ) -> KeyEventResult {
         if self.enabled() {
-            let Some(keycode) = event.text.chars().next() else {
+            let Some(keycode) = event.key_event.text.chars().next() else {
                 return KeyEventResult::EventIgnored;
             };
             let vertical = self.orientation() == Orientation::Vertical;
 
             if (!vertical && keycode == key_codes::RightArrow)
-                || (vertical && keycode == key_codes::DownArrow)
+                || (vertical && keycode == key_codes::UpArrow)
             {
                 if event.event_type == KeyEventType::KeyPressed {
                     self.set_value(self.value() + self.step());
                 } else if event.event_type == KeyEventType::KeyReleased {
-                    Self::FIELD_OFFSETS.released.apply_pin(self).call(&(self.value(),));
+                    Self::FIELD_OFFSETS.released().apply_pin(self).call(&(self.value(),));
                 }
                 return KeyEventResult::EventAccepted;
             }
             if (!vertical && keycode == key_codes::LeftArrow)
-                || (vertical && keycode == key_codes::UpArrow)
+                || (vertical && keycode == key_codes::DownArrow)
             {
                 if event.event_type == KeyEventType::KeyPressed {
                     self.set_value(self.value() - self.step());
                 } else if event.event_type == KeyEventType::KeyReleased {
-                    Self::FIELD_OFFSETS.released.apply_pin(self).call(&(self.value(),));
+                    Self::FIELD_OFFSETS.released().apply_pin(self).call(&(self.value(),));
                 }
                 return KeyEventResult::EventAccepted;
             }
@@ -295,7 +330,7 @@ impl Item for NativeSlider {
                 if event.event_type == KeyEventType::KeyPressed {
                     self.set_value(self.minimum());
                 } else if event.event_type == KeyEventType::KeyReleased {
-                    Self::FIELD_OFFSETS.released.apply_pin(self).call(&(self.value(),));
+                    Self::FIELD_OFFSETS.released().apply_pin(self).call(&(self.value(),));
                 }
                 return KeyEventResult::EventAccepted;
             }
@@ -303,7 +338,7 @@ impl Item for NativeSlider {
                 if event.event_type == KeyEventType::KeyPressed {
                     self.set_value(self.maximum());
                 } else if event.event_type == KeyEventType::KeyReleased {
-                    Self::FIELD_OFFSETS.released.apply_pin(self).call(&(self.value(),));
+                    Self::FIELD_OFFSETS.released().apply_pin(self).call(&(self.value(),));
                 }
                 return KeyEventResult::EventAccepted;
             }
@@ -319,7 +354,7 @@ impl Item for NativeSlider {
     ) -> FocusEventResult {
         if self.enabled() {
             Self::FIELD_OFFSETS
-                .has_focus
+                .has_focus()
                 .apply_pin(self)
                 .set(matches!(event, FocusEvent::FocusIn(_)));
             FocusEventResult::FocusAccepted
@@ -386,14 +421,17 @@ impl Item for NativeSlider {
 impl NativeSlider {
     fn set_value(self: Pin<&Self>, new_val: f32) {
         let new_val = new_val.max(self.minimum()).min(self.maximum());
+        if self.value() == new_val {
+            return;
+        }
         self.value.set(new_val);
-        Self::FIELD_OFFSETS.changed.apply_pin(self).call(&(new_val,));
+        Self::FIELD_OFFSETS.changed().apply_pin(self).call(&(new_val,));
     }
 }
 
 impl ItemConsts for NativeSlider {
     const cached_rendering_data_offset: const_field_offset::FieldOffset<Self, CachedRenderingData> =
-        Self::FIELD_OFFSETS.cached_rendering_data.as_unpinned_projection();
+        Self::FIELD_OFFSETS.cached_rendering_data().as_unpinned_projection();
 }
 
 declare_item_vtable! {

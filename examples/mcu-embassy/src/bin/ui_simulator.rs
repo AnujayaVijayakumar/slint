@@ -1,6 +1,7 @@
 // Copyright © 2025 David Haig
 // SPDX-License-Identifier: MIT
 
+// cSpell: ignore LEFTSHIFT LSHIFT mousestate xrel yrel
 // A simulator for the stm32u5g9j-dk2
 // This uses the cross platform sdl2 library to render the application on a PC (see readme for installation instructions)
 // The LEFTSHIFT key can be used in place of the blue push button on the dk2 (Hardware User Button)
@@ -26,18 +27,18 @@ use log::*;
 use mcu_embassy::{
     controller::{self, Action, Controller},
     simulator::hardware::HardwareSim,
-    slint_backend::{StmBackend, TargetPixelType, DISPLAY_HEIGHT, DISPLAY_WIDTH},
+    slint_backend::{DISPLAY_HEIGHT, DISPLAY_WIDTH, StmBackend, TargetPixelType},
 };
 use object_pool::{Pool, Reusable};
 use sdl2::{
     event::Event, keyboard::Keycode, mouse::MouseButton, pixels::PixelFormatEnum, rect::Rect,
 };
 use slint::{
-    platform::{
-        software_renderer::{MinimalSoftwareWindow, RepaintBufferType},
-        PointerEventButton, WindowAdapter, WindowEvent,
-    },
     ComponentHandle,
+    platform::{
+        PointerEventButton, WindowAdapter, WindowEvent,
+        software_renderer::{MinimalSoftwareWindow, RepaintBufferType},
+    },
 };
 use slint_generated::MainWindow;
 use static_cell::StaticCell;

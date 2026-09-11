@@ -1,9 +1,27 @@
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: MIT OR Apache-2.0 -->
 
 # Changelog
 All notable changes to this crate will be documented in this file.
 
-## [0.3.0]
+## [0.5.0] - 2026-08-18
+
+ - Replaced the `static_vtable` function with `STATIC_VTABLE` associated
+   const.
+ - Added `ErasedWeakFn`, a weak reference to a mapped object bundled with a
+   function taking that object and an `&Arg`, neither generic over the mapped
+   type, created with `VRcMapped::downgrade_erased_fn`.
+ - Updated `syn` to version 3.
+
+## [0.4.0] - 2026-04-16
+
+ - Bumped the `const-field-offset` dependency to 0.2 (breaking change in the
+   `FIELD_OFFSETS` API).
+ - Use absolute `::core::` paths in the generated code to avoid conflicts when
+   user code declares a type named `core`.
+ - Upgraded to edition 2024.
+ - The minimum supported Rust version is now 1.88.
+ - Fixed clippy warnings in `vtable-macro`.
+
+## [0.3.0] - 2025-06-16
 
  - Don't automatically add "extern C" to the function that do not have it.
 

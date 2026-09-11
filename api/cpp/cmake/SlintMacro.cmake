@@ -1,6 +1,7 @@
 # Copyright © SixtyFPS GmbH <info@slint.dev>
 # SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+# cSpell: ignore AFAICT ARGN endwhile GENEX REALPATH
 # Set up machinery to handle SLINT_EMBED_RESOURCES target property
 set(DEFAULT_SLINT_EMBED_RESOURCES as-absolute-path CACHE STRING
     "The default resource embedding option to pass to the Slint compiler")
@@ -15,9 +16,14 @@ function(SLINT_TARGET_SOURCES target)
     cmake_parse_arguments(SLINT_TARGET_SOURCES "" "NAMESPACE;COMPILATION_UNITS" "LIBRARY_PATHS" ${ARGN})
 
     get_target_property(enabled_features Slint::Slint SLINT_ENABLED_FEATURES)
-    if (("EXPERIMENTAL" IN_LIST enabled_features) AND ("SYSTEM_TESTING" IN_LIST enabled_features))
-        set(SLINT_COMPILER_ENV ${CMAKE_COMMAND} -E env)
-        set(SLINT_COMPILER_ENV ${SLINT_COMPILER_ENV} SLINT_EMIT_DEBUG_INFO=1)
+    if ("EXPERIMENTAL" IN_LIST enabled_features)
+        list(APPEND SLINT_COMPILER_ENV_VARS SLINT_ENABLE_EXPERIMENTAL_FEATURES=1)
+    endif()
+    if ("SYSTEM_TESTING" IN_LIST enabled_features)
+        list(APPEND SLINT_COMPILER_ENV_VARS SLINT_EMIT_DEBUG_INFO=1)
+    endif()
+    if (SLINT_COMPILER_ENV_VARS)
+        set(SLINT_COMPILER_ENV ${CMAKE_COMMAND} -E env ${SLINT_COMPILER_ENV_VARS})
     endif()
 
     if (DEFINED SLINT_TARGET_SOURCES_NAMESPACE)
@@ -63,7 +69,12 @@ function(SLINT_TARGET_SOURCES target)
         set(translation_domain_prop "$<TARGET_GENEX_EVAL:${target},$<TARGET_PROPERTY:${target},SLINT_TRANSLATION_DOMAIN>>")
         set(translation_domain_arg "$<IF:$<STREQUAL:${translation_domain_prop},>,${target},${translation_domain_prop}>")
 
+        set(no_default_translation_context_bool "$<BOOL:$<TARGET_PROPERTY:${target},SLINT_NO_DEFAULT_TRANSLATION_CONTEXT>>")
+        set(no_default_translation_context_arg "$<IF:${no_default_translation_context_bool},--no-default-translation-context,>")
+
         if (compilation_units GREATER 0)
+            # We need to set this to empty, as this variable is reused in every foreach iteration.
+            set(cpp_files "")
             foreach(cpp_num RANGE 1 ${compilation_units})
                 list(APPEND cpp_files "${CMAKE_CURRENT_BINARY_DIR}/slint_generated_${_SLINT_BASE_NAME}_${cpp_num}.cpp")
             endforeach()
@@ -79,6 +90,7 @@ function(SLINT_TARGET_SOURCES target)
                 --style ${_SLINT_STYLE}
                 --embed-resources=${embed}
                 --translation-domain=${translation_domain_arg}
+                ${no_default_translation_context_arg}
                 ${_SLINT_CPP_NAMESPACE_ARG}
                 ${_SLINT_CPP_LIBRARY_PATHS_ARG}
                 ${scale_factor_arg}

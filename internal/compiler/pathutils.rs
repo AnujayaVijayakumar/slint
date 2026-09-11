@@ -6,8 +6,14 @@
 //!
 //! This is not helped by us using URLs in place of paths *sometimes*.
 
-use smol_str::{format_smolstr, SmolStr, SmolStrBuilder};
+use smol_str::{SmolStr, SmolStrBuilder, format_smolstr};
 use std::path::{Path, PathBuf};
+
+/// Return `true` if `path` has a font file extension supported by Slint
+/// (`.ttf`, `.ttc`, or `.otf`).
+pub fn is_font_file(path: &str) -> bool {
+    path.ends_with(".ttf") || path.ends_with(".ttc") || path.ends_with(".otf")
+}
 
 /// Check whether a `Path` is actually an URL.
 pub fn is_url(path: &Path) -> bool {
@@ -427,11 +433,7 @@ fn dirname_string(path: &str) -> String {
         };
     }
 
-    if result.is_empty() {
-        String::from(".")
-    } else {
-        result
-    }
+    if result.is_empty() { String::from(".") } else { result }
 }
 
 #[test]
@@ -464,15 +466,18 @@ pub fn dirname(path: &Path) -> PathBuf {
 /// The result will be a `clean_path(...)`.
 pub fn join(base: &Path, path: &Path) -> Option<PathBuf> {
     if is_absolute(path) {
-        return Some(path.to_owned());
+        return Some(clean_path(path));
     }
 
     let Some(base_str) = base.to_str() else {
-        return Some(path.to_owned());
+        return Some(clean_path(path));
     };
     let Some(path_str) = path.to_str() else {
-        return Some(path.to_owned());
+        return Some(clean_path(path));
     };
+    if base_str.is_empty() {
+        return Some(clean_path(path));
+    }
 
     let path_separator = find_path_separator(path_str);
 
@@ -507,7 +512,7 @@ fn test_join() {
     fn th(base: &str, path: &str, expected: Option<&str>) {
         let base = PathBuf::from(base);
         let path = PathBuf::from(path);
-        let expected = expected.map(|e| PathBuf::from(e));
+        let expected = expected.map(PathBuf::from);
 
         let result = join(&base, &path);
         assert_eq!(result, expected);
@@ -523,4 +528,19 @@ fn test_join() {
     th("builtin:/foo", "bar.slint", Some("builtin:/foo/bar.slint"));
     th("builtin:/foo/", "bar.slint", Some("builtin:/foo/bar.slint"));
     th("builtin:/", "..\\bar.slint", Some("builtin:/bar.slint"));
+
+    th("some/relative", "hello.txt", Some("some/relative/hello.txt"));
+    th("", "foo/hello.txt", Some("foo/hello.txt"));
+    th("some/relative", "/foo/hello.txt", Some("/foo/hello.txt"));
+
+    // An absolute `path` ignores `base`, but is still cleaned up (#12798): a stray
+    // backslash used to be returned verbatim, which then mismatched the cleaned
+    // path used to look the document up again, panicking the type loader.
+    th("some/base", "/ddd\\\"dd", Some("/ddd/\"dd"));
+    th("some/base", "/a/../b", Some("/b"));
+    th("some/base", "/a\\b\\c", Some("/a/b/c"));
+    // Windows drive-absolute paths keep their backslashes.
+    th("some/base", "C:\\a\\b", Some("C:\\a\\b"));
+    // An empty base also cleans the path instead of returning it raw.
+    th("", "a/../b", Some("b"));
 }

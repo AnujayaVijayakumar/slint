@@ -1,16 +1,16 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-//! Passes that fills the root component used_global
+//! This pass extends the init code with font registration
 
+use crate::embedded_resources::EmbeddedResourcesIdx;
 use crate::{
     expression_tree::{BuiltinFunction, Expression, Unit},
     object_tree::*,
 };
 use smol_str::SmolStr;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
-/// Fill the root_component's used_globals
 pub fn collect_custom_fonts<'a>(
     doc: &Document,
     all_docs: impl Iterator<Item = &'a Document> + 'a,
@@ -28,33 +28,23 @@ pub fn collect_custom_fonts<'a>(
         BuiltinFunction::RegisterCustomFontByPath
     };
 
-    let prepare_font_registration_argument: Box<dyn Fn(&SmolStr) -> Expression> = if embed_fonts {
-        Box::new(|font_path| {
-            Expression::NumberLiteral(
-                {
-                    let mut resources = doc.embedded_file_resources.borrow_mut();
-                    let resource_id = match resources.get(font_path) {
-                        Some(r) => r.id,
-                        None => {
-                            let id = resources.len();
-                            resources.insert(
-                                font_path.clone(),
-                                crate::embedded_resources::EmbeddedResources {
-                                    id,
-                                    kind: crate::embedded_resources::EmbeddedResourcesKind::RawData,
-                                },
-                            );
-                            id
-                        }
-                    };
-                    resource_id as _
-                },
-                Unit::None,
-            )
-        })
-    } else {
-        Box::new(|font_path| Expression::StringLiteral(font_path.clone()))
-    };
+    let mut path_to_id = HashMap::<SmolStr, EmbeddedResourcesIdx>::new();
+    let mut prepare_font_registration_argument: Box<dyn FnMut(&SmolStr) -> Expression> =
+        if embed_fonts {
+            Box::new(|font_path| {
+                let resource_id = *path_to_id.entry(font_path.clone()).or_insert_with(|| {
+                    doc.embedded_file_resources.borrow_mut().push_and_get_key(
+                        crate::embedded_resources::EmbeddedResources {
+                            path: Some(font_path.clone()),
+                            kind: crate::embedded_resources::EmbeddedResourcesKind::FileData,
+                        },
+                    )
+                });
+                Expression::NumberLiteral(resource_id.0 as _, Unit::None)
+            })
+        } else {
+            Box::new(|font_path| Expression::StringLiteral(font_path.clone()))
+        };
 
     for c in doc.exported_roots() {
         c.init_code.borrow_mut().font_registration_code.extend(all_fonts.iter().map(|font_path| {

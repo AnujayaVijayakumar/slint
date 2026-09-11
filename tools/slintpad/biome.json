@@ -1,6 +1,6 @@
 {
-    "root": false,
-    "extends": "//",
+    "root": true,
+    "extends": ["../../biome.json"],
     "files": {
         "includes": [
             "**",
@@ -9,7 +9,9 @@
             "!**/build/**",
             "!**/out/**",
             "!**/playwright-report/**",
-            "!**/test-results/**"
+            "!**/test-results/**",
+            "!preview.html",
+            "!static/**"
         ]
     },
     "linter": {

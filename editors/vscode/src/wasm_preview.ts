@@ -25,7 +25,10 @@ export function update_configuration() {
     if (language_client) {
         send_to_lsp({
             PreviewTypeChanged: {
-                is_external: previewPanel !== null || use_wasm_preview(),
+                target:
+                    previewPanel !== null || use_wasm_preview()
+                        ? "embedded-wasm"
+                        : "child-process",
             },
         });
     }
@@ -146,7 +149,8 @@ function getPreviewHtml(
             vscode.postMessage({ command: "map_url", url: url });
         })},
         "${default_style}",
-        ${experimental ? "true" : "false"}
+        ${experimental ? "true" : "false"},
+        undefined
     );
 
     window.addEventListener('message', async message => {
@@ -229,7 +233,7 @@ function initPreviewPanel(
                     map_url(panel.webview, message.url);
                     return;
                 case "preview_ready":
-                    send_to_lsp({ RequestState: { unused: true } });
+                    send_to_lsp({ RequestState: {} });
                     return;
                 case "slint/preview_to_lsp":
                     send_to_lsp(message.params);

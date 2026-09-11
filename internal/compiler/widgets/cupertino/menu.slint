@@ -21,7 +21,7 @@ export component MenuBarItem {
         hover-background: CupertinoPalette.secondary-control-background;
         pressed-background: CupertinoPalette.secondary-control-background;
         font-size: 13px;
-        font-weight: 300;
+        font-weight: FontWeight.light;
         border-radius: 2px;
     }
 }
@@ -51,16 +51,16 @@ export component MenuItem {
     callback clear-current <=> base.clear-current;
     callback activate <=> base.activate;
 
-    min-height: max(22px, base.min-height);
+    min-height: entry.is-separator ? 5px : max(22px, base.min-height);
+    max-height: entry.is-separator ? 5px : base.max-height;
 
     HorizontalLayout {
         base := MenuItemBase {
             default-foreground: CupertinoPalette.foreground;
+            alternate-foreground: CupertinoPalette.alternate-foreground;
             current-foreground: CupertinoPalette.accent-foreground;
             current-background: CupertinoPalette.accent-background;
             separator-color: CupertinoPalette.border;
-            font-size: CupertinoFontSettings.body.font-size;
-            font-weight: CupertinoFontSettings.body.font-weight;
             border-radius: 5px;
             horizontal-padding: 8px;
             spacing: 4px;

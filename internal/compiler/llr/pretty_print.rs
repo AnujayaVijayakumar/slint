@@ -3,16 +3,36 @@
 
 use std::fmt::{Display, Result, Write};
 
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 
 use crate::expression_tree::MinMaxOp;
+use crate::langtype::{StructName, Type};
+use crate::layout::Orientation;
 
 use super::{
-    CompilationUnit, EvaluationContext, Expression, ParentCtx, PropertyReference, SubComponentIdx,
+    Animation, CompilationUnit, EvaluationContext, Expression, LocalMemberIndex,
+    LocalMemberReference, MemberReference, ParentScope, SubComponentIdx,
 };
 
 pub fn pretty_print(root: &CompilationUnit, writer: &mut dyn Write) -> Result {
     PrettyPrinter { writer, indentation: 0 }.print_root(root)
+}
+
+/// Print compiler-internal builtin structs by their name; they have no slint
+/// name, so `Type`'s Display spells out all their fields.
+struct DisplayType<'a>(&'a Type);
+impl Display for DisplayType<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result {
+        match self.0 {
+            Type::Struct(s) => match &s.name {
+                StructName::Builtin(b) if b.slint_name().is_none() => {
+                    write!(f, "{}", <&str>::from(b))
+                }
+                _ => write!(f, "{}", self.0),
+            },
+            _ => write!(f, "{}", self.0),
+        }
+    }
 }
 
 struct PrettyPrinter<'a> {
@@ -27,8 +47,16 @@ impl PrettyPrinter<'_> {
                 self.print_global(root, idx, g)?;
             }
         }
-        for c in root.sub_components.keys() {
-            self.print_component(root, c, None)?
+        // Repeater, popup, and menu trees print inline under their parent,
+        // because their expressions resolve in the parent scope.
+        for c in &root.used_sub_components {
+            self.print_component(root, *c, None)?
+        }
+        for p in &root.public_components {
+            self.print_component(root, p.item_tree.root, None)?
+        }
+        if let Some(p) = &root.popup_menu {
+            self.print_component(root, p.item_tree.root, None)?
         }
 
         Ok(())
@@ -38,7 +66,7 @@ impl PrettyPrinter<'_> {
         &mut self,
         root: &CompilationUnit,
         sc_idx: SubComponentIdx,
-        parent: Option<ParentCtx<'_>>,
+        parent: Option<&ParentScope<'_>>,
     ) -> Result {
         let ctx = EvaluationContext::new_sub_component(root, sc_idx, (), parent);
         let sc = &root.sub_components[sc_idx];
@@ -46,7 +74,23 @@ impl PrettyPrinter<'_> {
         self.indentation += 1;
         for p in &sc.properties {
             self.indent()?;
-            writeln!(self.writer, "property <{}> {}; //use={}", p.ty, p.name, p.use_count.get())?;
+            writeln!(
+                self.writer,
+                "property <{}> {}; //use={}",
+                DisplayType(&p.ty),
+                p.name,
+                p.use_count.get()
+            )?;
+        }
+        for c in &sc.callbacks {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "callback {} ({}) -> {};",
+                c.name,
+                c.args.iter().map(|t| DisplayType(t).to_string()).join(", "),
+                DisplayType(&c.ret_ty),
+            )?;
         }
         for f in &sc.functions {
             self.indent()?;
@@ -54,28 +98,52 @@ impl PrettyPrinter<'_> {
                 self.writer,
                 "function {} ({}) -> {} {{ {} }}; ",
                 f.name,
-                f.args.iter().map(ToString::to_string).join(", "),
-                f.ret_ty,
-                DisplayExpression(&f.code, &ctx)
+                f.args.iter().map(|t| DisplayType(t).to_string()).join(", "),
+                DisplayType(&f.ret_ty),
+                DisplayExpression(&f.code.borrow(), &ctx)
             )?;
         }
-        for (p1, p2) in &sc.two_way_bindings {
+        for twb in &sc.two_way_bindings {
             self.indent()?;
             writeln!(
                 self.writer,
-                "{} <=> {};",
-                DisplayPropertyRef(p1, &ctx),
-                DisplayPropertyRef(p2, &ctx)
+                "{} <=> {}{}{};",
+                DisplayLocalRef(&twb.prop1, &ctx),
+                DisplayPropertyRef(&twb.prop2, &ctx),
+                if twb.field_access.is_empty() { "" } else { "." },
+                twb.field_access.join(".")
             )?
         }
         for (p, init) in &sc.property_init {
             self.indent()?;
+            write!(
+                self.writer,
+                "{}: {}",
+                DisplayPropertyRef(p, &ctx),
+                DisplayExpression(&init.expression.borrow(), &ctx)
+            )?;
+            match &init.animation {
+                Some(Animation::Static(a)) => {
+                    write!(self.writer, " animate {}", DisplayExpression(a, &ctx))?
+                }
+                Some(Animation::Transition(a)) => {
+                    write!(self.writer, " animate transition {}", DisplayExpression(a, &ctx))?
+                }
+                None => {}
+            }
             writeln!(
                 self.writer,
-                "{}: {};{}",
-                DisplayPropertyRef(p, &ctx),
-                DisplayExpression(&init.expression.borrow(), &ctx),
-                if init.is_constant { " /*const*/" } else { "" }
+                ";{}",
+                if init.kind == super::BindingKind::Constant { " /*const*/" } else { "" }
+            )?
+        }
+        for (p, a) in &sc.animations {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "animate {} {{ {} }};",
+                DisplayLocalRef(p, &ctx),
+                DisplayExpression(a, &ctx)
             )?
         }
         for (p, e) in &sc.change_callbacks {
@@ -85,6 +153,72 @@ impl PrettyPrinter<'_> {
                 "changed {} => {};",
                 DisplayPropertyRef(p, &ctx),
                 DisplayExpression(&e.borrow(), &ctx),
+            )?
+        }
+        for e in &sc.pre_init_code {
+            self.indent()?;
+            writeln!(self.writer, "pre-init => {};", DisplayExpression(&e.borrow(), &ctx))?
+        }
+        for e in &sc.init_code {
+            self.indent()?;
+            writeln!(self.writer, "init => {};", DisplayExpression(&e.borrow(), &ctx))?
+        }
+        for (name, e) in
+            [("layout-info-h", &sc.layout_info_h), ("layout-info-v", &sc.layout_info_v)]
+        {
+            self.indent()?;
+            writeln!(self.writer, "{}: {};", name, DisplayExpression(&e.borrow(), &ctx))?
+        }
+        if let Some(e) = &sc.grid_layout_input_for_repeated {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "grid-layout-input-for-repeated: {};",
+                DisplayExpression(&e.borrow(), &ctx)
+            )?
+        }
+        if let Some(e) = &sc.flexbox_layout_item_info_for_repeated {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "flexbox-layout-item-info-for-repeated: {};",
+                DisplayExpression(&e.borrow(), &ctx)
+            )?
+        }
+        if let Some((cross_o, e)) = &sc.cross_axis_self_alignment_for_repeated {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "cross-axis-self-alignment-for-repeated ({cross_o:?}): {};",
+                DisplayExpression(&e.borrow(), &ctx)
+            )?
+        }
+        if let Some((main_o, e)) = &sc.layout_order_for_repeated {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "layout-order-for-repeated ({main_o:?}): {};",
+                DisplayExpression(&e.borrow(), &ctx)
+            )?
+        }
+        for (i, c) in sc.grid_layout_children.iter_enumerated() {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "grid-layout-child[{}] {{ h: {}; v: {} }};",
+                usize::from(i),
+                DisplayExpression(&c.layout_info_h.borrow(), &ctx),
+                DisplayExpression(&c.layout_info_v.borrow(), &ctx)
+            )?
+        }
+        for t in &sc.timers {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "timer {{ interval: {}; running: {}; triggered => {} }};",
+                DisplayExpression(&t.interval.borrow(), &ctx),
+                DisplayExpression(&t.running.borrow(), &ctx),
+                DisplayExpression(&t.triggered.borrow(), &ctx)
             )?
         }
         for ssc in &sc.sub_components {
@@ -98,18 +232,46 @@ impl PrettyPrinter<'_> {
             });
             writeln!(self.writer, "{} := {} {{ {geometry} }};", item.name, item.ty.class_name)?;
         }
+        for ((item_index, prop), e) in &sc.accessible_prop {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "{}.accessible-{}: {};",
+                item_name_in_tree(root, sc, *item_index)
+                    .unwrap_or_else(|| format!("@{item_index}")),
+                crate::generator::to_kebab_case(prop),
+                DisplayExpression(&e.borrow(), &ctx)
+            )?
+        }
         for (idx, r) in sc.repeated.iter_enumerated() {
             self.indent()?;
-            write!(self.writer, "for in {} : ", DisplayExpression(&r.model.borrow(), &ctx))?;
-            self.print_component(root, r.sub_tree.root, Some(ParentCtx::new(&ctx, Some(idx))))?
+            write!(
+                self.writer,
+                "{} {} : /*@repeater({})*/ ",
+                if r.index_prop.is_none() && r.data_prop.is_none() { "if" } else { "for in" },
+                DisplayExpression(&r.model.borrow(), &ctx),
+                usize::from(idx)
+            )?;
+            self.print_component(root, r.sub_tree.root, Some(&ParentScope::new(&ctx, Some(idx))))?
         }
-        for t in &sc.menu_item_trees {
+        for (i, t) in sc.menu_item_trees.iter().enumerate() {
             self.indent()?;
-            self.print_component(root, t.root, Some(ParentCtx::new(&ctx, None)))?
+            write!(self.writer, "menu : /*@menu({i})*/ ")?;
+            self.print_component(root, t.root, Some(&ParentScope::new(&ctx, None)))?
         }
-        for w in &sc.popup_windows {
+        for (i, w) in sc.popup_windows.iter().enumerate() {
             self.indent()?;
-            self.print_component(root, w.item_tree.root, Some(ParentCtx::new(&ctx, None)))?
+            let parent = ParentScope::new(&ctx, None);
+            // The position is evaluated in the popup's own scope.
+            let popup_ctx =
+                EvaluationContext::new_sub_component(root, w.item_tree.root, (), Some(&parent));
+            write!(
+                self.writer,
+                "{} at {} : /*@popup({i})*/ ",
+                if w.is_tooltip { "tooltip" } else { "popup" },
+                DisplayExpression(&w.position.borrow(), &popup_ctx)
+            )?;
+            self.print_component(root, w.item_tree.root, Some(&parent))?
         }
         self.indentation -= 1;
         self.indent()?;
@@ -128,28 +290,60 @@ impl PrettyPrinter<'_> {
         }
         let aliases = global.aliases.join(",");
         let aliases = if aliases.is_empty() { String::new() } else { format!(" /*{aliases}*/") };
-        writeln!(self.writer, "global {} {{{aliases}", global.name)?;
+        let emission = if global.from_library {
+            " /*from library*/"
+        } else if !global.must_generate() {
+            " /*not generated*/"
+        } else {
+            ""
+        };
+        writeln!(self.writer, "global {} {{{aliases}{emission}", global.name)?;
         self.indentation += 1;
-        for ((p, init), is_const) in
-            std::iter::zip(&global.properties, &global.init_values).zip(&global.const_properties)
-        {
+        for (p, is_const) in std::iter::zip(&global.properties, &global.const_properties) {
             self.indent()?;
-            let init = init.as_ref().map_or(String::new(), |init| {
-                format!(
-                    ": {}{}",
-                    DisplayExpression(&init.expression.borrow(), &ctx,),
-                    if init.is_constant { "/*const*/" } else { "" }
-                )
-            });
             writeln!(
                 self.writer,
-                "property <{}> {}{init}; //use={}{}",
-                p.ty,
+                "property <{}> {}; //use={}{}",
+                DisplayType(&p.ty),
                 p.name,
                 p.use_count.get(),
                 if *is_const { "  const" } else { "" }
             )?;
         }
+        for c in &global.callbacks {
+            self.indent()?;
+            writeln!(
+                self.writer,
+                "callback {} ({}) -> {};",
+                c.name,
+                c.args.iter().map(|t| DisplayType(t).to_string()).join(", "),
+                DisplayType(&c.ret_ty),
+            )?;
+        }
+        for (p, init) in &global.init_values {
+            self.indent()?;
+            match p {
+                LocalMemberIndex::Property(p) => {
+                    writeln!(
+                        self.writer,
+                        "{}: {}{};",
+                        global.properties[*p].name,
+                        DisplayExpression(&init.expression.borrow(), &ctx,),
+                        if init.kind == super::BindingKind::Constant { "/*const*/" } else { "" }
+                    )?;
+                }
+                LocalMemberIndex::Callback(c) => {
+                    writeln!(
+                        self.writer,
+                        "{} => {};",
+                        global.callbacks[*c].name,
+                        DisplayExpression(&init.expression.borrow(), &ctx,),
+                    )?;
+                }
+                _ => unreachable!(),
+            }
+        }
+
         for (p, e) in &global.change_callbacks {
             self.indent()?;
             writeln!(
@@ -167,7 +361,7 @@ impl PrettyPrinter<'_> {
                 f.name,
                 f.args.iter().map(ToString::to_string).join(", "),
                 f.ret_ty,
-                DisplayExpression(&f.code, &ctx)
+                DisplayExpression(&f.code.borrow(), &ctx)
             )?;
         }
         self.indentation -= 1;
@@ -183,60 +377,99 @@ impl PrettyPrinter<'_> {
     }
 }
 
-pub struct DisplayPropertyRef<'a, T>(pub &'a PropertyReference, pub &'a EvaluationContext<'a, T>);
+/// Name an item by its tree index, following sub-component instances to
+/// their root item (the index of an element that is itself a component).
+fn item_name_in_tree(
+    root: &CompilationUnit,
+    sc: &super::SubComponent,
+    tree_index: u32,
+) -> Option<String> {
+    if let Some(item) = sc.items.iter().find(|i| i.index_in_tree == tree_index) {
+        return Some(item.name.to_string());
+    }
+    let ssc = sc.sub_components.iter().find(|s| s.index_in_tree == tree_index)?;
+    Some(format!("{}.{}", ssc.name, item_name_in_tree(root, &root.sub_components[ssc.ty], 0)?))
+}
+
+pub struct DisplayPropertyRef<'a, T>(pub &'a MemberReference, pub &'a EvaluationContext<'a, T>);
 impl<T> Display for DisplayPropertyRef<'_, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result {
-        let mut ctx = self.1;
+        let ctx = self.1;
         match &self.0 {
-            PropertyReference::Local { sub_component_path, property_index } => {
-                if let Some(g) = ctx.current_global() {
-                    write!(f, "{}.{}", g.name, g.properties[*property_index].name)
-                } else {
-                    let mut sc = ctx.current_sub_component().unwrap();
-                    for i in sub_component_path {
-                        write!(f, "{}.", sc.sub_components[*i].name)?;
-                        sc = &ctx.compilation_unit.sub_components[sc.sub_components[*i].ty];
+            MemberReference::Relative { parent_level, local_reference } => {
+                print_local_ref(f, ctx, local_reference, *parent_level)
+            }
+            MemberReference::Global { global_index, member } => {
+                let g = &ctx.compilation_unit.globals[*global_index];
+                match member {
+                    LocalMemberIndex::Property(property_index) => {
+                        write!(f, "{}.{}", g.name, g.properties[*property_index].name)
                     }
-                    write!(f, "{}", sc.properties[*property_index].name)
+                    LocalMemberIndex::Callback(callback_index) => {
+                        write!(f, "{}.{}", g.name, g.callbacks[*callback_index].name)
+                    }
+                    LocalMemberIndex::Function(function_index) => {
+                        write!(f, "{}.{}", g.name, g.functions[*function_index].name)
+                    }
+                    _ => write!(f, "<invalid reference in global>"),
                 }
             }
-            PropertyReference::InNativeItem { sub_component_path, item_index, prop_name } => {
-                let mut sc = ctx.current_sub_component().unwrap();
-                for i in sub_component_path {
-                    write!(f, "{}.", sc.sub_components[*i].name)?;
-                    sc = &ctx.compilation_unit.sub_components[sc.sub_components[*i].ty];
-                }
+        }
+    }
+}
+
+pub struct DisplayLocalRef<'a, T>(pub &'a LocalMemberReference, pub &'a EvaluationContext<'a, T>);
+impl<T> Display for DisplayLocalRef<'_, T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result {
+        print_local_ref(f, self.1, self.0, 0)
+    }
+}
+
+fn print_local_ref<T>(
+    f: &mut std::fmt::Formatter<'_>,
+    ctx: &EvaluationContext<T>,
+    local_ref: &LocalMemberReference,
+    parent_level: usize,
+) -> Result {
+    if let Some(g) = ctx.current_global() {
+        match &local_ref.reference {
+            LocalMemberIndex::Property(property_index) => {
+                write!(f, "{}.{}", g.name, g.properties[*property_index].name)
+            }
+            LocalMemberIndex::Callback(callback_index) => {
+                write!(f, "{}.{}", g.name, g.callbacks[*callback_index].name)
+            }
+            LocalMemberIndex::Function(function_index) => {
+                write!(f, "{}.{}", g.name, g.functions[*function_index].name)
+            }
+            _ => write!(f, "<invalid reference in global>"),
+        }
+    } else {
+        let Some(s) = ctx.parent_sub_component_idx(parent_level) else {
+            return write!(f, "<invalid parent reference>");
+        };
+        let mut sc = &ctx.compilation_unit.sub_components[s];
+
+        for i in &local_ref.sub_component_path {
+            write!(f, "{}.", sc.sub_components[*i].name)?;
+            sc = &ctx.compilation_unit.sub_components[sc.sub_components[*i].ty];
+        }
+        match &local_ref.reference {
+            LocalMemberIndex::Property(property_index) => {
+                write!(f, "{}", sc.properties[*property_index].name)
+            }
+            LocalMemberIndex::Callback(callback_index) => {
+                write!(f, "{}", sc.callbacks[*callback_index].name)
+            }
+            LocalMemberIndex::Function(function_index) => {
+                write!(f, "{}", sc.functions[*function_index].name)
+            }
+            LocalMemberIndex::Native { item_index, prop_name, .. } => {
                 let i = &sc.items[*item_index];
                 write!(f, "{}.{}", i.name, prop_name)
             }
-            PropertyReference::InParent { level, parent_reference } => {
-                for _ in 0..level.get() {
-                    if ctx.parent.is_none() {
-                        return write!(f, "<invalid parent reference>");
-                    }
-                    ctx = ctx.parent.unwrap().ctx;
-                }
-                write!(f, "{}", Self(parent_reference, ctx))
-            }
-            PropertyReference::Global { global_index, property_index } => {
-                let g = &ctx.compilation_unit.globals[*global_index];
-                write!(f, "{}.{}", g.name, g.properties[*property_index].name)
-            }
-            PropertyReference::Function { sub_component_path, function_index } => {
-                if let Some(g) = ctx.current_global() {
-                    write!(f, "{}.{}", g.name, g.functions[*function_index].name)
-                } else {
-                    let mut sc = ctx.current_sub_component().unwrap();
-                    for i in sub_component_path {
-                        write!(f, "{}.", sc.sub_components[*i].name)?;
-                        sc = &ctx.compilation_unit.sub_components[sc.sub_components[*i].ty];
-                    }
-                    write!(f, "{}", sc.functions[*function_index].name)
-                }
-            }
-            PropertyReference::GlobalFunction { global_index, function_index } => {
-                let g = &ctx.compilation_unit.globals[*global_index];
-                write!(f, "{}.{}", g.name, g.functions[*function_index].name)
+            LocalMemberIndex::Timer(timer_index) => {
+                write!(f, "timer#{}", usize::from(*timer_index))
             }
         }
     }
@@ -251,6 +484,9 @@ impl<'a, T> Display for DisplayExpression<'a, T> {
             Expression::StringLiteral(x) => write!(f, "{x:?}"),
             Expression::NumberLiteral(x) => write!(f, "{x:?}"),
             Expression::BoolLiteral(x) => write!(f, "{x:?}"),
+            Expression::KeysLiteral(keys) => {
+                write!(f, "@keys({keys})",)
+            }
             Expression::PropertyReference(x) => write!(f, "{}", DisplayPropertyRef(x, ctx)),
             Expression::FunctionParameterReference { index } => write!(f, "arg_{index}"),
             Expression::StoreLocalVariable { name, value } => {
@@ -263,7 +499,7 @@ impl<'a, T> Display for DisplayExpression<'a, T> {
             Expression::CodeBlock(v) => {
                 write!(f, "{{ {} }}", v.iter().map(e).join("; "))
             }
-            Expression::BuiltinFunctionCall { function, arguments } => {
+            Expression::BuiltinFunctionCall { function, arguments, .. } => {
                 write!(f, "{:?}({})", function, arguments.iter().map(e).join(", "))
             }
             Expression::CallBackCall { callback, arguments } => {
@@ -297,6 +533,9 @@ impl<'a, T> Display for DisplayExpression<'a, T> {
             Expression::ArrayIndexAssignment { array, index, value } => {
                 write!(f, "{}[{}] = {}", e(array), e(index), e(value))
             }
+            Expression::SliceIndexAssignment { slice_name, index, value } => {
+                write!(f, "{}[{}] = {}", slice_name, index, e(value))
+            }
             Expression::BinaryExpression { lhs, rhs, op } => {
                 write!(f, "({} {} {})", e(lhs), op, e(rhs))
             }
@@ -320,37 +559,156 @@ impl<'a, T> Display for DisplayExpression<'a, T> {
                 values.iter().map(|(k, v)| format!("{}: {}", k, e(v))).join(", ")
             ),
             Expression::EasingCurve(x) => write!(f, "{x:?}"),
+            Expression::MouseCursor(x) => write!(f, "{x:?}"),
             Expression::LinearGradient { angle, stops } => write!(
                 f,
                 "@linear-gradient({}, {})",
                 e(angle),
                 stops.iter().map(|(e1, e2)| format!("{} {}", e(e1), e(e2))).join(", ")
             ),
-            Expression::RadialGradient { stops } => write!(
-                f,
-                "@radial-gradient(circle, {})",
-                stops.iter().map(|(e1, e2)| format!("{} {}", e(e1), e(e2))).join(", ")
-            ),
+            Expression::RadialGradient { center, radius, stops } => {
+                let center_str = center
+                    .as_ref()
+                    .map(|(cx, cy)| format!(" at {} {}", e(cx), e(cy)))
+                    .unwrap_or_default();
+                let radius_str = radius.as_ref().map(|r| format!(" {}", e(r))).unwrap_or_default();
+                write!(
+                    f,
+                    "@radial-gradient(circle{radius_str}{center_str}, {})",
+                    stops.iter().map(|(e1, e2)| format!("{} {}", e(e1), e(e2))).join(", ")
+                )
+            }
+            Expression::ConicGradient { from_angle, center, stops } => {
+                let center_str = center
+                    .as_ref()
+                    .map(|(cx, cy)| format!(" at {} {}", e(cx), e(cy)))
+                    .unwrap_or_default();
+                write!(
+                    f,
+                    "@conic-gradient(from {}{center_str}, {})",
+                    e(from_angle),
+                    stops.iter().map(|(e1, e2)| format!("{} {}", e(e1), e(e2))).join(", ")
+                )
+            }
             Expression::EnumerationValue(x) => write!(f, "{x}"),
-            Expression::LayoutCacheAccess { layout_cache_prop, index, repeater_index: None } => {
+            Expression::LayoutCacheAccess {
+                layout_cache_prop,
+                index,
+                repeater_index: None,
+                ..
+            } => {
                 write!(f, "{}[{}]", DisplayPropertyRef(layout_cache_prop, ctx), index)
             }
             Expression::LayoutCacheAccess {
                 layout_cache_prop,
                 index,
                 repeater_index: Some(ri),
+                entries_per_item,
             } => {
-                write!(f, "{}[{} % {}]", DisplayPropertyRef(layout_cache_prop, ctx), index, e(ri))
+                write!(
+                    f,
+                    "{0}[{0}[{1}] + {2} * {3}]",
+                    DisplayPropertyRef(layout_cache_prop, ctx),
+                    index,
+                    e(ri),
+                    entries_per_item
+                )
             }
-            Expression::BoxLayoutFunction { .. } => write!(f, "BoxLayoutFunction(TODO)",),
-            Expression::ComputeDialogLayoutCells { .. } => {
-                write!(f, "ComputeDialogLayoutCells(TODO)",)
+            Expression::GridRepeaterCacheAccess {
+                layout_cache_prop,
+                index,
+                repeater_index,
+                stride,
+                child_offset,
+                inner_repeater_index,
+                entries_per_item,
+            } => {
+                if let Some(inner_idx) = inner_repeater_index {
+                    write!(
+                        f,
+                        "{0}[{0}[{1}] + {2} * {3} + {4} * {5} + {6}]",
+                        DisplayPropertyRef(layout_cache_prop, ctx),
+                        index,
+                        e(repeater_index),
+                        e(stride),
+                        e(inner_idx),
+                        entries_per_item,
+                        child_offset
+                    )
+                } else {
+                    write!(
+                        f,
+                        "{0}[{0}[{1}] + {2} * {3} + {4}]",
+                        DisplayPropertyRef(layout_cache_prop, ctx),
+                        index,
+                        e(repeater_index),
+                        e(stride),
+                        child_offset
+                    )
+                }
             }
+            Expression::WithLayoutItemInfo {
+                cells_variable,
+                repeater_indices_var_name,
+                repeater_steps_var_name,
+                elements,
+                orientation,
+                repeated_cross_size,
+                sub_expression,
+            } => {
+                write!(
+                    f,
+                    "{{ {} = [{}] /*{}*/; ",
+                    cells_variable,
+                    elements
+                        .iter()
+                        .map(|x| match x {
+                            Either::Left(x) => e(x).to_string(),
+                            Either::Right(r) => match &r.cross_width {
+                                Some(w) => format!(
+                                    "@repeater({} at cross-width {})",
+                                    usize::from(r.repeater_index),
+                                    e(w)
+                                ),
+                                None => format!("@repeater({})", usize::from(r.repeater_index)),
+                            },
+                        })
+                        .join(", "),
+                    match orientation {
+                        Orientation::Horizontal => "horizontal",
+                        Orientation::Vertical => "vertical",
+                    }
+                )?;
+                if let Some(v) = repeater_indices_var_name {
+                    write!(f, "{v} = @repeater-indices; ")?;
+                }
+                if let Some(v) = repeater_steps_var_name {
+                    write!(f, "{v} = @repeater-steps; ")?;
+                }
+                if let Some(s) = repeated_cross_size {
+                    write!(f, "@repeated-cross-size = {}; ", e(s))?;
+                }
+                write!(f, "{} }}", e(sub_expression))
+            }
+            Expression::WithFlexboxLayoutItemInfo { .. } => {
+                write!(f, "WithFlexboxLayoutItemInfo(TODO)",)
+            }
+            Expression::BoxLayoutInfoOrthoWithMeasure { .. } => {
+                write!(f, "BoxLayoutInfoOrthoWithMeasure(TODO)",)
+            }
+            Expression::FlexboxLayoutInfoCrossAxisWithMeasure { .. } => {
+                write!(f, "FlexboxLayoutInfoCrossAxisWithMeasure(TODO)",)
+            }
+            Expression::SolveFlexboxLayoutWithMeasure { .. } => {
+                write!(f, "SolveFlexboxLayoutWithMeasure(TODO)",)
+            }
+            Expression::WithGridInputData { .. } => write!(f, "WithGridInputData(TODO)",),
             Expression::MinMax { ty: _, op, lhs, rhs } => match op {
                 MinMaxOp::Min => write!(f, "min({}, {})", e(lhs), e(rhs)),
                 MinMaxOp::Max => write!(f, "max({}, {})", e(lhs), e(rhs)),
             },
             Expression::EmptyComponentFactory => write!(f, "<empty-component-factory>",),
+            Expression::EmptyDataTransfer => write!(f, "<empty-data-transfer>",),
             Expression::TranslationReference { format_args, string_index, plural } => {
                 match plural {
                     Some(plural) => write!(
@@ -367,6 +725,13 @@ impl<'a, T> Display for DisplayExpression<'a, T> {
                         DisplayExpression(format_args, ctx)
                     ),
                 }
+            }
+            Expression::Closure { arg_name, expression } => {
+                let display_name = arg_name.strip_prefix("local_").unwrap_or(arg_name);
+                write!(f, "({}) => {}", display_name, e(expression))
+            }
+            Expression::DebugHook { expression, id } => {
+                write!(f, "debug-hook({id:?}, {})", DisplayExpression(expression, ctx))
             }
         }
     }

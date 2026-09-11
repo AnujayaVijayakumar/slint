@@ -22,9 +22,12 @@ export component AboutSlint {
         }
 
         Text {
-            text: "Version 1.13.0\nhttps://slint.dev/";
+            text: "Version 1.18.0\nhttps://slint.dev/";
             font-size: 10px;
             horizontal-alignment: center;
         }
+    }
+    TouchArea {
+        clicked => { Platform.open-url("https://slint.dev"); }
     }
 }

@@ -3,24 +3,47 @@
 
 //! This module contains all builtin structures exposed in the .slint language.
 
+/// Maps the optional `$(= $field_default:expr)?` capture of a
+/// [`for_each_builtin_structs!`](crate::for_each_builtin_structs) consumer to an `Option`
+/// of the default's `stringify!`-ed tokens:
+/// `builtin_struct_field_default_tokens!($($field_default)?)`.
+/// Note that raw tokens stringify with spaces, such as `- 1.0` or `SortOrder :: Unsorted`.
+#[macro_export]
+macro_rules! builtin_struct_field_default_tokens {
+    () => {
+        None
+    };
+    ($field_default:expr) => {
+        Some(stringify!($field_default))
+    };
+}
+
 /// Call a macro with every builtin structures exposed in the .slint language
+///
+/// Each struct is declared with `pub struct` if it should be re-exported in a public
+/// language-binding module (e.g. `slint::language` in the Rust crate), or plain `struct`
+/// to stay private. Consumers can dispatch on `$vis:vis`.
+///
+/// A field can declare a default value with `= expression` after its type.
+/// The expression is limited to number literals, bool literals, and enum values,
+/// because the consumers translate it to every target language: Rust and C++ use
+/// the expression verbatim, the other consumers apply their own minimal translation
+/// (see [`builtin_struct_field_default_tokens!`](crate::builtin_struct_field_default_tokens))
+/// and fail their build on anything outside the supported subset.
+/// Fields without a default value default to the zero value of their type.
+/// The consumers that generate documentation render the declared value themselves,
+/// so don't mention it in the field's doc comment.
 ///
 /// ## Example
 /// ```rust
 /// macro_rules! print_builtin_structs {
 ///     ($(
 ///         $(#[$struct_attr:meta])*
-///         struct $Name:ident {
-///             @name = $inner_name:literal
-///             export {
-///                 $( $(#[$pub_attr:meta])* $pub_field:ident : $pub_type:ty, )*
-///             }
-///             private {
-///                 $( $(#[$pri_attr:meta])* $pri_field:ident : $pri_type:ty, )*
-///             }
+///         $vis:vis struct $Name:ident {
+///             $( $(#[$field_attr:meta])* $field:ident : $field_type:ty $(= $field_default:tt)?, )*
 ///         }
 ///     )*) => {
-///         $(println!("{} => export:[{}] private:[{}]", stringify!($Name), stringify!($($pub_field),*), stringify!($($pri_field),*));)*
+///         $(println!("{} ({}) => [{}]", stringify!($Name), stringify!($vis), stringify!($($field),*));)*
 ///     };
 /// }
 /// i_slint_common::for_each_builtin_structs!(print_builtin_structs);
@@ -28,7 +51,7 @@
 #[macro_export]
 macro_rules! for_each_builtin_structs {
     ($macro:ident) => {
-        $macro![
+        $macro! {
             /// The `KeyboardModifiers` struct provides booleans to indicate possible modifier keys on a keyboard, such as Shift, Control, etc.
             /// It is provided as part of `KeyEvent`'s `modifiers` field.
             ///
@@ -37,187 +60,157 @@ macro_rules! for_each_builtin_structs {
             /// Slint maps the Command key to the control modifier, and the Control key to the meta modifier.
             ///
             /// On Windows, the Windows key is mapped to the meta modifier.
+            #[non_exhaustive]
             #[derive(Copy, Eq)]
-            struct KeyboardModifiers {
-                @name = "slint::private_api::KeyboardModifiers"
-                export {
-                    /// Indicates the Alt key on a keyboard.
-                    alt: bool,
-                    /// Indicates the Control key on a keyboard, except on macOS, where it is the Command key (⌘).
-                    control: bool,
-                    /// Indicates the Shift key on a keyboard.
-                    shift: bool,
-                    /// Indicates the Control key on macos, and the Windows key on Windows.
-                    meta: bool,
-                }
-                private {
-                }
+            pub struct KeyboardModifiers {
+                /// Indicates the Alt key on a keyboard.
+                alt: bool,
+                /// Indicates the Control key on a keyboard, except on macOS, where it is the Command key (⌘).
+                control: bool,
+                /// Indicates the Shift key on a keyboard.
+                shift: bool,
+                /// Indicates the Control key on macos, and the Windows key on Windows.
+                meta: bool,
             }
 
             /// Represents a Pointer event sent by the windowing system.
             /// This structure is passed to the `pointer-event` callback of the `TouchArea` element.
-            struct PointerEvent {
-                @name = "slint::private_api::PointerEvent"
-                export {
-                    /// The button that was pressed or released
-                    button: PointerEventButton,
-                    /// The kind of the event
-                    kind: PointerEventKind,
-                    /// The keyboard modifiers pressed during the event
-                    modifiers: KeyboardModifiers,
-                }
-                private {
-                }
+            #[non_exhaustive]
+            pub struct PointerEvent {
+                /// The button that was pressed or released
+                button: PointerEventButton,
+                /// The kind of the event
+                kind: PointerEventKind,
+                /// The keyboard modifiers pressed during the event
+                modifiers: KeyboardModifiers,
+                /// The unique ID of the touch point, indicating the finger ID. 0 means it's not a touch event (e.g., mouse).
+                touch_finger_id: i32,
             }
 
             /// Represents a Pointer scroll (or wheel) event sent by the windowing system.
             /// This structure is passed to the `scroll-event` callback of the `TouchArea` element.
-            struct PointerScrollEvent {
-                @name = "slint::private_api::PointerScrollEvent"
-                export {
-                    /// The amount of pixel in the horizontal direction
-                    delta_x: Coord,
-                    /// The amount of pixel in the vertical direction
-                    delta_y: Coord,
-                    /// The keyboard modifiers pressed during the event
-                    modifiers: KeyboardModifiers,
-                }
-                private {
-                }
+            #[non_exhaustive]
+            pub struct PointerScrollEvent {
+                /// The amount of pixel in the horizontal direction
+                delta_x: Coord,
+                /// The amount of pixel in the vertical direction
+                delta_y: Coord,
+                /// The keyboard modifiers pressed during the event
+                modifiers: KeyboardModifiers,
             }
 
             /// This structure is generated and passed to the key press and release callbacks of the `FocusScope` element.
-            struct KeyEvent {
-                @name = "slint::private_api::KeyEvent"
-                export {
-                    /// The unicode representation of the key pressed.
-                    text: SharedString,
-                    /// The keyboard modifiers active at the time of the key press event.
-                    modifiers: KeyboardModifiers,
-                    /// This field is set to true for key press events that are repeated,
-                    /// i.e. the key is held down. It's always false for key release events.
-                    repeat: bool,
-                }
-                private {
-                    /// Indicates whether the key was pressed or released
-                    event_type: KeyEventType,
-                    /// If the event type is KeyEventType::UpdateComposition or KeyEventType::CommitComposition,
-                    /// then this field specifies what part of the current text to replace.
-                    /// Relative to the offset of the pre-edit text within the text input element's text.
-                    replacement_range: Option<core::ops::Range<i32>>,
-                    /// If the event type is KeyEventType::UpdateComposition, this is the new pre-edit text
-                    preedit_text: SharedString,
-                    /// The selection within the preedit_text
-                    preedit_selection: Option<core::ops::Range<i32>>,
-                    /// The new cursor position, when None, the cursor is put after the text that was just inserted
-                    cursor_position: Option<i32>,
-                    anchor_position: Option<i32>,
-                }
+            #[non_exhaustive]
+            pub struct KeyEvent {
+                /// The unicode representation of the key pressed.
+                text: SharedString,
+                /// The keyboard modifiers active at the time of the key press event.
+                modifiers: KeyboardModifiers,
+                /// This field is set to true for key press events that are repeated,
+                /// i.e. the key is held down. It's always false for key release events.
+                repeat: bool,
             }
 
             /// This structure is passed to the callbacks of the `DropArea` element
-            struct DropEvent {
-                @name = "slint::private_api::DropEvent"
-                export {
-                    /// The mime type of the data being dragged
-                    mime_type: SharedString,
-                    /// The data being dragged
-                    data: SharedString,
-                    /// The current mouse position in coordinates of the `DropArea` element
-                    position: LogicalPosition,
-                }
-                private {
-                }
+            #[non_exhaustive]
+            pub struct DropEvent {
+                /// The payload set on the source `DragArea`.
+                data: DataTransfer,
+
+                /// The cursor position in the `DropArea`'s local coordinates.
+                position: LogicalPosition,
+
+                /// The action negotiated from current modifier state, clamped to the allowed set;
+                /// when no modifier is pressed, the first allowed of move, copy, link.
+                /// Updated on every `DragMove`. The target's `can-drop` callback can return this
+                /// to honor the user's modifier choice, or override with any other allowed action.
+                proposed_action: DragAction,
             }
 
             /// Represents an item in a StandardListView and a StandardTableView.
             #[non_exhaustive]
-            struct StandardListViewItem {
-                @name = "slint::StandardListViewItem"
-                export {
-                    /// The text content of the item
-                    text: SharedString,
-                }
-                private {
-                }
+            pub struct StandardListViewItem {
+                /// The text content of the item
+                text: SharedString,
             }
 
             /// This is used to define the column and the column header of a TableView
             #[non_exhaustive]
-            struct TableColumn {
-                @name = "slint::private_api::TableColumn"
-                export {
-                    /// The title of the column header
-                    title: SharedString,
-                    /// The minimum column width (logical length)
-                    min_width: Coord,
-                    /// The horizontal column stretch
-                    horizontal_stretch: f32,
-                    /// Sorts the column
-                    sort_order: SortOrder,
-                    /// the actual width of the column (logical length)
-                    width: Coord,
-                }
-                private {
-                }
-            }
-
-            /// Value of the state property
-            /// A state is just the current state, but also has information about the previous state and the moment it changed
-            struct StateInfo {
-                @name = "slint::private_api::StateInfo"
-                export {
-                    /// The current state value
-                    current_state: i32,
-                    /// The previous state
-                    previous_state: i32,
-                }
-                private {
-                    /// The instant in which the state changed last
-                    change_time: crate::animations::Instant,
-                }
+            pub struct TableColumn {
+                /// The title of the column header
+                title: SharedString,
+                /// The minimum column width (logical length)
+                min_width: Coord,
+                /// The horizontal column stretch
+                horizontal_stretch: f32,
+                /// Sorts the column
+                sort_order: SortOrder,
+                /// the actual width of the column (logical length)
+                width: Coord,
             }
 
             /// A structure to hold metrics of a font for a specified pixel size.
             struct FontMetrics {
-                @name = "slint::private_api::FontMetrics"
-                export {
-                    /// The distance between the baseline and the top of the tallest glyph in the font.
-                    ascent: Coord,
-                    /// The distance between the baseline and the bottom of the tallest glyph in the font.
-                    /// This is usually negative.
-                    descent: Coord,
-                    /// The distance between the baseline and the horizontal midpoint of the tallest glyph in the font,
-                    /// or zero if not specified by the font.
-                    x_height: Coord,
-                    /// The distance between the baseline and the top of a regular upper-case glyph in the font,
-                    /// or zero if not specified by the font.
-                    cap_height: Coord,
-                }
-                private {
-                }
+                /// The distance between the baseline and the top of the tallest glyph in the font.
+                ascent: Coord,
+                /// The distance between the baseline and the bottom of the tallest glyph in the font.
+                /// This is usually negative.
+                descent: Coord,
+                /// The distance between the baseline and the horizontal midpoint of the tallest glyph in the font,
+                /// or zero if not specified by the font.
+                x_height: Coord,
+                /// The distance between the baseline and the top of a regular upper-case glyph in the font,
+                /// or zero if not specified by the font.
+                cap_height: Coord,
+            }
+
+            /// This structure holds the hints that a `TextInput` gives to the platform's input method
+            /// (e.g. a soft keyboard) about the expected input.
+            /// The input method may take these hints into account, but might also ignore them.
+            #[non_exhaustive]
+            pub struct InputMethodHints {
+                /// The auto-capitalization behavior that the input method should apply.
+                capitalization: CapitalizationMode = (CapitalizationMode::Sentences),
+                /// Hint that the input method may automatically correct spelling mistakes as the user types.
+                auto_correct: bool = true,
+                /// Hint that the input method may offer auto-completion suggestions for the entered text.
+                auto_complete: bool = true,
             }
 
             /// An item in the menu of a menu bar or context menu
             struct MenuEntry {
-                @name = "slint::private_api::MenuEntry"
-                export {
-                    /// The text of the menu entry
-                    title: SharedString,
-                    /// the icon associated with the menu entry
-                    icon: Image,
-                    /// an opaque id that can be used to identify the menu entry
-                    id: SharedString,
-                    // keyboard_shortcut: KeySequence,
-                    /// whether the menu entry is enabled
-                    enabled: bool,
-                    /// Sub menu
-                    has_sub_menu: bool,
-                    /// The menu entry is a separator
-                    is_separator: bool,
-                }
-                private {}
+                /// The text of the menu entry
+                title: SharedString,
+                /// the icon associated with the menu entry
+                icon: Image,
+                /// an opaque id that can be used to identify the menu entry
+                id: SharedString,
+                // keys: KeySequence,
+                /// whether the menu entry is enabled
+                enabled: bool,
+                /// whether the menu entry is checkable
+                checkable: bool,
+                /// whether the menu entry is checked
+                checked: bool,
+                /// Sub menu
+                has_sub_menu: bool,
+                /// The menu entry is a separator
+                is_separator: bool,
+                /// The shortcut keys
+                shortcut: Keys,
             }
-        ];
+
+            /// A structure representing the four edges of an axis-aligned rectangle
+            struct Edges {
+                /// The left edge value
+                left: Coord,
+                /// The top edge value
+                top: Coord,
+                /// The right edge value
+                right: Coord,
+                /// The bottom edge value
+                bottom: Coord,
+            }
+        }
     };
 }

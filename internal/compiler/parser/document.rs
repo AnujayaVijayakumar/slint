@@ -15,6 +15,7 @@ use super::r#type::{parse_enum_declaration, parse_rustattr, parse_struct_declara
 /// struct Foo { foo: foo }
 /// enum Foo { hello }
 /// @rust-attr(...) struct X {}
+/// @rust-attr(...) @rust-attr(...) enum X {}
 /// /* empty */
 /// ```
 pub fn parse_document(p: &mut impl Parser) -> bool {
@@ -57,7 +58,10 @@ pub fn parse_document(p: &mut impl Parser) -> bool {
                 if !parse_rustattr(&mut *p) {
                     break;
                 }
-                let is_export = p.nth(0).as_str() == "export";
+                while p.peek().as_str() == "@" && p.nth(1).as_str() == "rust-attr" {
+                    parse_rustattr(&mut *p);
+                }
+                let is_export = p.peek().as_str() == "export";
                 let i = if is_export { 1 } else { 0 };
                 if !matches!(p.nth(i).as_str(), "enum" | "struct") {
                     p.error("Expected enum or struct after @rust-attr");
@@ -65,9 +69,9 @@ pub fn parse_document(p: &mut impl Parser) -> bool {
                 }
                 let r = if is_export {
                     parse_export(&mut *p, Some(checkpoint))
-                } else if p.nth(0).as_str() == "struct" {
+                } else if p.peek().as_str() == "struct" {
                     parse_struct_declaration(&mut *p, Some(checkpoint))
-                } else if p.nth(0).as_str() == "enum" {
+                } else if p.peek().as_str() == "enum" {
                     parse_enum_declaration(&mut *p, Some(checkpoint))
                 } else {
                     false
@@ -99,19 +103,21 @@ pub fn parse_document(p: &mut impl Parser) -> bool {
 /// global Struct { property<int> xx; }
 /// component C { property<int> xx; }
 /// component C inherits D { }
+/// interface I { property<int> xx; }
 /// ```
 pub fn parse_component(p: &mut impl Parser) -> bool {
     let simple_component = p.nth(1).kind() == SyntaxKind::ColonEqual;
     let is_global = !simple_component && p.peek().as_str() == "global";
+    let is_interface = !simple_component && p.peek().as_str() == "interface";
     let is_new_component = !simple_component && p.peek().as_str() == "component";
-    if !is_global && !simple_component && !is_new_component {
+    if !is_global && !simple_component && !is_new_component && !is_interface {
         p.error(
             "Parse error: expected a top-level item such as a component, a struct, or a global",
         );
         return false;
     }
     let mut p = p.start_node(SyntaxKind::Component);
-    if is_global || is_new_component {
+    if is_global || is_new_component || is_interface {
         p.consume();
     }
     if !p.start_node(SyntaxKind::DeclaredIdentifier).expect(SyntaxKind::Identifier) {
@@ -122,6 +128,16 @@ pub fn parse_component(p: &mut impl Parser) -> bool {
         if p.peek().kind() == SyntaxKind::ColonEqual {
             p.warning("':=' to declare a global is deprecated. Remove the ':='");
             p.consume();
+        }
+    } else if is_interface {
+        if p.peek().kind() == SyntaxKind::ColonEqual {
+            p.error("':=' to declare an interface is not supported. Remove the ':='");
+            p.consume();
+        }
+        if p.peek().as_str() == "inherits" {
+            p.error("Interface inheritance is not supported");
+            drop(p.start_node(SyntaxKind::Element));
+            return false;
         }
     } else if !is_new_component {
         if p.peek().kind() == SyntaxKind::ColonEqual {
@@ -144,7 +160,7 @@ pub fn parse_component(p: &mut impl Parser) -> bool {
         return false;
     }
 
-    if is_global && p.peek().kind() == SyntaxKind::LBrace {
+    if (is_global || is_interface) && p.peek().kind() == SyntaxKind::LBrace {
         let mut p = p.start_node(SyntaxKind::Element);
         p.consume();
         parse_element_content(&mut *p);

@@ -1,5 +1,4 @@
 ---
-<!-- Copyright © SixtyFPS GmbH <info@slint.dev> ; SPDX-License-Identifier: MIT -->
 title: Web
 description: Running Slint on the Web with Wasm
 ---
@@ -38,7 +37,7 @@ For a step-by-step walkthrough, check out the last chapter of the <Link type="qu
 
 Below is a summary of the main steps:
 
-In your `Cargo.toml`, set the crate type to `"cdylib"` and add [`wasm-bindgen`](https://rustwasm.github.io/wasm-bindgen/) as a dependency for the "wasm" target:
+In your `Cargo.toml`, set the crate type to `"cdylib"` and add [`wasm-bindgen`](https://wasm-bindgen.github.io/wasm-bindgen/) as a dependency for the "wasm" target:
 
 ```toml
 [lib]
@@ -66,7 +65,7 @@ pub fn main() {
 }
 ```
 
-Build the application using [wasm-pack](https://rustwasm.github.io/wasm-pack/).
+Build the application using [wasm-pack](https://wasm-bindgen.github.io/wasm-pack/).
 
 ```bash
 wasm-pack build --release --target web
@@ -90,15 +89,3 @@ Replace `YOUR_APPLICATION` with the name of your crate.
 :::note[Note]
 Many web browser load `.wasm` files only in trusted contexts. If during development you observe the browser producing permission errors, then you may need to serve files through a web server, instead of the file system directly.
 :::
-
-## Clipboard Support
-
-Slint's text input widgets supports copy and paste when running in the browser.
-This is implemented using the browser's clipboard API via the `web-sys` crate.
-Because the clipboard API in `web-sys` is still unstable, you need to opt in by setting the following environment variable when building:
-
-```bash
-RUSTFLAGS=--cfg=web_sys_unstable_apis
-```
-
-You can read more in the [`web-sys` unstable APIs documentation](https://rustwasm.github.io/docs/wasm-bindgen/web-sys/unstable-apis.html).

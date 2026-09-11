@@ -1,15 +1,16 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-use crate::common::{self, Result, SourceFileVersion};
+use crate::editor_preview::{self, Result};
 use crate::util;
 use i_slint_compiler::diagnostics::Spanned;
-use i_slint_compiler::expression_tree::{Expression, Unit};
-use i_slint_compiler::langtype::{ElementType, Type};
+use i_slint_compiler::expression_tree::{Expression, TwoWayBinding, Unit};
+use i_slint_compiler::langtype::{ElementType, PropertyLookupMode, Type};
 use i_slint_compiler::object_tree::{Element, ElementRc, PropertyDeclaration, PropertyVisibility};
 use i_slint_compiler::parser::{
-    syntax_nodes, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
+    SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize, syntax_nodes,
 };
+use i_slint_live_preview::protocol::SourceFileVersion;
 use lsp_types::Url;
 use smol_str::{SmolStr, ToSmolStr};
 
@@ -80,13 +81,14 @@ pub struct PropertyInformation {
 #[derive(Clone, Debug)]
 pub struct ElementInformation {
     pub id: SmolStr,
+    pub component_name: SmolStr,
     pub type_name: SmolStr,
-    pub range: TextRange,
+    pub offset: TextSize,
 }
 
 #[derive(Clone, Debug)]
 pub struct QueryPropertyResponse {
-    pub element_rc_node: common::ElementRcNode,
+    pub element_rc_node: editor_preview::ElementRcNode,
     pub properties: Vec<PropertyInformation>,
     pub element: Option<ElementInformation>,
     pub source_uri: String,
@@ -96,7 +98,8 @@ pub struct QueryPropertyResponse {
 const HIGH_PRIORITY: u32 = 100;
 const DEFAULT_PRIORITY: u32 = 1000;
 
-// This gets defined accessibility properties...
+// This returns defined reserved properties such as x, y, width, height,
+// accessibility properties or layout properties
 fn get_reserved_properties<'a>(
     group: &'a str,
     group_priority: u32,
@@ -140,10 +143,15 @@ fn add_element_properties(
     group: &str,
     group_priority: u32,
     is_local_element: bool,
+    shadowed: &HashSet<SmolStr>,
     result: &mut Vec<PropertyInformation>,
 ) {
     result.extend(element.property_declarations.iter().filter_map(move |(name, value)| {
         if !property_is_editable(value, is_local_element) {
+            return None;
+        }
+        let name = value.declared_name(name);
+        if shadowed.contains(name) {
             return None;
         }
 
@@ -280,22 +288,26 @@ fn find_code_block_or_expression(
 }
 
 fn find_property_binding_offset(
-    element: &common::ElementRcNode,
+    element: &editor_preview::ElementRcNode,
     property_name: &str,
 ) -> Option<u32> {
     let element_range = element.with_element_node(|node| node.text_range());
 
     let element = element.element.borrow();
 
-    if let Some(v) = element.bindings.get(property_name) {
-        if let Some(span) = &v.borrow().span {
-            let offset = span.span().offset as u32;
-            if element.source_file().map(|sf| sf.path())
-                == span.source_file.as_ref().map(|sf| sf.path())
-                && element_range.contains(offset.into())
-            {
-                return Some(offset);
-            }
+    // A member that shadows an inherited one is stored under a mangled internal key.
+    let key = element
+        .lookup_property(property_name, PropertyLookupMode::ComponentLocal)
+        .internal_or_resolved_name();
+    if let Some(v) = element.binding_cell_including_synthetic(&key)
+        && let Some(span) = &v.borrow().span
+    {
+        let offset = span.span().offset as u32;
+        if element.source_file().map(|sf| sf.path())
+            == span.source_file.as_ref().map(|sf| sf.path())
+            && element_range.contains(offset.into())
+        {
+            return Some(offset);
         }
     }
 
@@ -311,7 +323,7 @@ pub enum LayoutKind {
 }
 
 fn insert_property_definitions(
-    element: &common::ElementRcNode,
+    element: &editor_preview::ElementRcNode,
     mut properties: Vec<PropertyInformation>,
 ) -> Vec<PropertyInformation> {
     fn binding_value(element: &ElementRc, prop: &str, count: &mut usize) -> Expression {
@@ -321,14 +333,30 @@ fn insert_property_definitions(
             return Expression::Invalid;
         }
 
-        if let Some(binding) = element.borrow().bindings.get(prop) {
-            let e = binding.borrow().expression.clone();
+        // A member that shadows an inherited one is stored under a mangled internal key.
+        let key = element
+            .borrow()
+            .lookup_property(prop, PropertyLookupMode::ComponentLocal)
+            .internal_or_resolved_name();
+        if let Some(binding) = element.borrow().binding(&key) {
+            let e = binding.expression.ignore_debug_hooks().clone();
             if !matches!(e, Expression::Invalid) {
                 return e;
             }
-            for nr in &binding.borrow().two_way_bindings {
-                let e = binding_value(&nr.element(), nr.name(), count);
+            for twb in &binding.two_way_bindings {
+                let (mut e, field_access) = match twb {
+                    TwoWayBinding::Property { property, field_access } => {
+                        (binding_value(&property.element(), property.name(), count), field_access)
+                    }
+                    TwoWayBinding::ModelData { repeated_element, field_access } => (
+                        Expression::RepeaterModelReference { element: repeated_element.clone() },
+                        field_access,
+                    ),
+                };
                 if !matches!(e, Expression::Invalid) {
+                    for f in field_access {
+                        e = Expression::StructFieldAccess { base: e.into(), name: f.clone() }
+                    }
                     return e;
                 }
             }
@@ -358,11 +386,15 @@ fn insert_property_definitions(
 }
 
 pub(super) fn get_properties(
-    element: &common::ElementRcNode,
+    element: &editor_preview::ElementRcNode,
     in_layout: LayoutKind,
 ) -> Vec<PropertyInformation> {
     let mut result = Vec::new();
-    add_element_properties(&element.element.borrow(), "", 0, true, &mut result);
+    // A member shadowed by a nearer element is unreachable under that name, so only the
+    // shadowing declaration is listed
+    let mut shadowed = HashSet::new();
+    add_element_properties(&element.element.borrow(), "", 0, true, &shadowed, &mut result);
+    shadowed.extend(element.element.borrow().shadowing_members.keys().cloned());
 
     let mut current_element = element.element.clone();
     let mut depth = 0u32;
@@ -375,7 +407,11 @@ pub(super) fn get_properties(
         match base_type {
             ElementType::Component(c) => {
                 current_element = c.root_element.clone();
-                add_element_properties(&current_element.borrow(), &c.id, depth, false, &mut result);
+                {
+                    let current = current_element.borrow();
+                    add_element_properties(&current, &c.id, depth, false, &shadowed, &mut result);
+                    shadowed.extend(current.visible_shadowing_members().cloned());
+                }
                 continue;
             }
             ElementType::Builtin(b) => {
@@ -466,12 +502,24 @@ pub(super) fn get_properties(
                     group_priority: depth,
                 });
 
-                if b.name == "Image" {
+                let transform_origin = i_slint_compiler::typeregister::transform_origin_property();
+                result.extend(get_reserved_properties(
+                    &b.name,
+                    depth,
+                    i_slint_compiler::typeregister::RESERVED_TRANSFORM_PROPERTIES
+                        .iter()
+                        .cloned()
+                        .chain(std::iter::once((transform_origin.0, transform_origin.1.into()))),
+                ));
+
+                if matches!(b.name.as_str(), "GridLayout" | "HorizontalLayout" | "VerticalLayout") {
+                    // Add the padding that is otherwise filtered out
                     result.extend(get_reserved_properties(
                         &b.name,
                         depth,
-                        i_slint_compiler::typeregister::RESERVED_ROTATION_PROPERTIES
+                        i_slint_compiler::typeregister::RESERVED_LAYOUT_PROPERTIES
                             .iter()
+                            .filter(|x| x.0.starts_with("padding"))
                             .cloned(),
                     ));
                 }
@@ -506,14 +554,17 @@ pub(super) fn get_properties(
                 p
             }),
         );
+
         result.extend(
             get_reserved_properties(
                 "layout",
                 depth + 2000,
-                i_slint_compiler::typeregister::RESERVED_LAYOUT_PROPERTIES.iter().cloned(),
+                i_slint_compiler::typeregister::RESERVED_LAYOUT_PROPERTIES
+                    .iter()
+                    // padding for non-layout items is not yet implemented
+                    .filter(|x| !x.0.starts_with("padding"))
+                    .cloned(),
             )
-            // padding arbitrary items is not yet implemented
-            .filter(|x| !x.name.starts_with("padding"))
             .map(|mut p| {
                 match p.name.as_str() {
                     "min-width" => p.priority = 200,
@@ -540,7 +591,7 @@ pub(super) fn get_properties(
             name: "accessible-role".into(),
             priority: DEFAULT_PRIORITY - 100,
             ty: Type::Enumeration(
-                i_slint_compiler::typeregister::BUILTIN.with(|e| e.enums.AccessibleRole.clone()),
+                i_slint_compiler::typeregister::BUILTIN.enums.AccessibleRole.clone(),
             ),
             visibility: PropertyVisibility::InOut,
             declared_at: None,
@@ -564,7 +615,7 @@ pub(super) fn get_properties(
     insert_property_definitions(element, result)
 }
 
-fn find_block_range(element: &common::ElementRcNode) -> Option<TextRange> {
+fn find_block_range(element: &editor_preview::ElementRcNode) -> Option<TextRange> {
     element.with_element_node(|node| {
         let open_brace = node.child_token(SyntaxKind::LBrace)?;
         let close_brace = node.child_token(SyntaxKind::RBrace)?;
@@ -573,21 +624,28 @@ fn find_block_range(element: &common::ElementRcNode) -> Option<TextRange> {
     })
 }
 
-fn get_element_information(element: &common::ElementRcNode) -> ElementInformation {
-    let range = element.with_decorated_node(|node| util::node_range_without_trailing_ws(&node));
+fn get_element_information(element: &editor_preview::ElementRcNode) -> ElementInformation {
+    let offset = element.with_element_node(|n| n.text_range().start());
     let e = element.element.borrow();
+    let component_name = element.with_element_node(|n| {
+        if let Some(c) = n.parent().and_then(|p| syntax_nodes::Component::new(p.clone())) {
+            c.DeclaredIdentifier().text().to_smolstr()
+        } else {
+            SmolStr::default()
+        }
+    });
     let type_name = if matches!(&e.base_type, ElementType::Builtin(b) if b.name == "Empty") {
         SmolStr::default()
     } else {
         e.base_type.to_smolstr()
     };
-    ElementInformation { id: e.id.clone(), type_name, range }
+    ElementInformation { id: e.id.clone(), component_name, type_name, offset }
 }
 
 pub(crate) fn query_properties(
     uri: &Url,
     source_version: SourceFileVersion,
-    element: &common::ElementRcNode,
+    element: &editor_preview::ElementRcNode,
     in_layout: LayoutKind,
 ) -> Result<QueryPropertyResponse> {
     Ok(QueryPropertyResponse {
@@ -615,11 +673,12 @@ fn create_text_document_edit_for_set_binding_on_existing_property(
     version: SourceFileVersion,
     property: &PropertyInformation,
     new_expression: String,
+    format: editor_preview::ByteFormat,
 ) -> Option<lsp_types::TextDocumentEdit> {
     property.defined_at.as_ref().map(|defined_at| {
-        let range = util::node_to_lsp_range(&defined_at.code_block_or_expression);
+        let range = util::node_to_lsp_range(&defined_at.code_block_or_expression, format);
         let edit = lsp_types::TextEdit { range, new_text: new_expression };
-        common::create_text_document_edit(uri, version, vec![edit])
+        editor_preview::editing::create_text_document_edit(uri, version, vec![edit])
     })
 }
 
@@ -642,10 +701,10 @@ fn find_insert_position_relative_to_defined_properties(
             if property_index == usize::MAX {
                 previous_property = Some((i, defined_at.selection_range.end()));
             } else {
-                if let Some((pi, _)) = previous_property {
-                    if (i - property_index) >= (property_index - pi) {
-                        break;
-                    }
+                if let Some((pi, _)) = previous_property
+                    && (i - property_index) >= (property_index - pi)
+                {
+                    break;
                 }
                 let p = defined_at.selection_range.start();
                 return Some((TextRange::new(p, p), InsertPosition::Before));
@@ -674,10 +733,11 @@ fn find_insert_range_for_property(
 fn create_text_document_edit_for_set_binding_on_known_property(
     uri: Url,
     version: SourceFileVersion,
-    element: &common::ElementRcNode,
+    element: &editor_preview::ElementRcNode,
     properties: &[PropertyInformation],
     property_name: &str,
     new_expression: &str,
+    format: editor_preview::ByteFormat,
 ) -> Option<lsp_types::TextDocumentEdit> {
     let block_range = find_block_range(element);
 
@@ -686,7 +746,7 @@ fn create_text_document_edit_for_set_binding_on_known_property(
             let source_file = element.with_element_node(|n| n.source_file.clone());
             let indent = util::find_element_indent(element).unwrap_or_default();
             let edit = lsp_types::TextEdit {
-                range: util::text_range_to_lsp_range(&source_file, range),
+                range: util::text_range_to_lsp_range(&source_file, range, format),
                 new_text: match insert_type {
                     InsertPosition::Before => {
                         format!("{property_name}: {new_expression};\n{indent}    ")
@@ -696,7 +756,7 @@ fn create_text_document_edit_for_set_binding_on_known_property(
                     }
                 },
             };
-            common::create_text_document_edit(uri, version, vec![edit])
+            editor_preview::editing::create_text_document_edit(uri, version, vec![edit])
         },
     )
 }
@@ -704,20 +764,23 @@ fn create_text_document_edit_for_set_binding_on_known_property(
 pub fn set_binding(
     uri: Url,
     version: SourceFileVersion,
-    element: &common::ElementRcNode,
+    element: &editor_preview::ElementRcNode,
     property_name: &str,
     new_expression: String,
+    format: editor_preview::ByteFormat,
 ) -> Option<lsp_types::WorkspaceEdit> {
-    set_binding_impl(uri, version, element, property_name, new_expression)
-        .map(|edit| common::create_workspace_edit_from_text_document_edits(vec![edit]))
+    set_binding_impl(uri, version, element, property_name, new_expression, format).map(|edit| {
+        editor_preview::editing::create_workspace_edit_from_text_document_edits(vec![edit])
+    })
 }
 
 pub fn set_binding_impl(
     uri: Url,
     version: SourceFileVersion,
-    element: &common::ElementRcNode,
+    element: &editor_preview::ElementRcNode,
     property_name: &str,
     new_expression: String,
+    format: editor_preview::ByteFormat,
 ) -> Option<lsp_types::TextDocumentEdit> {
     let properties = get_properties(element, LayoutKind::None);
     let property = get_property_information(&properties, property_name).ok()?;
@@ -729,6 +792,7 @@ pub fn set_binding_impl(
             version,
             &property,
             new_expression,
+            format,
         )
     } else {
         // Add a new definition to a known property:
@@ -739,6 +803,7 @@ pub fn set_binding_impl(
             &properties,
             property_name,
             &new_expression,
+            format,
         )
     }
 }
@@ -747,23 +812,26 @@ pub fn set_binding_impl(
 pub fn set_bindings(
     uri: Url,
     version: SourceFileVersion,
-    element: &common::ElementRcNode,
-    properties: &[crate::common::PropertyChange],
+    element: &editor_preview::ElementRcNode,
+    properties: &[crate::editor_preview::editing::PropertyChange],
+    format: editor_preview::ByteFormat,
 ) -> Option<lsp_types::WorkspaceEdit> {
     let edits = properties
         .iter()
-        .filter_map(|p| set_binding_impl(uri.clone(), version, element, &p.name, p.value.clone()))
+        .filter_map(|p| {
+            set_binding_impl(uri.clone(), version, element, &p.name, p.value.clone(), format)
+        })
         .collect::<Vec<_>>();
 
     (edits.len() == properties.len())
-        .then_some(common::create_workspace_edit_from_text_document_edits(edits))
+        .then_some(editor_preview::editing::create_workspace_edit_from_text_document_edits(edits))
 }
 
 #[cfg(any(feature = "preview-external", feature = "preview-engine"))]
 fn element_at_source_code_position(
-    document_cache: &common::DocumentCache,
-    position: &common::VersionedPosition,
-) -> Result<common::ElementRcNode> {
+    document_cache: &editor_preview::DocumentCache,
+    position: &editor_preview::editing::VersionedPosition,
+) -> Result<editor_preview::ElementRcNode> {
     if &document_cache.document_version(position.url()) != position.version() {
         return Err("Document version mismatch.".into());
     }
@@ -777,22 +845,29 @@ fn element_at_source_code_position(
         .as_ref()
         .map(|n| n.source_file.clone())
         .ok_or_else(|| "Document had no node".to_string())?;
-    let element_position = util::text_size_to_lsp_position(&source_file, position.offset());
+    let element_position =
+        util::text_size_to_lsp_position(&source_file, position.offset(), document_cache.format);
 
     Ok(document_cache.element_at_position(position.url(), &element_position).ok_or_else(|| {
-        format!("No element found at the given start position {:?}", &element_position)
+        format!("No element found at the given start position {element_position:?}")
     })?)
 }
 
 #[cfg(any(feature = "preview-external", feature = "preview-engine"))]
 pub fn update_element_properties(
-    document_cache: &common::DocumentCache,
-    position: common::VersionedPosition,
-    properties: Vec<common::PropertyChange>,
+    document_cache: &editor_preview::DocumentCache,
+    position: editor_preview::editing::VersionedPosition,
+    properties: Vec<editor_preview::editing::PropertyChange>,
 ) -> Option<lsp_types::WorkspaceEdit> {
     let element = element_at_source_code_position(document_cache, &position).ok()?;
 
-    set_bindings(position.url().clone(), *position.version(), &element, &properties)
+    set_bindings(
+        position.url().clone(),
+        *position.version(),
+        &element,
+        &properties,
+        document_cache.format,
+    )
 }
 
 fn create_workspace_edit_for_remove_binding(
@@ -801,83 +876,111 @@ fn create_workspace_edit_for_remove_binding(
     range: lsp_types::Range,
 ) -> lsp_types::WorkspaceEdit {
     let edit = lsp_types::TextEdit { range, new_text: String::new() };
-    common::create_workspace_edit(uri.clone(), version, vec![edit])
+    editor_preview::editing::create_workspace_edit(uri.clone(), version, vec![edit])
 }
 
 pub fn remove_binding(
     uri: Url,
     version: SourceFileVersion,
-    element: &common::ElementRcNode,
+    element: &editor_preview::ElementRcNode,
     property_name: &str,
+    format: editor_preview::ByteFormat,
 ) -> Result<lsp_types::WorkspaceEdit> {
     let source_file = element.with_element_node(|node| node.source_file.clone());
 
-    let range = find_property_binding_offset(element, property_name)
+    let token = find_property_binding_offset(element, property_name)
         .and_then(|offset| {
             element.with_element_node(|node| node.token_at_offset(offset.into()).right_biased())
         })
-        .and_then(|token| {
-            for ancestor in token.parent_ancestors() {
-                if (ancestor.kind() == SyntaxKind::Binding)
-                    || (ancestor.kind() == SyntaxKind::PropertyDeclaration)
-                {
-                    let start = {
-                        let token = left_extend(ancestor.first_token()?);
-                        let start = token.text_range().start();
-                        token
-                            .prev_token()
-                            .and_then(|t| {
-                                if t.kind() == SyntaxKind::Whitespace && t.text().contains('\n') {
-                                    let to_sub =
-                                        t.text().split('\n').next_back().unwrap_or_default().len()
-                                            as u32;
-                                    start.checked_sub(to_sub.into())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(start)
-                    };
-                    let end = {
-                        let token = right_extend(ancestor.last_token()?);
-                        let end = token.text_range().end();
-                        token
-                            .next_token()
-                            .and_then(|t| {
-                                if t.kind() == SyntaxKind::Whitespace && t.text().contains('\n') {
-                                    let to_add =
-                                        t.text().split('\n').next().unwrap_or_default().len()
-                                            as u32;
-                                    end.checked_add((to_add + 1/* <cr> */).into())
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(end)
-                    };
+        .ok_or("Could not find property to delete.")?;
 
-                    return Some(util::text_range_to_lsp_range(
-                        &source_file,
-                        TextRange::new(start, end),
-                    ));
-                }
-                if ancestor.kind() == SyntaxKind::Element {
-                    // There should have been a binding before the element!
-                    break;
-                }
+    for ancestor in token.parent_ancestors() {
+        if ancestor.kind() == SyntaxKind::PropertyDeclaration {
+            let prop_decl = syntax_nodes::PropertyDeclaration::from(ancestor.clone());
+            let binding =
+                prop_decl.BindingExpression().ok_or("property declaration has no binding")?;
+            let colon = ancestor
+                .child_token(SyntaxKind::Colon)
+                .ok_or("property declaration has no colon")?;
+            let start = colon.text_range().start();
+            if let Some(semi_colon) = binding.child_token(SyntaxKind::Semicolon) {
+                let end = semi_colon.text_range().start();
+                let range =
+                    util::text_range_to_lsp_range(&source_file, TextRange::new(start, end), format);
+                let edit = lsp_types::TextEdit { range, new_text: String::new() };
+                return Ok(editor_preview::editing::create_workspace_edit(
+                    uri.clone(),
+                    version,
+                    vec![edit],
+                ));
+            } else if let Some(closing_brace) =
+                binding.CodeBlock().and_then(|cb| cb.child_token(SyntaxKind::RBrace))
+            {
+                let end = closing_brace.text_range().end();
+                let range =
+                    util::text_range_to_lsp_range(&source_file, TextRange::new(start, end), format);
+                let edit = lsp_types::TextEdit { range, new_text: ";".into() };
+                return Ok(editor_preview::editing::create_workspace_edit(
+                    uri.clone(),
+                    version,
+                    vec![edit],
+                ));
+            } else {
+                return Err("Could not find end of range to delete.".into());
             }
-            None
-        })
-        .ok_or_else(|| Into::<common::Error>::into("Could not find range to delete."))?;
+        } else if ancestor.kind() == SyntaxKind::Binding {
+            let start = {
+                let token = left_extend(ancestor.first_token().ok_or("empty binding")?);
+                let start = token.text_range().start();
+                token
+                    .prev_token()
+                    .and_then(|t| {
+                        if t.kind() == SyntaxKind::Whitespace && t.text().contains('\n') {
+                            let to_sub =
+                                t.text().split('\n').next_back().unwrap_or_default().len() as u32;
+                            start.checked_sub(to_sub.into())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(start)
+            };
+            let end = {
+                let token = right_extend(ancestor.last_token().ok_or("empty binding")?);
+                let end = token.text_range().end();
+                token
+                    .next_token()
+                    .and_then(|t| {
+                        if t.kind() == SyntaxKind::Whitespace && t.text().contains('\n') {
+                            let to_add =
+                                t.text().split('\n').next().unwrap_or_default().len() as u32;
+                            end.checked_add((to_add + 1/* <cr> */).into())
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(end)
+            };
 
-    Ok(create_workspace_edit_for_remove_binding(uri, version, range))
+            let range =
+                util::text_range_to_lsp_range(&source_file, TextRange::new(start, end), format);
+            return Ok(create_workspace_edit_for_remove_binding(uri, version, range));
+        }
+        if ancestor.kind() == SyntaxKind::Element {
+            // There should have been a binding before the element!
+            break;
+        }
+    }
+    Err("Could not find range to delete.".into())
 }
 
 #[cfg(test)]
 pub mod tests {
     use super::*;
 
-    use crate::language::test::{complex_document_cache, loaded_document_cache};
+    use crate::language::test::{
+        complex_document_cache, loaded_document_cache, loaded_document_cache_with_experimental,
+    };
 
     fn find_property<'a>(
         properties: &'a [PropertyInformation],
@@ -889,9 +992,9 @@ pub mod tests {
     pub fn properties_at_position_in_cache(
         line: u32,
         character: u32,
-        document_cache: &common::DocumentCache,
+        document_cache: &editor_preview::DocumentCache,
         url: &lsp_types::Url,
-    ) -> Option<(common::ElementRcNode, Vec<PropertyInformation>)> {
+    ) -> Option<(editor_preview::ElementRcNode, Vec<PropertyInformation>)> {
         let element =
             document_cache.element_at_position(url, &lsp_types::Position { line, character })?;
         Some((element.clone(), get_properties(&element, LayoutKind::None)))
@@ -901,9 +1004,9 @@ pub mod tests {
         line: u32,
         character: u32,
     ) -> Option<(
-        common::ElementRcNode,
+        editor_preview::ElementRcNode,
         Vec<PropertyInformation>,
-        common::DocumentCache,
+        editor_preview::DocumentCache,
         lsp_types::Url,
     )> {
         let (dc, url, _) = complex_document_cache();
@@ -925,18 +1028,18 @@ pub mod tests {
         // reserved properties:
         assert_eq!(
             &find_property(&result, "accessible-role").unwrap().ty.to_string(),
-            "enum AccessibleRole"
+            "AccessibleRole"
         );
         // Accessible property should not be present since the role is none
         assert!(find_property(&result, "accessible-label").is_none());
         assert!(find_property(&result, "accessible-action-default").is_none());
 
         // Poke deeper:
-        let (_, result, _, _) = properties_at_position(21, 30).unwrap();
+        let (_, result, dc, _) = properties_at_position(21, 30).unwrap();
         let property = find_property(&result, "background").unwrap();
 
         let def_at = property.defined_at.as_ref().unwrap();
-        let def_range = util::node_to_lsp_range(&def_at.code_block_or_expression);
+        let def_range = util::node_to_lsp_range(&def_at.code_block_or_expression, dc.format);
         assert_eq!(def_range.end.line, def_range.start.line);
         // -1 because the lsp range end location is exclusive.
         assert_eq!(
@@ -956,6 +1059,63 @@ pub mod tests {
     }
 
     #[test]
+    fn test_get_properties_shadowed_member() {
+        // `Derived` shadows the `@shadowable` `prop` of `Base` with a different type. The property
+        // editor must list the shadow (not the base) and find its binding, which is stored under a
+        // mangled internal key.
+        let (dc, url, _) = loaded_document_cache_with_experimental(
+            r#"
+component Base {
+    @shadowable in-out property <float> prop: 1;
+}
+component Derived inherits Base {
+    in-out property <int> prop: 42;
+}
+export component Main {
+    the-derived := Derived {
+        prop: 7;
+    }
+}
+"#
+            .into(),
+        );
+        let (_, result) = properties_at_position_in_cache(9, 8, &dc, &url).unwrap();
+        let prop = find_property(&result, "prop").unwrap();
+        // The listed property is the shadow, so its type is the derived one.
+        assert_eq!(prop.ty, Type::Int32);
+        // Its binding is found despite the mangled key, so it reads as defined, not as a fresh
+        // property waiting for a value.
+        assert!(prop.defined_at.is_some());
+    }
+
+    #[test]
+    fn test_get_properties_private_shadow_transparent() {
+        // A private declaration shadowing a public `@shadowable` member is invisible from outside
+        // the component, so the property editor lists the inherited public member, under its type.
+        let (dc, url, _) = loaded_document_cache_with_experimental(
+            r#"
+component Base {
+    @shadowable in-out property <int> prop: 1;
+}
+component Derived inherits Base {
+    private property <string> prop: "x";
+}
+export component Main {
+    the-derived := Derived {
+        prop: 5;
+    }
+}
+"#
+            .into(),
+        );
+        let (_, result) = properties_at_position_in_cache(9, 8, &dc, &url).unwrap();
+        let prop = find_property(&result, "prop").expect("'prop' should be listed");
+        assert_eq!(prop.ty, Type::Int32, "should be the inherited public type, not the shadow");
+        // The external binding of the inherited property is found (round-trip works).
+        assert!(prop.defined_at.is_some());
+    }
+
+    #[test]
     fn test_element_information() {
         let (document_cache, url, _) = complex_document_cache();
         let element =
@@ -963,14 +1123,13 @@ pub mod tests {
 
         let result = get_element_information(&element);
 
-        let r = util::text_range_to_lsp_range(
+        let o = util::text_size_to_lsp_position(
             &element.with_element_node(|n| n.source_file.clone()),
-            result.range,
+            result.offset,
+            document_cache.format,
         );
-        assert_eq!(r.start.line, 32);
-        assert_eq!(r.start.character, 12);
-        assert_eq!(r.end.line, 35);
-        assert_eq!(r.end.character, 13);
+        assert_eq!(o.line, 32);
+        assert_eq!(o.character, 12);
 
         assert_eq!(result.type_name.to_string(), "Text");
     }
@@ -1004,11 +1163,11 @@ pub mod tests {
         ec: u32,
     ) {
         for (i, l) in content.split('\n').enumerate() {
-            println!("{i:2}: {l}");
+            tracing::debug!("{i:2}: {l}");
         }
-        println!("-------------------------------------------------------------------");
-        println!("   :           1         2         3         4         5");
-        println!("   : 012345678901234567890123456789012345678901234567890123456789");
+        tracing::debug!("-------------------------------------------------------------------");
+        tracing::debug!("   :           1         2         3         4         5");
+        tracing::debug!("   : 012345678901234567890123456789012345678901234567890123456789");
 
         let (dc, url, _) = loaded_document_cache(content);
         let source_file = dc.get_document(&url).unwrap().node.as_ref().unwrap().source_file.clone();
@@ -1020,8 +1179,10 @@ pub mod tests {
 
         assert_eq!(&definition.code_block_or_expression.text(), "\"text\"");
 
-        let sel_range = util::text_range_to_lsp_range(&source_file, definition.selection_range);
-        println!("Actual: (l: {}, c: {}) - (l: {}, c: {}) --- Expected: (l: {sl}, c: {sc}) - (l: {el}, c: {ec})",
+        let sel_range =
+            util::text_range_to_lsp_range(&source_file, definition.selection_range, dc.format);
+        tracing::debug!(
+            "Actual: (l: {}, c: {}) - (l: {}, c: {}) --- Expected: (l: {sl}, c: {sc}) - (l: {el}, c: {ec})",
             sel_range.start.line,
             sel_range.start.character,
             sel_range.end.line,
@@ -1477,7 +1638,8 @@ component MainWindow inherits Window {
 
         let doc = dc.get_document(&url).unwrap();
         let source = &doc.node.as_ref().unwrap().source_file;
-        let (l, c) = source.line_column(source.source().unwrap().find("base2 :=").unwrap());
+        let (l, c) =
+            source.line_column(source.source().unwrap().find("base2 :=").unwrap(), dc.format);
         let (_, result) = properties_at_position_in_cache(l as u32, c as u32, &dc, &url).unwrap();
 
         let foo_property = find_property(&result, "foo").unwrap();
@@ -1485,12 +1647,96 @@ component MainWindow inherits Window {
         assert_eq!(foo_property.ty, Type::Int32);
 
         let declaration = foo_property.declared_at.as_ref().unwrap();
-        let start_position = util::text_size_to_lsp_position(source, declaration.start_position);
+        let start_position =
+            util::text_size_to_lsp_position(source, declaration.start_position, dc.format);
         assert_eq!(declaration.path, source.path());
         assert_eq!(start_position.line, 3);
         assert_eq!(start_position.character, 20); // This should probably point to the start of
-                                                  // `property<int> foo = 42`, not to the `<`
+        // `property<int> foo = 42`, not to the `<`
         assert_eq!(foo_property.group, "Base1");
+    }
+
+    #[test]
+    fn layout_padding() {
+        let (dc, url, _) = loaded_document_cache(
+            r#"import { LineEdit, Button, Slider, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+component CustomL inherits HorizontalLayout {
+    padding-left: 10px;
+    @children
+}
+
+component MainWindow inherits Window {
+    rect1 := Rectangle {
+        lay1 := CustomL {
+            Button { text: "Button"; }
+            err := Error {}
+            Rectangle {}
+            lay2 := VerticalLayout {
+                Slider { value: 0.5; }
+                Button { text: "Button"; }
+            }
+            lay3 := VerticalBox {
+                slider2 := Slider { value: 0.5; }
+                Rectangle {}
+            }
+        }
+    }
+}
+            "#.to_string());
+
+        let doc = dc.get_document(&url).unwrap();
+        let source = &doc.node.as_ref().unwrap().source_file;
+        let (l, c) =
+            source.line_column(source.source().unwrap().find("lay1 :=").unwrap(), dc.format);
+        let (_, result) = properties_at_position_in_cache(l as u32, c as u32, &dc, &url).unwrap();
+        let property = find_property(&result, "padding").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+        let property = find_property(&result, "padding-left").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+        let property = find_property(&result, "padding-top").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+
+        let (l, c) =
+            source.line_column(source.source().unwrap().find("lay2 :=").unwrap(), dc.format);
+        let (_, result) = properties_at_position_in_cache(l as u32, c as u32, &dc, &url).unwrap();
+        let property = find_property(&result, "padding").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+        let property = find_property(&result, "padding-left").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+        let property = find_property(&result, "padding-top").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+
+        let (l, c) =
+            source.line_column(source.source().unwrap().find("lay3 :=").unwrap(), dc.format);
+        let (_, result) = properties_at_position_in_cache(l as u32, c as u32, &dc, &url).unwrap();
+        let property = find_property(&result, "padding").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+        let property = find_property(&result, "padding-left").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+        let property = find_property(&result, "padding-top").unwrap();
+        assert_eq!(property.ty, Type::LogicalLength);
+
+        let (l, c) =
+            source.line_column(source.source().unwrap().find("rect1 :=").unwrap(), dc.format);
+        let (_, result) = properties_at_position_in_cache(l as u32, c as u32, &dc, &url).unwrap();
+        assert!(find_property(&result, "padding").is_none());
+        assert!(find_property(&result, "padding-left").is_none());
+        assert!(find_property(&result, "padding-top").is_none());
+
+        let (l, c) =
+            source.line_column(source.source().unwrap().find("slider2 :=").unwrap(), dc.format);
+        let (_, result) = properties_at_position_in_cache(l as u32, c as u32, &dc, &url).unwrap();
+        assert!(find_property(&result, "padding").is_none());
+        assert!(find_property(&result, "padding-left").is_none());
+        assert!(find_property(&result, "padding-top").is_none());
+
+        let (l, c) =
+            source.line_column(source.source().unwrap().find("err :=").unwrap(), dc.format);
+        let (_, result) = properties_at_position_in_cache(l as u32, c as u32, &dc, &url).unwrap();
+        assert!(dbg!(find_property(&result, "padding")).is_none());
+        assert!(find_property(&result, "padding-left").is_none());
+        assert!(find_property(&result, "padding-top").is_none());
     }
 
     #[test]
@@ -1517,7 +1763,8 @@ component SomeRect inherits Rectangle {
         let glob_property = find_property(&result, "glob").unwrap();
         assert_eq!(glob_property.ty, Type::Int32);
         let declaration = glob_property.declared_at.as_ref().unwrap();
-        let start_position = util::text_size_to_lsp_position(&source, declaration.start_position);
+        let start_position =
+            util::text_size_to_lsp_position(&source, declaration.start_position, dc.format);
         assert_eq!(declaration.path, source.path());
         assert_eq!(start_position.line, 2);
         assert_eq!(glob_property.group, "");
@@ -1527,7 +1774,8 @@ component SomeRect inherits Rectangle {
         let abcd_property = find_property(&result, "abcd").unwrap();
         assert_eq!(abcd_property.ty, Type::Int32);
         let declaration = abcd_property.declared_at.as_ref().unwrap();
-        let start_position = util::text_size_to_lsp_position(&source, declaration.start_position);
+        let start_position =
+            util::text_size_to_lsp_position(&source, declaration.start_position, dc.format);
         assert_eq!(declaration.path, source.path());
         assert_eq!(start_position.line, 7);
         assert_eq!(abcd_property.group, "");
@@ -1540,7 +1788,8 @@ component SomeRect inherits Rectangle {
         let width_property = find_property(&result, "width").unwrap();
         assert_eq!(width_property.ty, Type::LogicalLength);
         let definition = width_property.defined_at.as_ref().unwrap();
-        let expression_range = util::node_to_lsp_range(&definition.code_block_or_expression);
+        let expression_range =
+            util::node_to_lsp_range(&definition.code_block_or_expression, dc.format);
         assert_eq!(expression_range.start.line, 8);
         assert_eq!(width_property.group, "geometry");
     }
@@ -1761,8 +2010,8 @@ component MyComp {
         property_name: &str,
         new_value: &str,
     ) -> Option<lsp_types::WorkspaceEdit> {
-        let (element, _, _, url) = properties_at_position(18, 15).unwrap();
-        set_binding(url, None, &element, property_name, new_value.to_string())
+        let (element, _, dc, url) = properties_at_position(18, 15).unwrap();
+        set_binding(url, None, &element, property_name, new_value.to_string(), dc.format)
     }
 
     #[test]
@@ -1820,5 +2069,117 @@ component MyComp {
         assert_eq!(&tc.new_text, "5px");
         assert_eq!(tc.range.start, lsp_types::Position { line: 17, character: 27 });
         assert_eq!(tc.range.end, lsp_types::Position { line: 17, character: 32 });
+    }
+
+    #[test]
+    fn test_remove_binding() {
+        let source = r#"
+component Foo inherits Window {
+    width: 30px;
+    background: red;
+    Foo { background: blue; }
+}
+"#;
+        let (dc, uri, _) = crate::language::test::loaded_document_cache(source.into());
+        let elem = dc
+            .element_at_offset(&uri, TextSize::new(source.find("Window").unwrap() as u32))
+            .unwrap();
+        let edit = remove_binding(uri.clone(), None, &elem, "background", dc.format).unwrap();
+
+        let applied =
+            crate::editor_preview::editing::text_edit::apply_workspace_edit(&dc, &edit).unwrap();
+        assert_eq!(
+            applied.first().unwrap().contents,
+            r#"
+component Foo inherits Window {
+    width: 30px;
+    Foo { background: blue; }
+}
+"#
+        );
+
+        let elem = dc
+            .element_at_offset(&uri, TextSize::new(source.find("Foo {").unwrap() as u32))
+            .unwrap();
+        let edit = remove_binding(uri.clone(), None, &elem, "background", dc.format).unwrap();
+
+        let applied =
+            crate::editor_preview::editing::text_edit::apply_workspace_edit(&dc, &edit).unwrap();
+        assert_eq!(
+            applied.first().unwrap().contents,
+            r#"
+component Foo inherits Window {
+    width: 30px;
+    background: red;
+    Foo {  }
+}
+"#
+        );
+    }
+
+    #[test]
+    fn test_remove_binding_in_declaration() {
+        let source = r#"
+component Foo inherits Window {
+    property <int> test1: 45 + 78; // comment
+    property <int> test2: {
+        return 4;
+    }
+    property <{x: int}> test3: { return { x: 0 }; };
+    background: violet;
+}
+"#;
+        let (dc, uri, _) = crate::language::test::loaded_document_cache(source.into());
+        let elem = dc
+            .element_at_offset(&uri, TextSize::new(source.find("Window").unwrap() as u32))
+            .unwrap();
+        let edit = remove_binding(uri.clone(), None, &elem, "test1", dc.format).unwrap();
+        let applied =
+            crate::editor_preview::editing::text_edit::apply_workspace_edit(&dc, &edit).unwrap();
+        assert_eq!(
+            applied.first().unwrap().contents,
+            r#"
+component Foo inherits Window {
+    property <int> test1; // comment
+    property <int> test2: {
+        return 4;
+    }
+    property <{x: int}> test3: { return { x: 0 }; };
+    background: violet;
+}
+"#
+        );
+
+        let edit = remove_binding(uri.clone(), None, &elem, "test2", dc.format).unwrap();
+        let applied =
+            crate::editor_preview::editing::text_edit::apply_workspace_edit(&dc, &edit).unwrap();
+        assert_eq!(
+            applied.first().unwrap().contents,
+            r#"
+component Foo inherits Window {
+    property <int> test1: 45 + 78; // comment
+    property <int> test2;
+    property <{x: int}> test3: { return { x: 0 }; };
+    background: violet;
+}
+"#
+        );
+
+        let edit = remove_binding(uri.clone(), None, &elem, "test3", dc.format).unwrap();
+        let applied =
+            crate::editor_preview::editing::text_edit::apply_workspace_edit(&dc, &edit).unwrap();
+        assert_eq!(
+            applied.first().unwrap().contents,
+            r#"
+component Foo inherits Window {
+    property <int> test1: 45 + 78; // comment
+    property <int> test2: {
+        return 4;
+    }
+    property <{x: int}> test3;
+    background: violet;
+}
+"#
+        );
     }
 }

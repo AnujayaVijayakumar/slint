@@ -74,12 +74,13 @@ pub async fn compile_from_string_with_style(
 ) -> Result<CompilationResult, JsValue> {
     #[allow(deprecated)]
     let mut compiler = slint_interpreter::ComponentCompiler::default();
+    compiler.compiler_configuration(i_slint_core::InternalToken).is_preview = true;
     if !style.is_empty() {
         compiler.set_style(style)
     }
 
     if let Some(load_callback) = optional_import_callback {
-        let open_import_fallback = move |file_name: &Path| -> core::pin::Pin<
+        let open_import_callback = move |file_name: &Path| -> core::pin::Pin<
             Box<dyn core::future::Future<Output = Option<std::io::Result<String>>>>,
         > {
             Box::pin({
@@ -99,7 +100,7 @@ pub async fn compile_from_string_with_style(
                 }
             })
         };
-        compiler.set_file_loader(open_import_fallback);
+        compiler.set_file_loader(open_import_callback);
     }
 
     let c = compiler.build_from_source(source, base_url.into()).await;
@@ -178,20 +179,20 @@ impl WrappedCompiledComp {
                 NEXT_CANVAS_ID.with(|next_id| {
                     *next_id.borrow_mut() = Some(canvas_id);
                 });
-                let instance =
-                    WrappedInstance(comp.take().create().unwrap());
+                let instance = WrappedInstance(comp.take().create().unwrap());
                 resolve.take().call1(&JsValue::UNDEFINED, &JsValue::from(instance)).unwrap_throw();
             }) {
                 reject
                     .call1(
                         &JsValue::UNDEFINED,
-                        &JsValue::from(
-                            format!("internal error: Failed to queue closure for event loop invocation: {e}"),
-                        ),
+                        &JsValue::from(format!(
+                            "internal error: Failed to queue closure for event loop invocation: {e}"
+                        )),
                     )
                     .unwrap_throw();
             }
-        })).unchecked_into::<InstancePromise>())
+        }))
+        .unchecked_into::<InstancePromise>())
     }
     /// Creates this compiled component in the canvas of the provided instance, wrapped in a promise.
     /// For this to work, the provided instance needs to be visible (show() must've been
@@ -205,7 +206,11 @@ impl WrappedCompiledComp {
         instance: WrappedInstance,
     ) -> Result<InstancePromise, JsValue> {
         Ok(JsValue::from(js_sys::Promise::new(&mut |resolve, reject| {
-            let params = send_wrapper::SendWrapper::new((self.0.clone(), instance.0.clone_strong(), resolve));
+            let params = send_wrapper::SendWrapper::new((
+                self.0.clone(),
+                instance.0.clone_strong(),
+                resolve,
+            ));
             if let Err(e) = slint_interpreter::invoke_from_event_loop(move || {
                 let (comp, instance, resolve) = params.take();
                 let instance =
@@ -215,13 +220,14 @@ impl WrappedCompiledComp {
                 reject
                     .call1(
                         &JsValue::UNDEFINED,
-                        &JsValue::from(
-                            format!("internal error: Failed to queue closure for event loop invocation: {e}"),
-                        ),
+                        &JsValue::from(format!(
+                            "internal error: Failed to queue closure for event loop invocation: {e}"
+                        )),
                     )
                     .unwrap_throw();
             }
-        })).unchecked_into::<InstancePromise>())
+        }))
+        .unchecked_into::<InstancePromise>())
     }
 }
 
@@ -254,9 +260,9 @@ impl WrappedInstance {
     fn invoke_from_event_loop_wrapped_in_promise(
         &self,
         callback: impl FnOnce(
-                &slint_interpreter::ComponentInstance,
-            ) -> Result<(), slint_interpreter::PlatformError>
-            + 'static,
+            &slint_interpreter::ComponentInstance,
+        ) -> Result<(), slint_interpreter::PlatformError>
+        + 'static,
     ) -> Result<js_sys::Promise, JsValue> {
         let callback = std::cell::RefCell::new(Some(callback));
         Ok(js_sys::Promise::new(&mut |resolve, reject| {
@@ -300,16 +306,54 @@ impl WrappedInstance {
                 }
             }) {
                 reject
-                .call1(
-                    &JsValue::UNDEFINED,
-                    &JsValue::from(
-                        format!("internal error: Failed to queue closure for event loop invocation: {e}"),
-                    ),
-                )
-                .unwrap_throw();
+                    .call1(
+                        &JsValue::UNDEFINED,
+                        &JsValue::from(format!(
+                            "internal error: Failed to queue closure for event loop invocation: {e}"
+                        )),
+                    )
+                    .unwrap_throw();
             }
         }))
     }
+}
+
+/// Register a font for use by the `font-family` property.
+///
+/// `data` is the content of a TrueType or OpenType file.
+/// The families it declares become available to the components compiled afterwards,
+/// under the names the font itself carries,
+/// so a page that registers JetBrains Mono can then use `font-family: "JetBrains Mono"`.
+///
+/// The browser build has no system fonts to query,
+/// so this is the only way to draw a component in a font of the host page's choosing.
+/// A font the page loaded through `@font-face` doesn't count:
+/// the canvas renderer doesn't consult the CSS font database.
+///
+/// Text that was already laid out keeps the font it was shaped with,
+/// so register the font before compiling the component that uses it.
+///
+/// Throws if the platform isn't initialized yet, or if the data declares no font family.
+#[wasm_bindgen]
+pub fn register_font_from_memory(data: Vec<u8>) -> Result<(), JsValue> {
+    use i_slint_core::textlayout::sharedparley::fontique;
+
+    // The shared collection holds the bytes through its own `Arc`, so the font doesn't need the
+    // `&'static [u8]` that `Renderer::register_font_from_memory` asks for, and nothing is leaked.
+    // Taking the `Vec` by value hands over the copy wasm-bindgen already made.
+    let blob = fontique::Blob::new(std::sync::Arc::new(data));
+
+    let registered = i_slint_core::with_global_context(
+        || Err(i_slint_core::platform::PlatformError::NoPlatform),
+        |ctx| ctx.font_context().borrow_mut().collection.register_fonts(blob, None),
+    )?;
+
+    if registered.is_empty() {
+        return Err("the data declares no font family, \
+                    expected a TrueType or OpenType file"
+            .into());
+    }
+    Ok(())
 }
 
 /// Register DOM event handlers on all instance and set up the event loop for that.
@@ -344,19 +388,19 @@ pub fn init() -> Result<(), JsValue> {
                         .document()
                         .expect("wasm-interpreter: Could not retrieve DOM document")
                         .get_element_by_id(&canvas_id)
-                        .expect( {
-                            &format!(
+                        .unwrap_or_else(|| {
+                            panic!(
                                 "wasm-interpreter: Could not retrieve existing HTML Canvas element '{}'",
                                 canvas_id
                             )
                         })
                         .dyn_into::<web_sys::HtmlCanvasElement>()
-                        .expect(
-                            &format!(
+                        .unwrap_or_else(|_| {
+                            panic!(
                                 "winit backend: Specified DOM element '{}' is not a HTML Canvas",
                                 canvas_id
                             )
-                        );
+                        });
                     attrs = attrs
                         .with_canvas(Some(html_canvas))
                         // Don't activate the window by default, as that will cause the page to scroll,

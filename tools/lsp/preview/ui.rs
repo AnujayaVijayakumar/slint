@@ -1,36 +1,207 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore BBBX Sometype structurize
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::{collections::HashMap, iter::once, rc::Rc};
 
+use super::user_settings::PreviewUserSettings;
 use i_slint_compiler::parser::TextRange;
 use i_slint_compiler::{expression_tree, langtype};
 
+use i_slint_core::DataTransfer;
 use itertools::Itertools;
 use slint::{Model, ModelRc, SharedString, ToSharedString, VecModel};
 use slint_interpreter::{DiagnosticLevel, PlatformError};
 use smol_str::SmolStr;
 
-use crate::common::{self, ComponentInformation};
-use crate::preview::{self, preview_data, properties, SelectionNotification};
+use crate::editor_preview::{self, component_catalog::ComponentInformation};
+use crate::preview::{self, DragItem, SelectionNotification, preview_data, properties};
 
 #[cfg(target_arch = "wasm32")]
-use crate::wasm_prelude::*;
+use crate::editor_preview::wasm_prelude::*;
+
+fn fuzzy_filter_iter<Item: std::fmt::Debug>(
+    input: &mut impl Iterator<Item = Item>,
+    transformer: impl Fn(&Item) -> String,
+    needle: &str,
+) -> Vec<Item> {
+    use nucleo_matcher::{Config, Matcher, pattern};
+
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let pattern = pattern::Pattern::parse(
+        needle,
+        pattern::CaseMatching::Ignore,
+        pattern::Normalization::Smart,
+    );
+
+    let mut all_matches = input
+        .filter_map(|item| {
+            let terms = [transformer(&item)];
+            pattern.match_list(terms.iter(), &mut matcher).pop().map(|(_, value)| (value, item))
+        })
+        .collect::<Vec<_>>();
+
+    all_matches.sort_by_key(|matched_item| std::cmp::Reverse(matched_item.0));
+
+    let cut_off = {
+        let lowest_value = all_matches.last().map(|(value, _)| *value).unwrap_or_default();
+        let highest_value = all_matches.first().map(|(value, _)| *value).unwrap_or_default();
+
+        if all_matches.len() < 10 {
+            lowest_value
+        } else {
+            highest_value - (highest_value - lowest_value) / 2
+        }
+    };
+
+    all_matches.drain(..).take_while(|(value, _)| *value >= cut_off).map(|(_, item)| item).collect()
+}
 
 mod brushes;
 pub mod log_messages;
 pub mod palette;
 mod property_view;
 mod recent_colors;
+pub mod search_model;
 
 slint::include_modules!();
 
+/// Abstraction over the different window types (PreviewUi vs EditorUi).
+/// Only used for the few operations that need component-level access
+/// (window(), show(), run()). Most code should use the Api global directly.
+pub enum AppWindow {
+    Preview(PreviewUi),
+    Editor(EditorUi),
+}
+
+impl AppWindow {
+    pub fn window(&self) -> &slint::Window {
+        match self {
+            AppWindow::Preview(ui) => ui.window(),
+            AppWindow::Editor(ui) => ui.window(),
+        }
+    }
+
+    pub fn show(&self) -> Result<(), PlatformError> {
+        match self {
+            AppWindow::Preview(ui) => ui.show(),
+            AppWindow::Editor(ui) => ui.show(),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn run(&self) -> Result<(), PlatformError> {
+        match self {
+            AppWindow::Preview(ui) => ui.run(),
+            AppWindow::Editor(ui) => ui.run(),
+        }
+    }
+
+    pub fn clone_strong(&self) -> Self {
+        match self {
+            AppWindow::Preview(ui) => AppWindow::Preview(ui.clone_strong()),
+            AppWindow::Editor(ui) => AppWindow::Editor(ui.clone_strong()),
+        }
+    }
+
+    pub fn api(&self) -> Api<'_> {
+        match self {
+            AppWindow::Preview(ui) => ui.global::<Api>(),
+            AppWindow::Editor(ui) => ui.global::<Api>(),
+        }
+    }
+
+    // Convenience accessor. Because Api implements Global for both EditorUi and PreviewUi
+    // we need to fully-qualify the as_weak call, which is annoying.
+    pub fn api_weak(&self) -> slint::Weak<Api<'static>> {
+        match self {
+            AppWindow::Preview(ui) => {
+                let api = ui.global::<Api>();
+                <Api as slint::Global<'_, PreviewUi>>::as_weak(&api)
+            }
+            AppWindow::Editor(ui) => {
+                let api = ui.global::<Api>();
+                <Api as slint::Global<'_, EditorUi>>::as_weak(&api)
+            }
+        }
+    }
+}
+
 pub type PropertyDeclarations = HashMap<SmolStr, PropertyDeclaration>;
 
-pub fn create_ui(style: String, experimental: bool) -> Result<PreviewUi, PlatformError> {
-    let ui = PreviewUi::new()?;
+pub fn preview_user_settings_from_values(
+    always_on_top: bool,
+    show_library: bool,
+    show_properties: bool,
+    show_outline: bool,
+    show_simulation_data: bool,
+    show_console: bool,
+) -> PreviewUserSettings {
+    PreviewUserSettings {
+        version: PreviewUserSettings::CURRENT_VERSION,
+        always_on_top,
+        show_library,
+        show_properties,
+        show_outline,
+        show_simulation_data,
+        show_console,
+    }
+}
+
+pub fn apply_preview_user_settings(app_window: &AppWindow, settings: &PreviewUserSettings) {
+    // The `changed` handlers triggered by these setters run deferred and report
+    // back through `preview::update_user_settings_from_ui`, which dedupes them
+    // against the last synced settings, so no echo guard is needed here.
+    let api = app_window.api();
+    api.set_always_on_top(settings.always_on_top);
+
+    match app_window {
+        AppWindow::Preview(ui) => {
+            ui.set_library_widget(settings.show_library);
+            ui.set_properties_widget(settings.show_properties);
+            ui.set_outline_widget(settings.show_outline);
+            ui.set_data_widget(settings.show_simulation_data);
+            ui.set_console_panel_expanded(settings.show_console);
+        }
+        AppWindow::Editor(_) => {}
+    }
+}
+
+pub fn setup_preview_user_settings(api: &Api<'_>) {
+    api.on_preview_user_settings_changed(
+        |always_on_top,
+         show_library,
+         show_properties,
+         show_outline,
+         show_simulation_data,
+         show_console| {
+            preview::update_user_settings_from_ui(preview_user_settings_from_values(
+                always_on_top,
+                show_library,
+                show_properties,
+                show_outline,
+                show_simulation_data,
+                show_console,
+            ));
+        },
+    );
+}
+
+pub fn create_ui(
+    to_lsp: &Rc<dyn editor_preview::PreviewToLsp>,
+    style: &str,
+    use_editor_ui: bool,
+) -> Result<AppWindow, PlatformError> {
+    let app_window = if use_editor_ui {
+        AppWindow::Editor(EditorUi::new()?)
+    } else {
+        AppWindow::Preview(PreviewUi::new()?)
+    };
+
+    let api = app_window.api();
+    let api_weak = app_window.api_weak();
 
     // styles:
     let known_styles = once(&"native")
@@ -39,8 +210,8 @@ pub fn create_ui(style: String, experimental: bool) -> Result<PreviewUi, Platfor
         .cloned()
         .sorted()
         .collect::<Vec<_>>();
-    let style = if known_styles.contains(&style.as_str()) {
-        style
+    let style = if known_styles.contains(&style) {
+        style.to_string()
     } else {
         known_styles
             .iter()
@@ -57,20 +228,21 @@ pub fn create_ui(style: String, experimental: bool) -> Result<PreviewUi, Platfor
         model
     });
 
-    let api = ui.global::<Api>();
-
-    api.set_current_style(style.clone().into());
-    api.set_experimental(experimental);
+    let current_style_index =
+        known_styles.iter().position(|&s| s == style.as_str()).unwrap_or(0) as i32;
     api.set_known_styles(style_model.into());
+    api.set_current_style_index(current_style_index);
 
     api.on_add_new_component(super::add_new_component);
     api.on_rename_component(super::rename_component);
     api.on_style_changed(super::change_style);
     api.on_show_component(super::show_component);
-    api.on_show_document(|file, line, column| {
+
+    let lsp = to_lsp.clone();
+    api.on_show_document(move |file, line, column| {
         use lsp_types::{Position, Range};
         let pos = Position::new((line as u32).saturating_sub(1), (column as u32).saturating_sub(1));
-        super::ask_editor_to_show_document(&file, Range::new(pos, pos), false)
+        lsp.ask_editor_to_show_document(&file, Range::new(pos, pos), false).ok();
     });
     api.on_show_document_offset_range(super::show_document_offset_range);
     api.on_show_preview_for(super::show_preview_for);
@@ -92,8 +264,33 @@ pub fn create_ui(style: String, experimental: bool) -> Result<PreviewUi, Platfor
         );
     });
     api.on_select_behind(super::element_selection::select_element_behind);
+    api.on_highlight_positions(super::element_selection::highlight_positions);
+    let lsp = to_lsp.clone();
     api.on_can_drop(super::can_drop_component);
-    api.on_drop(super::drop_component);
+    api.on_new_component_data(|index: i32| -> DataTransfer {
+        let Ok(index) = index.try_into() else {
+            return Default::default();
+        };
+        let mut transfer = DataTransfer::default();
+        transfer.set_user_data(Rc::new(DragItem::NewComponent { index }));
+        transfer
+    });
+    api.on_move_element_instance_data(|uri: SharedString, offset: i32| -> DataTransfer {
+        let Ok(offset) = offset.try_into() else {
+            return Default::default();
+        };
+        let mut transfer = DataTransfer::default();
+        transfer.set_user_data(Rc::new(DragItem::MoveElementInstance { uri, offset }));
+        transfer
+    });
+    api.on_drop(move |data: DataTransfer, x: f32, y: f32| {
+        lsp.send_telemetry(&mut [(
+            "type".to_string(),
+            serde_json::to_value("component_dropped").unwrap(),
+        )])
+        .ok();
+        super::drop_component(data, x, y)
+    });
     api.on_selected_element_resize(super::resize_selected_element);
     api.on_selected_element_can_move_to(super::can_move_selected_element);
     api.on_selected_element_move(super::move_selected_element);
@@ -102,6 +299,7 @@ pub fn create_ui(style: String, experimental: bool) -> Result<PreviewUi, Platfor
     api.on_test_code_binding(super::test_code_binding);
     api.on_set_code_binding(super::set_code_binding);
     api.on_set_color_binding(super::set_color_binding);
+    api.on_set_element_id(super::set_element_id);
     api.on_property_declaration_ranges(super::property_declaration_ranges);
 
     api.on_get_property_value(get_property_value);
@@ -110,14 +308,31 @@ pub fn create_ui(style: String, experimental: bool) -> Result<PreviewUi, Platfor
     api.on_insert_row_into_value_table(insert_row_into_value_table);
     api.on_remove_row_from_value_table(remove_row_from_value_table);
 
-    api.on_set_json_preview_data(set_json_preview_data);
+    let lsp = to_lsp.clone();
+    api.on_set_json_preview_data(move |container, property_name, json_string, send_telemetry| {
+        if send_telemetry {
+            lsp.send_telemetry(&mut [(
+                "type".to_string(),
+                serde_json::to_value("data_json_changed").unwrap(),
+            )])
+            .ok();
+        }
+        set_json_preview_data(container, property_name, json_string)
+    });
 
     api.on_string_to_code(string_to_code);
 
-    brushes::setup(&ui);
-    log_messages::setup(&ui);
-    palette::setup(&ui);
-    recent_colors::setup(&ui);
+    brushes::setup(&api);
+    log_messages::setup(&api);
+    palette::setup(&api);
+    recent_colors::setup(&api, api_weak);
+    super::outline::setup(&api);
+    super::undo_redo::setup(&api);
+    setup_preview_user_settings(&api);
+    apply_preview_user_settings(&app_window, &PreviewUserSettings::default());
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "preview-remote"))]
+    super::remote::setup(&app_window, to_lsp);
 
     #[cfg(target_vendor = "apple")]
     api.set_control_key_name("command".into());
@@ -130,7 +345,7 @@ pub fn create_ui(style: String, experimental: bool) -> Result<PreviewUi, Platfor
         api.set_control_key_name("command".into());
     }
 
-    Ok(ui)
+    Ok(app_window)
 }
 
 fn extract_definition_location(ci: &ComponentInformation) -> (SharedString, SharedString) {
@@ -144,12 +359,11 @@ fn extract_definition_location(ci: &ComponentInformation) -> (SharedString, Shar
     (url.to_string().into(), file_name.into())
 }
 
-pub fn ui_set_uses_widgets(ui: &PreviewUi, uses_widgets: bool) {
-    let api = ui.global::<Api>();
+pub fn ui_set_uses_widgets(api: &Api<'_>, uses_widgets: bool) {
     api.set_uses_widgets(uses_widgets);
 }
 
-pub fn set_diagnostics(ui: &PreviewUi, diagnostics: &[slint_interpreter::Diagnostic]) {
+pub fn set_diagnostics(api: &Api<'_>, diagnostics: &[slint_interpreter::Diagnostic]) {
     let summary = diagnostics
         .iter()
         .inspect(|d| {
@@ -161,28 +375,31 @@ pub fn set_diagnostics(ui: &PreviewUi, diagnostics: &[slint_interpreter::Diagnos
             let level = match d.level() {
                 DiagnosticLevel::Error => LogMessageLevel::Error,
                 DiagnosticLevel::Warning => LogMessageLevel::Warning,
+                DiagnosticLevel::Note => LogMessageLevel::Note,
                 _ => LogMessageLevel::Debug,
             };
 
-            log_messages::append_log_message(ui, level, location, d.message());
+            log_messages::append_log_message(api, level, location, d.message());
         })
         .fold(DiagnosticSummary::NothingDetected, |acc, d| {
             match (acc, d.level()) {
                 (_, DiagnosticLevel::Error) => DiagnosticSummary::Errors,
                 (DiagnosticSummary::Errors, DiagnosticLevel::Warning) => DiagnosticSummary::Errors,
                 (_, DiagnosticLevel::Warning) => DiagnosticSummary::Warnings,
+                // Ignore Note level diagnostics for the summary.
+                // If there is only a note, that's not relevant enough to bother the user.
+                (acc, DiagnosticLevel::Note) => acc,
                 // DiagnosticLevel is non-exhaustive:
                 (acc, _) => acc,
             }
         });
 
-    let api = ui.global::<Api>();
     api.set_diagnostic_summary(summary);
 }
 
 pub fn ui_set_known_components(
-    ui: &PreviewUi,
-    known_components: &[crate::common::ComponentInformation],
+    api: &Api<'_>,
+    known_components: &[crate::editor_preview::component_catalog::ComponentInformation],
     current_component_index: usize,
 ) {
     let mut builtins_map: HashMap<String, Vec<ComponentItem>> = Default::default();
@@ -233,12 +450,19 @@ pub fn ui_set_known_components(
         }
     }
 
+    type ComponentModel = search_model::SearchModel<ComponentItem>;
+    fn make_component_model(vec: Vec<ComponentItem>) -> ComponentModel {
+        ComponentModel::new(VecModel::from(vec), |i, search_str| {
+            search_model::contains(i.name.as_str(), search_str)
+        })
+    }
+
     fn sort_subset(mut input: HashMap<String, Vec<ComponentItem>>) -> Vec<ComponentListItem> {
         let mut output = input
             .drain()
             .map(|(k, mut v)| {
                 v.sort_by_key(|i| i.name.clone());
-                let model = Rc::new(VecModel::from(v));
+                let model = Rc::new(make_component_model(v));
                 ComponentListItem {
                     category: k.into(),
                     file_url: SharedString::new(),
@@ -253,11 +477,12 @@ pub fn ui_set_known_components(
     let builtin_components = sort_subset(builtins_map);
     let std_widgets_components = sort_subset(std_widgets_map);
     let library_components = sort_subset(library_map);
+
     let mut file_components = path_map
         .drain()
         .map(|(p, (file_url, mut v))| {
             v.sort_by_key(|i| i.name.clone());
-            let model = Rc::new(VecModel::from(v));
+            let model = Rc::new(make_component_model(v));
             let name = if p == longest_path_prefix {
                 p.file_name().unwrap_or_default().to_string_lossy().to_string()
             } else {
@@ -276,9 +501,33 @@ pub fn ui_set_known_components(
     all_components.extend_from_slice(&library_components[..]);
     all_components.extend_from_slice(&file_components[..]);
 
-    let result = Rc::new(VecModel::from(all_components));
-    let api = ui.global::<Api>();
-    api.set_known_components(result.into());
+    let result = Rc::new(search_model::SearchModel::new(
+        VecModel::from(all_components),
+        |category, search_str| {
+            let mut yes = search_str.is_empty();
+            if let Some(sub_filter) = category.components.as_any().downcast_ref::<ComponentModel>()
+            {
+                sub_filter.set_search_text(search_str.clone());
+                yes = yes || sub_filter.row_count() > 0;
+            }
+            yes
+        },
+    ));
+
+    let old_search_text = api
+        .get_known_components()
+        .as_any()
+        .downcast_ref::<search_model::SearchModel<ComponentListItem>>()
+        .map(|x| x.search_text())
+        .filter(|x| !x.is_empty());
+    if let Some(search_text) = old_search_text {
+        result.set_search_text(search_text.clone());
+    }
+
+    api.set_known_components(result.clone().into());
+    api.on_library_search(move |term| {
+        result.set_search_text(term);
+    });
 }
 
 fn to_ui_range(r: TextRange) -> Option<Range> {
@@ -317,7 +566,7 @@ fn string_to_code(
     }
 }
 
-fn unit_model(units: &[expression_tree::Unit]) -> ModelRc<SharedString> {
+fn unit_model(units: &[expression_tree::WrittenUnit]) -> ModelRc<SharedString> {
     Rc::new(VecModel::from(
         units.iter().map(|u| u.to_string().into()).collect::<Vec<SharedString>>(),
     ))
@@ -336,7 +585,7 @@ fn is_equal_element(c: &ElementInformation, n: &ElementInformation) -> bool {
     c.id == n.id
         && c.type_name == n.type_name
         && c.source_uri == n.source_uri
-        && c.range.start == n.range.start
+        && c.offset == n.offset
 }
 
 pub type PropertyGroupModel = ModelRc<PropertyGroup>;
@@ -436,6 +685,7 @@ struct ValueMapping {
     name_prefix: SharedString,
     is_too_complex: bool,
     is_array: bool,
+    is_struct: bool,
     headers: Vec<SharedString>,
     current_values: Vec<PropertyValue>,
     array_values: Vec<Vec<PropertyValue>>,
@@ -468,7 +718,7 @@ fn map_value_and_type(
             ..Default::default()
         });
     }
-    use i_slint_compiler::expression_tree::Unit;
+    use i_slint_compiler::expression_tree::WrittenUnit;
     use langtype::Type;
 
     match ty {
@@ -499,11 +749,11 @@ fn map_value_and_type(
         Type::Duration => {
             mapping.headers.push(mapping.name_prefix.clone());
             mapping.current_values.push(PropertyValue {
-                display_string: slint::format!("{}{}", get_value::<f32>(value), Unit::Ms),
+                display_string: slint::format!("{}{}", get_value::<f32>(value), WrittenUnit::Ms),
                 kind: PropertyValueKind::Float,
                 value_kind: PropertyValueKind::Float,
                 value_float: get_value::<f32>(value),
-                visual_items: unit_model(&[Unit::S, Unit::Ms]),
+                visual_items: unit_model(&[WrittenUnit::S, WrittenUnit::Ms]),
                 value_int: 1,
                 code: get_code(value),
                 default_selection: 1,
@@ -514,18 +764,18 @@ fn map_value_and_type(
         Type::PhysicalLength => {
             mapping.headers.push(mapping.name_prefix.clone());
             mapping.current_values.push(PropertyValue {
-                display_string: slint::format!("{}{}", get_value::<f32>(value), Unit::Phx),
+                display_string: slint::format!("{}{}", get_value::<f32>(value), WrittenUnit::Phx),
                 kind: PropertyValueKind::Float,
                 value_kind: PropertyValueKind::Float,
                 value_float: get_value::<f32>(value),
                 visual_items: unit_model(&[
-                    Unit::Px,
-                    Unit::Cm,
-                    Unit::Mm,
-                    Unit::In,
-                    Unit::Pt,
-                    Unit::Phx,
-                    Unit::Rem,
+                    WrittenUnit::Px,
+                    WrittenUnit::Cm,
+                    WrittenUnit::Mm,
+                    WrittenUnit::In,
+                    WrittenUnit::Pt,
+                    WrittenUnit::Phx,
+                    WrittenUnit::Rem,
                 ]),
                 value_int: 5,
                 code: get_code(value),
@@ -537,18 +787,18 @@ fn map_value_and_type(
         Type::LogicalLength => {
             mapping.headers.push(mapping.name_prefix.clone());
             mapping.current_values.push(PropertyValue {
-                display_string: slint::format!("{}{}", get_value::<f32>(value), Unit::Px),
+                display_string: slint::format!("{}{}", get_value::<f32>(value), WrittenUnit::Px),
                 kind: PropertyValueKind::Float,
                 value_kind: PropertyValueKind::Float,
                 value_float: get_value::<f32>(value),
                 visual_items: unit_model(&[
-                    Unit::Px,
-                    Unit::Cm,
-                    Unit::Mm,
-                    Unit::In,
-                    Unit::Pt,
-                    Unit::Phx,
-                    Unit::Rem,
+                    WrittenUnit::Px,
+                    WrittenUnit::Cm,
+                    WrittenUnit::Mm,
+                    WrittenUnit::In,
+                    WrittenUnit::Pt,
+                    WrittenUnit::Phx,
+                    WrittenUnit::Rem,
                 ]),
                 value_int: 0,
                 code: get_code(value),
@@ -560,18 +810,18 @@ fn map_value_and_type(
         Type::Rem => {
             mapping.headers.push(mapping.name_prefix.clone());
             mapping.current_values.push(PropertyValue {
-                display_string: slint::format!("{}{}", get_value::<f32>(value), Unit::Rem),
+                display_string: slint::format!("{}{}", get_value::<f32>(value), WrittenUnit::Rem),
                 kind: PropertyValueKind::Float,
                 value_kind: PropertyValueKind::Float,
                 value_float: get_value::<f32>(value),
                 visual_items: unit_model(&[
-                    Unit::Px,
-                    Unit::Cm,
-                    Unit::Mm,
-                    Unit::In,
-                    Unit::Pt,
-                    Unit::Phx,
-                    Unit::Rem,
+                    WrittenUnit::Px,
+                    WrittenUnit::Cm,
+                    WrittenUnit::Mm,
+                    WrittenUnit::In,
+                    WrittenUnit::Pt,
+                    WrittenUnit::Phx,
+                    WrittenUnit::Rem,
                 ]),
                 value_int: 6,
                 code: get_code(value),
@@ -583,11 +833,16 @@ fn map_value_and_type(
         Type::Angle => {
             mapping.headers.push(mapping.name_prefix.clone());
             mapping.current_values.push(PropertyValue {
-                display_string: slint::format!("{}{}", get_value::<f32>(value), Unit::Deg),
+                display_string: slint::format!("{}{}", get_value::<f32>(value), WrittenUnit::Deg),
                 kind: PropertyValueKind::Float,
                 value_kind: PropertyValueKind::Float,
                 value_float: get_value::<f32>(value),
-                visual_items: unit_model(&[Unit::Deg, Unit::Grad, Unit::Turn, Unit::Rad]),
+                visual_items: unit_model(&[
+                    WrittenUnit::Deg,
+                    WrittenUnit::Grad,
+                    WrittenUnit::Turn,
+                    WrittenUnit::Rad,
+                ]),
                 value_int: 0,
                 code: get_code(value),
                 default_selection: 0,
@@ -598,11 +853,15 @@ fn map_value_and_type(
         Type::Percent => {
             mapping.headers.push(mapping.name_prefix.clone());
             mapping.current_values.push(PropertyValue {
-                display_string: slint::format!("{}{}", get_value::<f32>(value), Unit::Percent),
+                display_string: slint::format!(
+                    "{}{}",
+                    get_value::<f32>(value),
+                    WrittenUnit::Percent
+                ),
                 kind: PropertyValueKind::Float,
                 value_kind: PropertyValueKind::Float,
                 value_float: get_value::<f32>(value),
-                visual_items: unit_model(&[Unit::Percent]),
+                visual_items: unit_model(&[WrittenUnit::Percent]),
                 value_int: 0,
                 code: get_code(value),
                 default_selection: 0,
@@ -675,6 +934,25 @@ fn map_value_and_type(
                         ..Default::default()
                     });
                 }
+                slint::Brush::ConicGradient(cg) => {
+                    mapping.headers.push(mapping.name_prefix.clone());
+                    mapping.current_values.push(PropertyValue {
+                        display_string: SharedString::from("Conic Gradient"),
+                        kind: PropertyValueKind::Brush,
+                        value_kind: PropertyValueKind::Brush,
+                        brush_kind: BrushKind::Conic,
+                        value_brush: slint::Brush::ConicGradient(cg.clone()),
+                        gradient_stops: Rc::new(VecModel::from(
+                            cg.stops()
+                                .map(|gs| GradientStop { color: gs.color, position: gs.position })
+                                .collect::<Vec<_>>(),
+                        ))
+                        .into(),
+                        accessor_path: mapping.name_prefix.clone(),
+                        code: get_code(value),
+                        ..Default::default()
+                    });
+                }
                 _ => {
                     mapping.headers.push(mapping.name_prefix.clone());
                     mapping.current_values.push(PropertyValue {
@@ -738,6 +1016,7 @@ fn map_value_and_type(
         }
         Type::Array(array_ty) => {
             mapping.is_array = true;
+
             let model = get_value::<ModelRc<slint_interpreter::Value>>(value);
 
             for (idx, sub_value) in model.iter().enumerate() {
@@ -745,10 +1024,9 @@ fn map_value_and_type(
                     ValueMapping { name_prefix: mapping.name_prefix.clone(), ..Default::default() };
                 map_value_and_type(array_ty, &Some(sub_value), &mut sub_mapping);
 
-                let sub_mapping_too_complex = sub_mapping.is_array || sub_mapping.is_too_complex;
-                mapping.is_too_complex = mapping.is_too_complex || sub_mapping_too_complex;
+                mapping.is_too_complex = mapping.is_too_complex || sub_mapping.is_too_complex;
 
-                if sub_mapping_too_complex {
+                if sub_mapping.is_too_complex {
                     if idx == 0 {
                         mapping.headers.push(mapping.name_prefix.clone());
                     }
@@ -762,7 +1040,7 @@ fn map_value_and_type(
             }
         }
         Type::Struct(s) => {
-            mapping.is_array = false;
+            mapping.is_struct = true;
 
             let struct_data = get_value::<slint_interpreter::Struct>(value);
 
@@ -782,11 +1060,9 @@ fn map_value_and_type(
                     &mut sub_mapping,
                 );
 
-                let sub_mapping_too_complex = sub_mapping.is_array || sub_mapping.is_too_complex;
+                mapping.is_too_complex = mapping.is_too_complex || sub_mapping.is_too_complex;
 
-                mapping.is_too_complex = mapping.is_too_complex || sub_mapping_too_complex;
-
-                if sub_mapping_too_complex {
+                if sub_mapping.is_too_complex {
                     mapping.headers.push(mapping.name_prefix.clone());
                     mapping.current_values.push(std::mem::take(&mut sub_mapping.code_value));
                 } else {
@@ -868,23 +1144,23 @@ fn map_preview_data_property(
     let mut mapping = ValueMapping::default();
     map_value_and_type(&value.ty, &value.value, &mut mapping);
 
-    let is_array = mapping.array_values.len() != 1 || mapping.array_values[0].len() != 1;
+    let is_table = mapping.is_array || mapping.is_struct;
     let is_too_complex = mapping.is_too_complex;
 
     Some(PreviewData {
         name: SharedString::from(&key.property_name),
         has_getter,
         has_setter,
-        kind: match (is_array, is_too_complex) {
+        kind: match (is_table, is_too_complex) {
             (false, false) => PreviewDataKind::Value,
             (true, false) => PreviewDataKind::Table,
-            _ => PreviewDataKind::Json,
+            (_, true) => PreviewDataKind::Json,
         },
     })
 }
 
 pub fn ui_set_preview_data(
-    ui: &PreviewUi,
+    api: &Api<'_>,
     preview_data: preview_data::PreviewDataMap,
     previewed_component: Option<String>,
 ) {
@@ -893,7 +1169,7 @@ pub fn ui_set_preview_data(
         it: &mut dyn Iterator<Item = (&preview_data::PreviewDataKey, &preview_data::PreviewData)>,
     ) -> Option<PropertyContainer> {
         let (id, props) = it.filter_map(|(k, v)| Some((k, map_preview_data_property(k, v)?))).fold(
-            (None, vec![]),
+            (None, Vec::new()),
             move |mut acc, (key, value)| {
                 acc.0 = Some(acc.0.unwrap_or_else(|| key.container.clone()));
                 acc.1.push(value);
@@ -907,7 +1183,7 @@ pub fn ui_set_preview_data(
         })
     }
 
-    let mut result: Vec<PropertyContainer> = vec![];
+    let mut result: Vec<PropertyContainer> = Vec::new();
 
     if let Some(c) = create_container(
         previewed_component.unwrap_or_else(|| "<MAIN>".to_string()),
@@ -927,8 +1203,6 @@ pub fn ui_set_preview_data(
             result.push(c);
         }
     }
-
-    let api = ui.global::<Api>();
 
     api.set_preview_data(Rc::new(VecModel::from(result)).into());
 }
@@ -1013,15 +1287,6 @@ fn table_row_to_struct(row: ModelRc<PropertyValue>, indent_level: usize) -> Opti
         Inner(BTreeMap<String, NodeKind>),
     }
 
-    if row.row_count() == 1 {
-        if let Some(v) = row.row_data(0) {
-            if v.accessor_path.is_empty() {
-                // bare value!
-                return Some(format!("{}{}", "  ".repeat(indent_level), v.code));
-            }
-        }
-    }
-
     fn structurize(row: ModelRc<PropertyValue>) -> Option<BTreeMap<String, NodeKind>> {
         let mut result = BTreeMap::default();
 
@@ -1068,7 +1333,12 @@ fn table_row_to_struct(row: ModelRc<PropertyValue>, indent_level: usize) -> Opti
         prefix: &str,
     ) -> Option<String> {
         let indent_step = "  ";
-        let mut result = format!("{}{prefix}{{\n", indent_step.repeat(indent_level));
+        let is_struct = structure.len() != 1 || !structure.contains_key("");
+        let mut result = if is_struct {
+            format!("{}{prefix}{{\n", indent_step.repeat(indent_level))
+        } else {
+            format!("{}{prefix}", indent_step.repeat(indent_level))
+        };
 
         let last_index = structure.len() - 1;
 
@@ -1076,17 +1346,25 @@ fn table_row_to_struct(row: ModelRc<PropertyValue>, indent_level: usize) -> Opti
             let comma = if index == last_index { "" } else { "," };
             match v {
                 NodeKind::Leaf(v) => {
-                    result +=
-                        &format!("{}\"{k}\": {v}{comma}\n", indent_step.repeat(indent_level + 1))
+                    if is_struct {
+                        result += &format!(
+                            "{}\"{k}\": {v}{comma}\n",
+                            indent_step.repeat(indent_level + 1)
+                        )
+                    } else {
+                        result += &format!("{v}{comma}\n")
+                    }
                 }
                 NodeKind::Inner(m) => {
-                    result += &structure_to_string(m, indent_level + 1, &format!("\"{k}\": "))?;
+                    let prefix = if is_struct { format!("\"{k}\": ") } else { String::new() };
+                    result += &structure_to_string(m, indent_level + 1, &prefix)?;
                     result += &format!("{comma}\n");
                 }
             }
         }
-
-        result += &format!("{}}}", indent_step.repeat(indent_level));
+        if is_struct {
+            result += &format!("{}}}", indent_step.repeat(indent_level));
+        }
 
         Some(result)
     }
@@ -1115,7 +1393,7 @@ fn set_property_value_table(
         return "Could not process input values".into();
     };
 
-    set_json_preview_data(container, property_name, json_string.into(), false)
+    set_json_preview_data(container, property_name, json_string.into())
 }
 
 fn default_property_value(source: &PropertyValue) -> PropertyValue {
@@ -1192,7 +1470,7 @@ fn insert_row_into_value_table(table: PropertyValueTable, insert_before: i32) {
     };
 
     let row_data = {
-        let mut result = vec![];
+        let mut result = Vec::new();
         if let Some(row) = vec_model.row_data(0) {
             result = row.iter().map(|pv| default_property_value(&pv)).collect::<Vec<_>>();
         }
@@ -1227,15 +1505,7 @@ fn set_json_preview_data(
     container: SharedString,
     property_name: SharedString,
     json_string: SharedString,
-    send_telemetry: bool,
 ) -> SharedString {
-    if send_telemetry {
-        crate::preview::send_telemetry(&mut [(
-            "type".to_string(),
-            serde_json::to_value("data_json_changed").unwrap(),
-        )]);
-    }
-
     let property_name = (!property_name.is_empty()).then_some(property_name.to_string());
 
     let json = match serde_json::from_str::<serde_json::Value>(json_string.as_ref()) {
@@ -1275,8 +1545,19 @@ fn update_properties(
     for (c, n) in std::iter::zip(current_model.iter(), next_model.iter()) {
         debug_assert_eq!(c.group_name, n.group_name);
 
-        let cvg = c.properties.as_any().downcast_ref::<VecModel<PropertyInformation>>().unwrap();
-        let nvg = n.properties.as_any().downcast_ref::<VecModel<PropertyInformation>>().unwrap();
+        fn extract_inner_model(m: &PropertyGroup) -> &VecModel<PropertyInformation> {
+            m.properties
+                .as_any()
+                .downcast_ref::<search_model::SearchModel<PropertyInformation>>()
+                .unwrap()
+                .source_model()
+                .as_any()
+                .downcast_ref::<VecModel<PropertyInformation>>()
+                .unwrap()
+        }
+
+        let cvg = extract_inner_model(&c);
+        let nvg = extract_inner_model(&n);
 
         update_grouped_properties(cvg, nvg);
     }
@@ -1285,36 +1566,40 @@ fn update_properties(
 }
 
 pub fn ui_set_properties(
-    ui: &PreviewUi,
-    document_cache: &common::DocumentCache,
+    api: &Api<'_>,
+    window: &slint::Window,
+    document_cache: &editor_preview::DocumentCache,
     properties: Option<properties::QueryPropertyResponse>,
 ) -> PropertyDeclarations {
-    let win = i_slint_core::window::WindowInner::from_pub(ui.window()).window_adapter();
-    let (next_element, declarations, next_model) =
-        property_view::map_properties_to_ui(document_cache, properties, &win).unwrap_or((
-            ElementInformation {
-                id: "".into(),
-                type_name: "".into(),
-                source_uri: "".into(),
-                source_version: 0,
-                range: Range { start: 0, end: 0 },
-            },
-            HashMap::new(),
-            Rc::new(VecModel::from(Vec::<PropertyGroup>::new())).into(),
-        ));
+    let win = i_slint_core::window::WindowInner::from_pub(window).window_adapter();
+    let Some((next_element, declarations, next_model)) =
+        property_view::map_properties_to_ui(document_cache, properties, &win)
+    else {
+        api.set_properties(ModelRc::default());
+        api.set_current_element(ElementInformation::default());
+        return Default::default();
+    };
 
-    let api = ui.global::<Api>();
     let current_model = api.get_properties();
 
     let element = api.get_current_element();
     if !is_equal_element(&element, &next_element) {
-        api.set_properties(next_model);
-    } else if current_model.row_count() > 0 {
-        update_properties(current_model, next_model);
-    } else {
-        api.set_properties(next_model);
-    }
+        let old_search_text = current_model
+            .as_any()
+            .downcast_ref::<search_model::SearchModel<PropertyGroup>>()
+            .map(|x| x.search_text())
+            .filter(|x| !x.is_empty());
+        if let Some(search_text) = old_search_text {
+            next_model.set_search_text(search_text.clone());
+        }
 
+        api.set_properties(next_model.clone().into());
+        api.on_properties_search(move |search_text| {
+            next_model.set_search_text(search_text);
+        });
+    } else {
+        update_properties(current_model, next_model.into());
+    }
     api.set_current_element(next_element);
 
     declarations
@@ -1386,6 +1671,22 @@ mod tests {
         assert!(it.next().is_none());
     }
 
+    #[test]
+    fn preview_user_settings_from_values_maps_all_toggles() {
+        assert_eq!(
+            super::preview_user_settings_from_values(true, false, true, false, true, false),
+            super::PreviewUserSettings {
+                version: super::PreviewUserSettings::CURRENT_VERSION,
+                always_on_top: true,
+                show_library: false,
+                show_properties: true,
+                show_outline: false,
+                show_simulation_data: true,
+                show_console: false,
+            }
+        );
+    }
+
     fn generate_preview_data(
         visibility: &str,
         type_def: &str,
@@ -1411,8 +1712,8 @@ export component Tester {{
     }
 
     fn compare_pv(r: &super::PropertyValue, e: &PropertyValue) {
-        eprintln!("Received: {r:?}");
-        eprintln!("Expected: {e:?}");
+        tracing::debug!("Received: {r:?}");
+        tracing::debug!("Expected: {e:?}");
 
         assert_eq!(r.value_bool, e.value_bool);
         assert_eq!(r.is_translatable, e.is_translatable);
@@ -1442,15 +1743,15 @@ export component Tester {{
         let (key, value) = generate_preview_data(visibility, type_def, type_name, code);
         let rp = super::map_preview_data_property(&key, &value).unwrap();
 
-        eprintln!("*** Validating PreviewData: Received: {rp:?}");
-        eprintln!("*** Validating PreviewData: Expected: {expected_data:?}");
+        tracing::debug!("*** Validating PreviewData: Received: {rp:?}");
+        tracing::debug!("*** Validating PreviewData: Expected: {expected_data:?}");
 
         assert_eq!(rp.name, expected_data.name);
         assert_eq!(rp.has_getter, expected_data.has_getter);
         assert_eq!(rp.has_setter, expected_data.has_setter);
         assert_eq!(rp.kind, expected_data.kind);
 
-        eprintln!("*** PreviewData is as expected...");
+        tracing::debug!("*** PreviewData is as expected...");
 
         (key, value)
     }
@@ -1462,6 +1763,7 @@ export component Tester {{
         code: &str,
         expected_data: super::PreviewData,
         expected_value: super::PropertyValue,
+        header: &str,
     ) {
         let (_, value) = validate_rp_impl(visibility, type_def, type_name, code, expected_data);
 
@@ -1471,7 +1773,7 @@ export component Tester {{
         let (is_array, headers, values) = super::map_preview_data_to_property_value_table(&value);
         assert!(!is_array);
         assert!(headers.len() == 1);
-        assert!(headers[0].is_empty());
+        assert_eq!(headers[0], header);
         assert_eq!(values.len(), 1);
         assert_eq!(values.first().unwrap().len(), 1);
     }
@@ -1504,7 +1806,7 @@ export component Tester {{
         assert_eq!(is_array, expected_is_array);
 
         for (idx, h) in headers.iter().enumerate() {
-            eprintln!("Header {idx}: \"{h}\"");
+            tracing::debug!("Header {idx}: \"{h}\"");
         }
         assert_eq!(headers.len(), expected_headers.len());
         assert!(headers.iter().zip(expected_headers.iter()).all(|(rh, eh)| rh == eh));
@@ -1537,6 +1839,7 @@ export component Tester {{
                 value_string: "Test".into(),
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1570,6 +1873,7 @@ export component Tester {{
                 .into(),
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1603,6 +1907,7 @@ export component Tester {{
                 .into(),
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1630,6 +1935,7 @@ export component Tester {{
                 value_int: 1,
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1660,6 +1966,7 @@ export component Tester {{
                 .into(),
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1684,6 +1991,7 @@ export component Tester {{
                 visual_items: std::rc::Rc::new(VecModel::from(vec!["%".into()])).into(),
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1701,14 +2009,15 @@ export component Tester {{
                 ..Default::default()
             },
             super::PropertyValue {
-                display_string: "#aabbccff".into(),
-                code: "\"#aabbccff\"".into(),
+                display_string: "#aabbcc".into(),
+                code: "\"#aabbcc\"".into(),
                 kind: super::PropertyValueKind::Color,
                 value_brush: slint::Brush::SolidColor(slint::Color::from_argb_u8(
                     0xff, 0xaa, 0xbb, 0xcc,
                 )),
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1732,6 +2041,7 @@ export component Tester {{
                 value_int: 12,
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1755,6 +2065,7 @@ export component Tester {{
                 value_bool: true,
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1778,6 +2089,7 @@ export component Tester {{
                 value_bool: false,
                 ..Default::default()
             },
+            "",
         );
     }
 
@@ -1794,15 +2106,18 @@ export component Tester {{
                 name: "test".into(),
                 has_getter: true,
                 has_setter: true,
-                kind: super::PreviewDataKind::Json,
+                kind: super::PreviewDataKind::Table,
             },
             super::PropertyValue {
-                kind: super::PropertyValueKind::Code,
-                code:
-                    "{\n  \"first\": [\n    \"first of a kind\",\n    \"second of a kind\"\n  ]\n}"
-                        .into(),
+                accessor_path: "first".into(),
+                display_string: "\"first of a kind\"".into(),
+                code: "\"first of a kind\"".into(),
+                kind: super::PropertyValueKind::String,
+                value_string: "first of a kind".into(),
+                value_kind: PropertyValueKind::String,
                 ..Default::default()
             },
+            "first",
         );
     }
 
@@ -1850,53 +2165,52 @@ export component Tester {{
             struct C2 { c2_1: string, c2_2: int }
             struct FooStruct { first: C1, second: C2 }
             "#,
-           "FooStruct",
-           "{ first: { c1_1: \"first of a kind\", c1_2: 23 }, second: { c2_1: \"second of a kind\", c2_2: 42 } }",
+            "FooStruct",
+            "{ first: { c1_1: \"first of a kind\", c1_2: 23 }, second: { c2_1: \"second of a kind\", c2_2: 42 } }",
             super::PreviewData {
                 name: "test".into(),
                 has_getter: true,
                 has_setter: true,
                 kind: super::PreviewDataKind::Table,
-                },
+            },
             "{\n  \"first\": {\n    \"c1-1\": \"first of a kind\",\n    \"c1-2\": 23\n  },\n  \"second\": {\n    \"c2-1\": \"second of a kind\",\n    \"c2-2\": 42\n  }\n}",
             false,
-                vec![
-                    "first.c1-1".into(),
-                    "first.c1-2".into(),
-                    "second.c2-1".into(),
-                   "second.c2-2".into(),
-                ],
-               vec![
-                    vec![super::PropertyValue {
-                            display_string: "first of a kind".into(),
-                            code: "\"first of a kind\"".into(),
-                            kind: super::PropertyValueKind::String,
-                            value_string: "first of a kind".into(),
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "23".into(),
-                            code: "23".into(),
-                            kind: super::PropertyValueKind::Integer,
-                            value_int: 23,
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "second of a kind".into(),
-                            code: "\"second of a kind\"".into(),
-                            kind: super::PropertyValueKind::String,
-                            value_string: "second of a kind".into(),
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "42".into(),
-                            code: "42".into(),
-                            kind: super::PropertyValueKind::Integer,
-                            value_int: 42,
-                            ..Default::default()
-                        },
-                        ],
-                ]
+            vec![
+                "first.c1-1".into(),
+                "first.c1-2".into(),
+                "second.c2-1".into(),
+                "second.c2-2".into(),
+            ],
+            vec![vec![
+                super::PropertyValue {
+                    display_string: "first of a kind".into(),
+                    code: "\"first of a kind\"".into(),
+                    kind: super::PropertyValueKind::String,
+                    value_string: "first of a kind".into(),
+                    ..Default::default()
+                },
+                super::PropertyValue {
+                    display_string: "23".into(),
+                    code: "23".into(),
+                    kind: super::PropertyValueKind::Integer,
+                    value_int: 23,
+                    ..Default::default()
+                },
+                super::PropertyValue {
+                    display_string: "second of a kind".into(),
+                    code: "\"second of a kind\"".into(),
+                    kind: super::PropertyValueKind::String,
+                    value_string: "second of a kind".into(),
+                    ..Default::default()
+                },
+                super::PropertyValue {
+                    display_string: "42".into(),
+                    code: "42".into(),
+                    kind: super::PropertyValueKind::Integer,
+                    value_int: 42,
+                    ..Default::default()
+                },
+            ]],
         );
     }
 
@@ -1909,8 +2223,8 @@ export component Tester {{
             struct C2 { c2_1: string, c2_2: int }
             struct FooStruct { first: C1, second: C2 }
             "#,
-           "[FooStruct]",
-           "[{ first: { c1_1: \"first of a kind\", c1_2: 23 }, second: { c2_1: \"second of a kind\", c2_2: 42 } }, { first: { c1_1: \"row 2, 1\", c1_2: 3 }, second: { c2_1: \"row 2, 2\", c2_2: 2 } }]",
+            "[FooStruct]",
+            "[{ first: { c1_1: \"first of a kind\", c1_2: 23 }, second: { c2_1: \"second of a kind\", c2_2: 42 } }, { first: { c1_1: \"row 2, 1\", c1_2: 3 }, second: { c2_1: \"row 2, 2\", c2_2: 2 } }]",
             super::PreviewData {
                 name: "test".into(),
                 has_getter: true,
@@ -1919,72 +2233,74 @@ export component Tester {{
             },
             "[\n  {\n    \"first\": {\n      \"c1-1\": \"first of a kind\",\n      \"c1-2\": 23\n    },\n    \"second\": {\n      \"c2-1\": \"second of a kind\",\n      \"c2-2\": 42\n    }\n  },\n  {\n    \"first\": {\n      \"c1-1\": \"row 2, 1\",\n      \"c1-2\": 3\n    },\n    \"second\": {\n      \"c2-1\": \"row 2, 2\",\n      \"c2-2\": 2\n    }\n  }\n]",
             true,
+            vec![
+                "first.c1-1".into(),
+                "first.c1-2".into(),
+                "second.c2-1".into(),
+                "second.c2-2".into(),
+            ],
+            vec![
                 vec![
-                    "first.c1-1".into(),
-                    "first.c1-2".into(),
-                    "second.c2-1".into(),
-                   "second.c2-2".into(),
+                    super::PropertyValue {
+                        display_string: "first of a kind".into(),
+                        code: "\"first of a kind\"".into(),
+                        kind: super::PropertyValueKind::String,
+                        value_string: "first of a kind".into(),
+                        ..Default::default()
+                    },
+                    super::PropertyValue {
+                        display_string: "23".into(),
+                        code: "23".into(),
+                        kind: super::PropertyValueKind::Integer,
+                        value_int: 23,
+                        ..Default::default()
+                    },
+                    super::PropertyValue {
+                        display_string: "second of a kind".into(),
+                        code: "\"second of a kind\"".into(),
+                        kind: super::PropertyValueKind::String,
+                        value_string: "second of a kind".into(),
+                        ..Default::default()
+                    },
+                    super::PropertyValue {
+                        display_string: "42".into(),
+                        code: "42".into(),
+                        kind: super::PropertyValueKind::Integer,
+                        value_int: 42,
+                        ..Default::default()
+                    },
                 ],
-               vec![
-                    vec![super::PropertyValue {
-                            display_string: "first of a kind".into(),
-                            code: "\"first of a kind\"".into(),
-                            kind: super::PropertyValueKind::String,
-                            value_string: "first of a kind".into(),
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "23".into(),
-                            code: "23".into(),
-                            kind: super::PropertyValueKind::Integer,
-                            value_int: 23,
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "second of a kind".into(),
-                            code: "\"second of a kind\"".into(),
-                            kind: super::PropertyValueKind::String,
-                            value_string: "second of a kind".into(),
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "42".into(),
-                            code: "42".into(),
-                            kind: super::PropertyValueKind::Integer,
-                            value_int: 42,
-                            ..Default::default()
-                        },
-                    ],
-                    vec![super::PropertyValue {
-                            display_string: "row 2, 1".into(),
-                            code: "\"row 2, 1\"".into(),
-                            kind: super::PropertyValueKind::String,
-                            value_string: "row 2, 1".into(),
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "3".into(),
-                            code: "3".into(),
-                            kind: super::PropertyValueKind::Integer,
-                            value_int: 3,
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "row 2, 2".into(),
-                            code: "\"row 2, 2\"".into(),
-                            kind: super::PropertyValueKind::String,
-                            value_string: "row 2, 2".into(),
-                            ..Default::default()
-                        },
-                        super::PropertyValue {
-                            display_string: "2".into(),
-                            code: "2".into(),
-                            kind: super::PropertyValueKind::Integer,
-                            value_int: 2,
-                            ..Default::default()
-                        },
-                    ],
-                ]
+                vec![
+                    super::PropertyValue {
+                        display_string: "row 2, 1".into(),
+                        code: "\"row 2, 1\"".into(),
+                        kind: super::PropertyValueKind::String,
+                        value_string: "row 2, 1".into(),
+                        ..Default::default()
+                    },
+                    super::PropertyValue {
+                        display_string: "3".into(),
+                        code: "3".into(),
+                        kind: super::PropertyValueKind::Integer,
+                        value_int: 3,
+                        ..Default::default()
+                    },
+                    super::PropertyValue {
+                        display_string: "row 2, 2".into(),
+                        code: "\"row 2, 2\"".into(),
+                        kind: super::PropertyValueKind::String,
+                        value_string: "row 2, 2".into(),
+                        ..Default::default()
+                    },
+                    super::PropertyValue {
+                        display_string: "2".into(),
+                        code: "2".into(),
+                        kind: super::PropertyValueKind::Integer,
+                        value_int: 2,
+                        ..Default::default()
+                    },
+                ],
+            ],
         );
     }
 
@@ -2032,7 +2348,7 @@ export component Tester {{
     }
 
     #[test]
-    fn test_table_row_to_stuct() {
+    fn test_table_row_to_struct() {
         fn bool_pv(value: bool, accessor_path: &str) -> PropertyValue {
             PropertyValue {
                 accessor_path: SharedString::from(accessor_path),
@@ -2043,10 +2359,10 @@ export component Tester {{
             }
         }
 
-        validate_array_row_to_struct(0, vec![bool_pv(true, "")], "true");
-        validate_array_row_to_struct(1, vec![bool_pv(true, "")], "  true");
-        validate_array_row_to_struct(2, vec![bool_pv(true, "")], "    true");
-        validate_array_row_to_struct(3, vec![bool_pv(true, "")], "      true");
+        validate_array_row_to_struct(0, vec![bool_pv(true, "")], "true\n");
+        validate_array_row_to_struct(1, vec![bool_pv(true, "")], "  true\n");
+        validate_array_row_to_struct(2, vec![bool_pv(true, "")], "    true\n");
+        validate_array_row_to_struct(3, vec![bool_pv(true, "")], "      true\n");
         validate_array_row_to_struct(
             1,
             vec![bool_pv(true, "test")],

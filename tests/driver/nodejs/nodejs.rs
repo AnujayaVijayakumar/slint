@@ -1,6 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore slintpath
 use std::error::Error;
 use std::sync::LazyLock;
 use std::{fs::File, io::Write, path::PathBuf};
@@ -13,40 +14,42 @@ fn check_output(o: std::process::Output) {
             String::from_utf8_lossy(&o.stderr),
             String::from_utf8_lossy(&o.stdout),
         );
-        //panic!("Build Failed {:?}", o.status);
+        panic!("Build Failed {:?}", o.status);
     }
 }
 
 static NODE_API_JS_PATH: LazyLock<PathBuf> = LazyLock::new(|| {
     let node_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../api/node");
 
-    // On Windows npm is 'npm.cmd', which Rust's process::Command doesn't look for as extension, because
+    // On Windows pnpm is 'pnpm.cmd', which Rust's process::Command doesn't look for as extension, because
     // it tries to emulate CreateProcess.
-    let npm = which::which("npm").unwrap();
+    let pnpm = which::which("pnpm").expect("pnpm must be installed to run the nodejs tests");
 
     // installs the slint node package dependencies
-    let o = std::process::Command::new(npm.clone())
+    let o = std::process::Command::new(pnpm.clone())
         .arg("install")
-        .arg("--no-audit")
         .arg("--ignore-scripts")
+        .arg("--config.confirmModulesPurge=false") // https://github.com/pnpm/pnpm/issues/9973 (and 7727 for the solution)
+        // Prevent the pnpm confirmation prompt for module purge.
+        .env("CI", "true")
         .current_dir(node_dir.clone())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|err| format!("Could not launch npm install: {err}"))
+        .map_err(|err| format!("Could not launch pnpm install: {err}"))
         .unwrap();
 
     check_output(o);
 
     // builds the slint node package in debug
-    let o = std::process::Command::new(npm.clone())
+    let o = std::process::Command::new(pnpm.clone())
         .arg("run")
         .arg("build:testing")
         .current_dir(node_dir.clone())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|err| format!("Could not launch npm install: {err}"))
+        .map_err(|err| format!("Could not launch pnpm run: {err}"))
         .unwrap();
 
     check_output(o);
@@ -95,7 +98,7 @@ pub fn test(testcase: &test_driver_lib::TestCase) -> Result<(), Box<dyn Error>> 
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|err| format!("Could not launch npm start: {err}"))?;
+        .map_err(|err| format!("Could not launch node main.js: {err}"))?;
 
     if !output.status.success() {
         print!("{}", String::from_utf8_lossy(output.stdout.as_ref()));

@@ -3,15 +3,14 @@
 
 //! Handle colors and brushes in the UI
 
-use slint::{ComponentHandle, Model, VecModel};
+use slint::{Model, VecModel};
 
 use crate::preview::ui;
 
+use itertools::Itertools as _;
 use std::rc::Rc;
 
-pub fn setup(ui: &ui::PreviewUi) {
-    let api = ui.global::<ui::Api>();
-
+pub fn setup(api: &ui::Api<'_>) {
     api.on_add_gradient_stop(add_gradient_stop);
     api.on_remove_gradient_stop(remove_gradient_stop);
     api.on_move_gradient_stop(move_gradient_stop);
@@ -52,7 +51,11 @@ pub fn color_to_string(color: slint::Color) -> slint::SharedString {
     let g = color.green();
     let b = color.blue();
 
-    slint::format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+    if a == 255 {
+        slint::format!("#{r:02x}{g:02x}{b:02x}")
+    } else {
+        slint::format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
+    }
 }
 
 fn color_to_short_string(color: slint::Color) -> String {
@@ -64,7 +67,7 @@ fn color_to_short_string(color: slint::Color) -> String {
 }
 
 pub fn string_to_color(text: &str) -> Option<slint::Color> {
-    i_slint_compiler::literals::parse_color_literal(text).map(slint::Color::from_argb_encoded)
+    i_slint_common::color_parsing::parse_color_literal(text).map(slint::Color::from_argb_encoded)
 }
 
 fn as_json_brush(
@@ -95,10 +98,28 @@ fn as_slint_brush(
     match kind {
         ui::BrushKind::Solid => color_to_string(color),
         ui::BrushKind::Linear => {
-            format!("@linear-gradient({angle}deg{})", stops_as_string(stops)).into()
+            slint::format!("@linear-gradient({angle}deg{})", stops_as_string(stops))
         }
         ui::BrushKind::Radial => {
-            format!("@radial-gradient(circle{})", stops_as_string(stops)).into()
+            slint::format!("@radial-gradient(circle{})", stops_as_string(stops))
+        }
+        ui::BrushKind::Conic => {
+            let stops = sorted_gradient_stops(stops);
+            let angle = angle.rem_euclid(360.0);
+            let prefix = if angle.abs() > f32::EPSILON {
+                slint::format!("from {}deg, ", angle)
+            } else {
+                slint::SharedString::new()
+            };
+
+            slint::format!(
+                "@conic-gradient({}{})",
+                prefix,
+                stops
+                    .iter()
+                    .map(|s| format!("{} {}deg", color_to_string(s.color), s.position * 360.0))
+                    .join(", ")
+            )
         }
     }
 }
@@ -130,6 +151,9 @@ pub fn create_brush(
         ),
         ui::BrushKind::Radial => slint::Brush::RadialGradient(
             i_slint_core::graphics::RadialGradientBrush::new_circle(stops.drain(..)),
+        ),
+        ui::BrushKind::Conic => slint::Brush::ConicGradient(
+            i_slint_core::graphics::ConicGradientBrush::new(angle, stops.drain(..)),
         ),
     }
 }

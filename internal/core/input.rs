@@ -1,23 +1,27 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
+// cSpell: ignore altgr rpos Unapply
 /*! Module handling mouse events
 */
 #![warn(missing_docs)]
 
+use crate::cursor::MouseCursorInner;
 use crate::item_tree::ItemTreeRc;
 use crate::item_tree::{ItemRc, ItemWeak, VisitChildrenResult};
-pub use crate::items::PointerEventButton;
-use crate::items::{DropEvent, ItemRef, TextCursorDirection};
-pub use crate::items::{FocusReason, KeyEvent, KeyboardModifiers};
-use crate::lengths::{LogicalPoint, LogicalVector};
-use crate::timers::Timer;
+use crate::items::{
+    AllowedDragActions, BuiltInMouseCursor, DropEvent, ItemRef, OperatingSystemType,
+    TextCursorDirection,
+};
+pub use crate::items::{FocusReason, KeyEvent, KeyboardModifiers, PointerEventButton};
+use crate::lengths::{ItemTransform, LogicalPoint, LogicalVector};
 use crate::window::{WindowAdapter, WindowInner};
 use crate::{Coord, Property, SharedString};
 use alloc::rc::Rc;
 use alloc::vec::Vec;
 use const_field_offset::FieldOffsets;
 use core::cell::Cell;
+use core::fmt::Display;
 use core::pin::Pin;
 use core::time::Duration;
 
@@ -27,44 +31,112 @@ use core::time::Duration;
 /// TODO: merge with platform::WindowEvent
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq)]
-#[allow(missing_docs)]
 pub enum MouseEvent {
     /// The mouse or finger was pressed
-    /// `position` is the position of the mouse when the event happens.
-    /// `button` describes the button that is pressed when the event happens.
-    /// `click_count` represents the current number of clicks.
-    Pressed { position: LogicalPoint, button: PointerEventButton, click_count: u8 },
+    Pressed {
+        /// The position of the pointer when the event happened.
+        position: LogicalPoint,
+        /// The button that was pressed.
+        button: PointerEventButton,
+        /// The current click count reported for this press.
+        click_count: u8,
+        /// The touch ID if the event originated from touch input.
+        touch_finger_id: i32,
+    },
     /// The mouse or finger was released
-    /// `position` is the position of the mouse when the event happens.
-    /// `button` describes the button that is pressed when the event happens.
-    /// `click_count` represents the current number of clicks.
-    Released { position: LogicalPoint, button: PointerEventButton, click_count: u8 },
+    Released {
+        /// The position of the pointer when the event happened.
+        position: LogicalPoint,
+        /// The button that was released.
+        button: PointerEventButton,
+        /// The current click count reported for this release.
+        click_count: u8,
+        /// The touch ID if the event originated from touch input.
+        touch_finger_id: i32,
+    },
     /// The position of the pointer has changed
-    Moved { position: LogicalPoint },
+    Moved {
+        /// The new position of the pointer.
+        position: LogicalPoint,
+        /// The touch ID if the event originated from touch input.
+        touch_finger_id: i32,
+    },
     /// Wheel was operated.
-    /// `pos` is the position of the mouse when the event happens.
-    /// `delta_x` is the amount of pixels to scroll in horizontal direction,
-    /// `delta_y` is the amount of pixels to scroll in vertical direction.
-    Wheel { position: LogicalPoint, delta_x: Coord, delta_y: Coord },
+    Wheel {
+        /// The position of the pointer when the event happened.
+        position: LogicalPoint,
+        /// The horizontal scroll delta in logical pixels.
+        delta_x: Coord,
+        /// The vertical scroll delta in logical pixels.
+        delta_y: Coord,
+        /// The gesture phase reported for the wheel event.
+        phase: TouchPhase,
+    },
     /// The mouse is being dragged over this item.
     /// [`InputEventResult::EventIgnored`] means that the item does not handle the drag operation
     /// and [`InputEventResult::EventAccepted`] means that the item can accept it.
-    DragMove(DropEvent),
+    DragMove {
+        /// The dragged payload and its current position/proposed action.
+        event: DropEvent,
+        /// The actions the drag source permits.
+        allowed: AllowedDragActions,
+    },
     /// The mouse is released while dragging over this item.
-    Drop(DropEvent),
+    Drop {
+        /// The dragged payload and its current position/proposed action.
+        event: DropEvent,
+        /// The actions the drag source permits.
+        allowed: AllowedDragActions,
+    },
+    /// A platform-recognized pinch gesture (macOS/iOS trackpad, Qt).
+    PinchGesture {
+        /// The focal position of the gesture.
+        position: LogicalPoint,
+        /// The incremental scale delta for this gesture update.
+        delta: f32,
+        /// The gesture phase reported by the platform.
+        phase: TouchPhase,
+    },
+    /// A platform-recognized rotation gesture (macOS/iOS trackpad, Qt).
+    RotationGesture {
+        /// The focal position of the gesture.
+        position: LogicalPoint,
+        /// The incremental rotation in degrees, where positive means clockwise.
+        delta: f32,
+        /// The gesture phase reported by the platform.
+        phase: TouchPhase,
+    },
     /// The mouse exited the item or component
     Exit,
 }
 
 impl MouseEvent {
+    /// The touch ID if the event originated from touch input.
+    pub fn touch_finger_id(&self) -> i32 {
+        match self {
+            MouseEvent::Pressed { touch_finger_id, .. } => *touch_finger_id,
+            MouseEvent::Released { touch_finger_id, .. } => *touch_finger_id,
+            MouseEvent::Moved { touch_finger_id, .. } => *touch_finger_id,
+            _ => 0,
+        }
+    }
+
+    /// Whether the event originates from a touch screen rather than a mouse.
+    pub fn is_from_touch(&self) -> bool {
+        // touch events carry the finger id + 1, events from a mouse carry 0
+        self.touch_finger_id() != 0
+    }
+
     /// The position of the cursor for this event, if any
     pub fn position(&self) -> Option<LogicalPoint> {
         match self {
             MouseEvent::Pressed { position, .. } => Some(*position),
             MouseEvent::Released { position, .. } => Some(*position),
-            MouseEvent::Moved { position } => Some(*position),
+            MouseEvent::Moved { position, .. } => Some(*position),
             MouseEvent::Wheel { position, .. } => Some(*position),
-            MouseEvent::DragMove(e) | MouseEvent::Drop(e) => {
+            MouseEvent::PinchGesture { position, .. } => Some(*position),
+            MouseEvent::RotationGesture { position, .. } => Some(*position),
+            MouseEvent::DragMove { event: e, .. } | MouseEvent::Drop { event: e, .. } => {
                 Some(crate::lengths::logical_point_from_api(e.position))
             }
             MouseEvent::Exit => None,
@@ -76,9 +148,11 @@ impl MouseEvent {
         let pos = match self {
             MouseEvent::Pressed { position, .. } => Some(position),
             MouseEvent::Released { position, .. } => Some(position),
-            MouseEvent::Moved { position } => Some(position),
+            MouseEvent::Moved { position, .. } => Some(position),
             MouseEvent::Wheel { position, .. } => Some(position),
-            MouseEvent::DragMove(e) | MouseEvent::Drop(e) => {
+            MouseEvent::PinchGesture { position, .. } => Some(position),
+            MouseEvent::RotationGesture { position, .. } => Some(position),
+            MouseEvent::DragMove { event: e, .. } | MouseEvent::Drop { event: e, .. } => {
                 e.position = crate::api::LogicalPosition::from_euclid(
                     crate::lengths::logical_point_from_api(e.position) + vec,
                 );
@@ -91,6 +165,30 @@ impl MouseEvent {
         }
     }
 
+    /// Transform the position by the given item transform.
+    pub fn transform(&mut self, transform: ItemTransform) {
+        let pos = match self {
+            MouseEvent::Pressed { position, .. } => Some(position),
+            MouseEvent::Released { position, .. } => Some(position),
+            MouseEvent::Moved { position, .. } => Some(position),
+            MouseEvent::Wheel { position, .. } => Some(position),
+            MouseEvent::PinchGesture { position, .. } => Some(position),
+            MouseEvent::RotationGesture { position, .. } => Some(position),
+            MouseEvent::DragMove { event: e, .. } | MouseEvent::Drop { event: e, .. } => {
+                e.position = crate::api::LogicalPosition::from_euclid(
+                    transform
+                        .transform_point(crate::lengths::logical_point_from_api(e.position).cast())
+                        .cast(),
+                );
+                None
+            }
+            MouseEvent::Exit => None,
+        };
+        if let Some(pos) = pos {
+            *pos = transform.transform_point(pos.cast()).cast();
+        }
+    }
+
     /// Set the click count of the pressed or released event
     fn set_click_count(&mut self, count: u8) {
         match self {
@@ -100,6 +198,102 @@ impl MouseEvent {
             _ => (),
         }
     }
+}
+
+/// The mouse events a backend can deliver to the runtime.
+#[allow(missing_docs)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BackendMouseEvent {
+    /// The mouse or finger was pressed
+    Pressed {
+        position: LogicalPoint,
+        button: PointerEventButton,
+        click_count: u8,
+        touch_finger_id: i32,
+    },
+    /// The mouse or finger was released
+    Released {
+        position: LogicalPoint,
+        button: PointerEventButton,
+        click_count: u8,
+        touch_finger_id: i32,
+    },
+    /// The position of the pointer has changed
+    Moved { position: LogicalPoint, touch_finger_id: i32 },
+    /// Wheel was operated.
+    Wheel { position: LogicalPoint, delta_x: Coord, delta_y: Coord, phase: TouchPhase },
+    /// A platform-recognized pinch gesture (macOS/iOS trackpad, Qt).
+    PinchGesture { position: LogicalPoint, delta: f32, phase: TouchPhase },
+    /// A platform-recognized rotation gesture (macOS/iOS trackpad, Qt).
+    RotationGesture { position: LogicalPoint, delta: f32, phase: TouchPhase },
+    /// The mouse exited the item or component
+    Exit,
+}
+
+impl From<BackendMouseEvent> for MouseEvent {
+    fn from(event: BackendMouseEvent) -> Self {
+        match event {
+            BackendMouseEvent::Pressed { position, button, click_count, touch_finger_id } => {
+                Self::Pressed { position, button, click_count, touch_finger_id }
+            }
+            BackendMouseEvent::Released { position, button, click_count, touch_finger_id } => {
+                Self::Released { position, button, click_count, touch_finger_id }
+            }
+            BackendMouseEvent::Moved { position, touch_finger_id } => {
+                Self::Moved { position, touch_finger_id }
+            }
+            BackendMouseEvent::Wheel { position, delta_x, delta_y, phase } => {
+                Self::Wheel { position, delta_x, delta_y, phase }
+            }
+            BackendMouseEvent::PinchGesture { position, delta, phase } => {
+                Self::PinchGesture { position, delta, phase }
+            }
+            BackendMouseEvent::RotationGesture { position, delta, phase } => {
+                Self::RotationGesture { position, delta, phase }
+            }
+            BackendMouseEvent::Exit => Self::Exit,
+        }
+    }
+}
+
+/// The drag and drop events a backend can deliver, through [`WindowInner::process_drag_event`].
+#[allow(missing_docs)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendDragEvent {
+    /// A drag is hovering over the window.
+    Move { event: DropEvent, allowed: AllowedDragActions },
+    /// A drag was released over the window.
+    Drop { event: DropEvent, allowed: AllowedDragActions },
+    /// A drag left the window, or was cancelled while hovering over it.
+    Leave,
+}
+
+impl From<BackendDragEvent> for MouseEvent {
+    fn from(event: BackendDragEvent) -> Self {
+        match event {
+            BackendDragEvent::Move { event, allowed } => Self::DragMove { event, allowed },
+            BackendDragEvent::Drop { event, allowed } => Self::Drop { event, allowed },
+            // A drag leaving tears down the hover state the same way the pointer leaving does.
+            BackendDragEvent::Leave => Self::Exit,
+        }
+    }
+}
+
+/// Phase of a touch, gesture event or wheel event.
+/// A touchpad is recognized as wheel event and therefore
+/// we need to find out when the touch event starts and ends
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TouchPhase {
+    /// The gesture began (e.g., first finger touched or platform gesture started).
+    Started,
+    /// The gesture is ongoing (e.g., fingers moved or platform gesture updated).
+    Moved,
+    /// The gesture completed normally.
+    Ended,
+    /// The gesture was cancelled (e.g., interrupted by the system) or the mouse wheel was used
+    Cancelled,
 }
 
 /// This value is returned by the `input_event` function of an Item
@@ -145,15 +339,19 @@ pub enum InputEventFilterResult {
     /// This is what happens when the flickable wants to delay the event.
     /// This should only be used for Press event, and the event will be sent after the delay, or
     /// if a release event is seen before that delay
+    /// If any other component is handling the event it will be not handled by the component returned this result
     //(Can't use core::time::Duration because it is not repr(c))
     DelayForwarding(u64),
+    /// Like `ForwardAndIgnore`, but the item still receives a [`MouseEvent::Exit`]
+    /// when the pointer leaves, even if a sibling handles the event in between.
+    ForwardAndObserve,
 }
 
 /// This module contains the constant character code used to represent the keys.
 #[allow(missing_docs, non_upper_case_globals)]
 pub mod key_codes {
     macro_rules! declare_consts_for_special_keys {
-       ($($char:literal # $name:ident # $($_qt:ident)|* # $($_winit:ident $(($_pos:ident))?)|*    # $($_xkb:ident)|*;)*) => {
+       ($($char:literal # $name:ident # $($shifted:ident)? $(=> $($_muda:ident)? # $($_qt:ident)|* # $($_winit:ident $(($_pos:ident))?)|*    # $($_xkb:ident)|* )? ;)*) => {
             $(pub const $name : char = $char;)*
 
             #[allow(missing_docs)]
@@ -193,7 +391,7 @@ pub mod key_codes {
         };
     }
 
-    i_slint_common::for_each_special_keys!(declare_consts_for_special_keys);
+    i_slint_common::for_each_keys!(declare_consts_for_special_keys);
 }
 
 /// Internal struct to maintain the pressed/released state of the keys that
@@ -234,22 +432,6 @@ impl InternalKeyboardModifierState {
             debug_assert_eq!(key_code.len_utf8(), text.len());
         }
 
-        // Special cases:
-        #[cfg(target_os = "windows")]
-        {
-            if self.altgr {
-                // Windows sends Ctrl followed by AltGr on AltGr. Disable the Ctrl again!
-                self.left_control = false;
-                self.right_control = false;
-            } else if self.control() && self.alt() {
-                // Windows treats Ctrl-Alt as AltGr
-                self.left_control = false;
-                self.right_control = false;
-                self.left_alt = false;
-                self.right_alt = false;
-            }
-        }
-
         Some(self)
     }
 
@@ -265,6 +447,70 @@ impl InternalKeyboardModifierState {
     pub fn control(&self) -> bool {
         self.right_control || self.left_control
     }
+
+    pub fn modifiers_for(&self, _event: &InternalKeyEvent) -> KeyboardModifiers {
+        #[allow(unused_mut)]
+        let mut alt = self.alt();
+        #[allow(unused_mut)]
+        let mut control = self.control();
+
+        // Windows treats Ctrl+Alt as implying AltGr, but not vice-versa
+        // Unfortunately, our different backends produce different key combinations here.
+        //
+        // ## Qt
+        // Qt always sends Ctrl + Alt instead of AltGr, and does not tell us whether this
+        // was interpreted as AltGr or not. So with Qt we have no way of telling whether
+        // AltGr is pressed, and we have to assume that it is pressed whenever Ctrl + Alt is pressed.
+        // In that case the `text_without_modifiers` is also not set.
+        //
+        // ## Winit
+        // Winit sends the actual Ctrl/Alt/AltGr keypress correctly.
+        // With winit we can detect whether ctrl+alt actually caused a AltGr conversion or not,
+        // by checking whether the text_without_modifiers is different from the event text.
+        //
+        // ## Wasm
+        // Winit on the web for some reasons sends first a Ctrl and then AltGr event when only AltGr
+        // is pressed.
+        // So there we need to get rid of the additional Ctrl event whenever AltGr is pressed.
+        #[cfg(target_os = "windows")]
+        {
+            // Non-web windows (Usually winit or Qt)
+            if !self.altgr && self.control() && self.alt() {
+                // AltGr is not pressed, but Ctrl+Alt is pressed.
+                // Try to detect if an AltGr conversion occurred.
+                // If so, disable Ctrl and Alt
+                //
+                // On platforms that don't provide text_without_modifiers, fall back to a simple
+                // heuristic that assumes A-Z & 0-9 are not produced with AltGr, but all other keys are.
+                let implies_altgr = if _event.text_without_modifiers.is_empty() {
+                    _event.key_event.text.chars().any(|c| !c.is_ascii_alphanumeric())
+                } else {
+                    _event.text_without_modifiers.to_lowercase()
+                        != _event.key_event.text.to_lowercase()
+                };
+                if implies_altgr {
+                    alt = false;
+                    control = false;
+                }
+            }
+        }
+        #[cfg(target_family = "wasm")]
+        if crate::detect_operating_system() == OperatingSystemType::Windows {
+            // Non-native windows (e.g. Winit on the web)
+            // This currently injects additional Ctrl events, so remove those if AltGr is
+            // pressed.
+            let is_altgr = self.altgr
+                || (self.control()
+                    && self.alt()
+                    && _event.key_event.text.chars().any(|c| !c.is_ascii_alphanumeric()));
+            if is_altgr {
+                alt = false;
+                control = false;
+            }
+        }
+
+        KeyboardModifiers { alt, control, meta: self.meta(), shift: self.shift() }
+    }
 }
 
 impl From<InternalKeyboardModifierState> for KeyboardModifiers {
@@ -274,6 +520,562 @@ impl From<InternalKeyboardModifierState> for KeyboardModifiers {
             control: internal_state.control(),
             meta: internal_state.meta(),
             shift: internal_state.shift(),
+        }
+    }
+}
+
+#[i_slint_core_macros::slint_doc]
+/// The `Keys` type is the Rust representation of Slint's `keys` primitive type.
+///
+/// It can be created with the `@keys` macro in Slint and defines which key event(s) activate a KeyBinding.
+///
+/// See also the Slint documentation on [Key Bindings](slint:KeyBindingOverview).
+///
+/// In `.slint` files, `Keys` values are typically created via the `@keys(...)` macro.
+/// From backend code, they can be created from a list of string parts with the similar
+/// syntax as the macro:
+///
+/// ```rust
+/// use slint::Keys;
+///
+/// let save = Keys::from_parts(["Control", "S"])?;
+/// let undo = Keys::from_parts(["Control", "Shift?", "Z"])?;
+/// let f5 = Keys::from_parts(["F5"])?;
+/// let zoom_in = Keys::from_parts(["Control", "Plus"])?;
+/// let euro = Keys::from_parts(["Control", "€"])?;
+/// let empty = Keys::from_parts([])?;  // same as Keys::default()
+/// # Ok::<(), i_slint_core::input::KeysParseError>(())
+/// ```
+/// ## Parts format
+///
+/// Each element is either a modifier or a key (case-sensitive, matching the `@keys` macro):
+/// - **Modifiers** (optional): `Control`, `Alt`, `Shift`, `Meta`
+/// - **Optional modifiers**: `Shift?`, `Alt?` (match regardless of that modifier's state)
+/// - **Named key** (required, exactly one): A named key (`Return`, `Tab`, `F1`, `Plus`, `Space`, `A`–`Z`, etc.)
+/// - **String literal fallback**: If no named key matches, the part is treated as a string
+///   literal — it must be a single lowercase grapheme cluster (e.g., `"€"`, `"é"`)
+///
+/// Keys with layout-dependent shifted variants (digits `Digit0`–`Digit9`, symbols like
+/// `Plus`, `Comma`, etc.) automatically get `Shift?` behavior, just like the `@keys` macro.
+#[derive(Clone, Eq, PartialEq, Default)]
+#[repr(C)]
+pub struct Keys {
+    inner: KeysInner,
+}
+
+/// Internal representation of key-parse errors. Variants are not part of the public API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeysParseErrorInner {
+    /// No key was found (only modifiers were specified).
+    NoKey,
+    /// More than one non-modifier key was found.
+    MultipleKeys,
+    /// A string literal contains more than one grapheme cluster.
+    /// The contained string is the offending key part (e.g. `"ab"` or `"return"`).
+    MultipleGraphemeClusters(SharedString),
+    /// A string literal is not lowercase.
+    /// The contained string is the offending key part (e.g. `"É"`).
+    NotLowercase(SharedString),
+    /// Incompatible modifiers were specified (e.g. both `Shift` and `Shift?`).
+    /// The contained string is a human-readable description of the conflict.
+    IncompatibleModifiers(SharedString),
+}
+
+/// Error type returned when constructing a [`Keys`] from string parts.
+///
+/// This is an opaque error type. Use its [`Display`] implementation
+/// to obtain a human-readable description of the problem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeysParseError(KeysParseErrorInner);
+
+impl core::fmt::Display for KeysParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.0 {
+            KeysParseErrorInner::NoKey => write!(f, "no key found (only modifiers)"),
+            KeysParseErrorInner::MultipleKeys => {
+                write!(f, "multiple non-modifier keys found")
+            }
+            KeysParseErrorInner::MultipleGraphemeClusters(s) => {
+                write!(f, "key string must be a single grapheme cluster, got: {s}")
+            }
+            KeysParseErrorInner::NotLowercase(s) => {
+                let lower = s.to_lowercase();
+                write!(f, "key string must be lowercase, use \"{lower}\" instead")
+            }
+            KeysParseErrorInner::IncompatibleModifiers(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl core::error::Error for KeysParseError {}
+
+use i_slint_common::key_codes::{ShiftBehavior, lookup_key_name};
+
+/// Re-exported in private_unstable_api to create a Keys struct.
+pub fn make_keys(
+    key: SharedString,
+    modifiers: KeyboardModifiers,
+    ignore_shift: bool,
+    ignore_alt: bool,
+) -> Keys {
+    Keys {
+        inner: KeysInner { key: key.to_lowercase().into(), modifiers, ignore_shift, ignore_alt },
+    }
+}
+
+#[cfg(feature = "ffi")]
+#[allow(unsafe_code)]
+pub(crate) mod ffi {
+    use crate::api::ToSharedString as _;
+
+    use super::*;
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keys(
+        key: &SharedString,
+        alt: bool,
+        control: bool,
+        shift: bool,
+        meta: bool,
+        ignore_shift: bool,
+        ignore_alt: bool,
+        out: &mut Keys,
+    ) {
+        *out = make_keys(
+            key.clone(),
+            KeyboardModifiers { alt, control, shift, meta },
+            ignore_shift,
+            ignore_alt,
+        );
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keys_debug_string(shortcut: &Keys, out: &mut SharedString) {
+        *out = crate::format!("{shortcut:?}");
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keys_to_string(shortcut: &Keys, out: &mut SharedString) {
+        *out = shortcut.to_shared_string();
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keys_from_parts(
+        parts: crate::slice::Slice<'_, SharedString>,
+        out: &mut Keys,
+    ) -> bool {
+        match keys_from_parts(parts.as_slice().iter().map(|s| s.as_str())) {
+            Ok(keys) => {
+                *out = keys;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn slint_keys_to_parts(
+        keys: &Keys,
+        out: &mut crate::SharedVector<SharedString>,
+    ) {
+        *out = keys.to_parts().map(SharedString::from).collect();
+    }
+}
+
+/// Normalize a key string: lowercase and NFC-normalize.
+fn normalize_key(key: &str) -> SharedString {
+    let lowered = key.to_lowercase();
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "shared-parley")] {
+            let normalizer = icu_normalizer::ComposingNormalizer::new_nfc();
+            let normalized = normalizer.normalize(&lowered);
+            SharedString::from(normalized.as_ref())
+        } else {
+            SharedString::from(lowered.as_str())
+        }
+    }
+}
+
+fn keys_from_parts<'a>(parts: impl Iterator<Item = &'a str>) -> Result<Keys, KeysParseError> {
+    keys_from_parts_inner(parts).map_err(KeysParseError)
+}
+
+fn keys_from_parts_inner<'a>(
+    parts: impl Iterator<Item = &'a str>,
+) -> Result<Keys, KeysParseErrorInner> {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    let mut modifiers = KeyboardModifiers::default();
+    let mut ignore_shift = false;
+    let mut ignore_alt = false;
+    let mut key_part: Option<&str> = None;
+
+    for part in parts {
+        // Parts are *not* trimmed: whitespace is significant, so `" "`, `"\t"` and
+        // `"\n"` are valid literal spellings of the Space, Tab and Return keys, the
+        // same way `@keys(" ")` is valid in Slint. Trimming would silently swallow
+        // them and make those keys unreachable through a literal. Empty parts carry
+        // no information and are skipped, which keeps `from_parts([""])` equivalent
+        // to `from_parts([])`.
+        if part.is_empty() {
+            continue;
+        }
+        match part {
+            "Control" => modifiers.control = true,
+            "Alt" => {
+                if ignore_alt {
+                    return Err(KeysParseErrorInner::IncompatibleModifiers(
+                        "Alt and Alt? cannot be combined".into(),
+                    ));
+                }
+                modifiers.alt = true;
+            }
+            "Shift" => {
+                if ignore_shift {
+                    return Err(KeysParseErrorInner::IncompatibleModifiers(
+                        "Shift and Shift? cannot be combined".into(),
+                    ));
+                }
+                modifiers.shift = true;
+            }
+            "Meta" => modifiers.meta = true,
+            "Shift?" => {
+                if modifiers.shift {
+                    return Err(KeysParseErrorInner::IncompatibleModifiers(
+                        "Shift and Shift? cannot be combined".into(),
+                    ));
+                }
+                ignore_shift = true;
+            }
+            "Alt?" => {
+                if modifiers.alt {
+                    return Err(KeysParseErrorInner::IncompatibleModifiers(
+                        "Alt and Alt? cannot be combined".into(),
+                    ));
+                }
+                ignore_alt = true;
+            }
+            _ => {
+                if key_part.is_some() {
+                    return Err(KeysParseErrorInner::MultipleKeys);
+                }
+                key_part = Some(part);
+            }
+        }
+    }
+
+    let key_name = match key_part {
+        Some(k) => k,
+        None if modifiers == KeyboardModifiers::default() && !ignore_shift && !ignore_alt => {
+            // Empty input (or only empty parts) → Keys::default(), same as @keys()
+            return Ok(Keys::default());
+        }
+        None => return Err(KeysParseErrorInner::NoKey),
+    };
+
+    // First: try named-key lookup (case-sensitive, like the @keys macro)
+    if let Some((key_char, shift_behavior)) = lookup_key_name(key_name) {
+        // Auto-set ignore_shift for keys with localized shifted variants
+        if matches!(shift_behavior, ShiftBehavior::LocalizedShiftable { .. }) {
+            if modifiers.shift {
+                return Err(KeysParseErrorInner::IncompatibleModifiers(
+                    alloc::format!(
+                        "Key bindings involving {key_name} ignore Shift to support different keyboard layouts; remove Shift"
+                    ).into(),
+                ));
+            }
+            ignore_shift = true;
+        }
+        // Key code literals in key_codes.rs are already NFC-normalized, just lowercase.
+        let key: SharedString = key_char.to_lowercase().collect::<alloc::string::String>().into();
+        return Ok(Keys { inner: KeysInner { key, modifiers, ignore_shift, ignore_alt } });
+    }
+
+    // Fallback: treat as a string literal (like @keys("€"))
+    // Must be a single grapheme cluster
+    let grapheme_count = key_name.graphemes(true).count();
+    if grapheme_count > 1 {
+        return Err(KeysParseErrorInner::MultipleGraphemeClusters(key_name.into()));
+    }
+
+    // Must be lowercase
+    let lowered = key_name.to_lowercase();
+    if lowered != key_name {
+        return Err(KeysParseErrorInner::NotLowercase(key_name.into()));
+    }
+
+    let key = normalize_key(key_name);
+    Ok(Keys { inner: KeysInner { key, modifiers, ignore_shift, ignore_alt } })
+}
+
+/// Internal representation of the `Keys` type.
+/// This is semver exempt and is only used to set up the native menu in the backends.
+#[derive(PartialEq, Eq, Clone, Default)]
+#[repr(C)]
+pub struct KeysInner {
+    /// The `key` used to trigger the shortcut
+    ///
+    /// Note: This is currently converted to lowercase when the shortcut is created!
+    pub key: SharedString,
+    /// `KeyboardModifier`s that need to be pressed for the shortcut to fire
+    pub modifiers: KeyboardModifiers,
+    /// Whether to ignore shift state when matching the shortcut
+    pub ignore_shift: bool,
+    /// Whether to ignore alt state when matching the shortcut
+    pub ignore_alt: bool,
+}
+
+impl KeysInner {
+    /// Private access to the KeysInner for a given Keys value.
+    pub fn from_pub(keys: &Keys) -> &Self {
+        &keys.inner
+    }
+}
+
+impl Keys {
+    #[i_slint_core_macros::slint_doc]
+    /// Create a `Keys` from an iterator of string parts (matching `@keys` macro syntax).
+    ///
+    /// Each element is either a modifier (`Control`, `Shift`, `Alt`, `Meta`, `Shift?`, `Alt?`)
+    /// or a key. Keys are first looked up by name (case-sensitive) in the Key namespace;
+    /// if not found, treated as a string literal (must be a single lowercase grapheme cluster).
+    /// Exactly one non-modifier key must be present.
+    ///
+    /// Parts are taken verbatim — they are not trimmed — so whitespace is significant:
+    /// `" "`, `"\t"` and `"\n"` are literal spellings of the `Space`, `Tab` and `Return`
+    /// keys, just as `@keys(" ")` is valid in Slint. A part must therefore match a
+    /// modifier or key exactly; `" Control "` is not the `Control` modifier.
+    ///
+    /// An empty iterator returns `Keys::default()` (same as `@keys()`). Empty parts are
+    /// skipped, so `from_parts([""])` is also `Keys::default()`.
+    ///
+    /// See also the Slint documentation on [Key Bindings](slint:KeyBindingOverview).
+    ///
+    /// Note: This currently only supports a **single shortcut** (one key + modifiers).
+    pub fn from_parts<'a>(
+        parts: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Keys, KeysParseError> {
+        keys_from_parts(parts.into_iter())
+    }
+
+    #[i_slint_core_macros::slint_doc]
+    /// Decompose this `Keys` value into the string parts that
+    /// [`Keys::from_parts`] accepts.
+    ///
+    /// See also the Slint documentation on [Key Bindings](slint:KeyBindingOverview).
+    ///
+    /// A `Keys` value that is converted into parts and then re-created from those parts
+    /// with [`Keys::from_parts`] will be equal to the input `Keys` value:
+    ///
+    /// ```
+    /// use slint::Keys;
+    /// let k = Keys::from_parts(["Control", "Shift?", "Z"])?;
+    /// let k_from_parts = Keys::from_parts(k.to_parts())?;
+    /// assert_eq!(k_from_parts, k);
+    /// # Ok::<(), i_slint_core::input::KeysParseError>(())
+    /// ```
+    ///
+    /// Note that while a round-trip guarantees that the resulting `Keys` instances will
+    /// be equal, the parts returned by `to_parts` can be different from the parts used
+    /// to construct the `Keys` instance with `from_parts`.
+    ///
+    /// A part is not necessarily printable, so a text format storing parts has to quote
+    /// or escape them. The
+    /// [`runtime_key_bindings`](https://github.com/slint-ui/slint/tree/master/examples/runtime_key_bindings)
+    /// example shows one way to persist a user-configured shortcut and restore it.
+    ///
+    /// An empty `Keys` (i.e. [`Keys::default()`]) returns an empty iterator.
+    pub fn to_parts(&self) -> impl Iterator<Item = &str> {
+        let inner = &self.inner;
+        let has_key = !inner.key.is_empty();
+        // Order matches the `@keys` macro / Debug impl: Meta, Control, Alt, Shift.
+        //
+        // The key itself is always emitted as the stored character, never as the
+        // name it may have been created from. Names are not reversed back: a
+        // `LocalizedShiftable` name auto-applies `ignore_shift` on re-parse, so
+        // emitting one would break the round-trip of a literal such as
+        // `["Control", "+"]` (which has `ignore_shift = false`). Emitting the raw
+        // character lets `ignore_shift` be carried explicitly by `Shift?`, so
+        // `@keys(Control + Plus)` comes back as `["Control", "Shift?", "+"]`.
+        [
+            (has_key && inner.modifiers.meta).then_some("Meta"),
+            (has_key && inner.modifiers.control).then_some("Control"),
+            (has_key && inner.modifiers.alt).then_some("Alt"),
+            (has_key && !inner.modifiers.alt && inner.ignore_alt).then_some("Alt?"),
+            (has_key && inner.modifiers.shift).then_some("Shift"),
+            (has_key && !inner.modifiers.shift && inner.ignore_shift).then_some("Shift?"),
+            has_key.then(|| inner.key.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    /// Check whether a `Keys` can be triggered by the given `KeyEvent`
+    pub(crate) fn matches(&self, key_event: &KeyEvent) -> bool {
+        let inner = &self.inner;
+        // An empty Keys is never triggered, even if the modifiers match.
+        if inner.key.is_empty() {
+            return false;
+        }
+
+        // TODO: Should this check the event_type and only match on KeyReleased?
+        let mut expected_modifiers = inner.modifiers;
+        if inner.ignore_shift {
+            expected_modifiers.shift = key_event.modifiers.shift;
+        }
+        if inner.ignore_alt {
+            expected_modifiers.alt = key_event.modifiers.alt;
+        }
+        // Note: The shortcut's key is already in lowercase and NFC-normalized
+        // (by the compiler and backends respectively), so we only need to
+        // lowercase the event text. Backends are expected to NFC-normalize
+        // key event text before dispatching.
+        //
+        // This improves our handling of CapsLock and Shift, as the event text will be in uppercase
+        // if caps lock is active, even if shift is not pressed.
+        let event_text = key_event.text.chars().flat_map(|character| character.to_lowercase());
+
+        event_text.eq(inner.key.chars()) && key_event.modifiers == expected_modifiers
+    }
+
+    fn format_key_for_display(&self) -> crate::SharedString {
+        let key_str = self.inner.key.as_str();
+        let first_char = key_str.chars().next();
+
+        if let Some(first_char) = first_char {
+            macro_rules! check_special_key {
+                ($($char:literal # $name:ident # $($shifted:ident)? $(=> $($_muda:ident)? # $($qt:ident)|* # $($winit:ident $(($_pos:ident))?)|* # $($xkb:ident)|*)? ;)*) => {
+                    match first_char {
+                    $($(
+                        // Use $qt as a marker - if it exists, generate the check
+                        $char => {
+                            let _ = stringify!($($qt)|*); // Use $qt to enable this branch
+                            return stringify!($name).into();
+                        }
+                    )?)*
+                        _ => ()
+                    }
+                };
+            }
+            i_slint_common::for_each_keys!(check_special_key);
+        }
+
+        if key_str.chars().count() == 1 {
+            return key_str.to_uppercase().into();
+        }
+
+        key_str.into()
+    }
+}
+
+impl Display for Keys {
+    /// Converts the [`Keys`] to a string that looks native on the current platform.
+    ///
+    /// For example, the shortcut created with `@keys(Meta + Control + A)`
+    /// will be converted like this:
+    /// - **macOS**: `⌃⌘A`
+    /// - **Windows**: `Win+Ctrl+A`
+    /// - **Linux**: `Super+Ctrl+A`
+    ///
+    /// Note that this functions output is best-effort and may be adjusted/improved at any time,
+    /// do not rely on this output to be stable!
+    //
+    // References for implementation
+    // - macOS: <https://developer.apple.com/design/human-interface-guidelines/keyboards>
+    // - Windows: <https://learn.microsoft.com/en-us/windows/apps/design/input/keyboard-accelerators>
+    // - Linux: <https://developer.gnome.org/hig/guidelines/keyboard.html>
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let inner = &self.inner;
+        if inner.key.is_empty() {
+            return Ok(());
+        }
+
+        if crate::is_apple_platform() {
+            // Slint remaps modifiers on macOS: control → Command, meta → Control
+            // From Apple's documentation:
+            //
+            // List modifier keys in the correct order.
+            // If you use more than one modifier key in a custom shortcut, always list them in this order:
+            //  Control, Option, Shift, Command
+            if inner.modifiers.meta {
+                f.write_str("⌃")?;
+            }
+            if !inner.ignore_alt && inner.modifiers.alt {
+                f.write_str("⌥")?;
+            }
+            if !inner.ignore_shift && inner.modifiers.shift {
+                f.write_str("⇧")?;
+            }
+            if inner.modifiers.control {
+                f.write_str("⌘")?;
+            }
+        } else {
+            let separator = "+";
+
+            // TODO: These should probably be translated, but better to have at least
+            // platform-local names than nothing.
+            let (ctrl_str, alt_str, shift_str, meta_str) =
+                if crate::detect_operating_system() == OperatingSystemType::Windows {
+                    ("Ctrl", "Alt", "Shift", "Win")
+                } else {
+                    ("Ctrl", "Alt", "Shift", "Super")
+                };
+
+            if inner.modifiers.meta {
+                f.write_str(meta_str)?;
+                f.write_str(separator)?;
+            }
+            if inner.modifiers.control {
+                f.write_str(ctrl_str)?;
+                f.write_str(separator)?;
+            }
+            if !inner.ignore_alt && inner.modifiers.alt {
+                f.write_str(alt_str)?;
+                f.write_str(separator)?;
+            }
+            if !inner.ignore_shift && inner.modifiers.shift {
+                f.write_str(shift_str)?;
+                f.write_str(separator)?;
+            }
+        }
+        f.write_str(&self.format_key_for_display())
+    }
+}
+
+impl core::fmt::Debug for Keys {
+    /// Formats the keyboard shortcut so that the output would be accepted by the @keys macro in Slint.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let inner = &self.inner;
+        // Make sure to keep this in sync with the implementation in compiler/langtype.rs
+        if inner.key.is_empty() {
+            write!(f, "")
+        } else {
+            let alt = inner
+                .ignore_alt
+                .then_some("Alt?+")
+                .or(inner.modifiers.alt.then_some("Alt+"))
+                .unwrap_or_default();
+            let ctrl = if inner.modifiers.control { "Control+" } else { "" };
+            let meta = if inner.modifiers.meta { "Meta+" } else { "" };
+            let shift = inner
+                .ignore_shift
+                .then_some("Shift?+")
+                .or(inner.modifiers.shift.then_some("Shift+"))
+                .unwrap_or_default();
+            let keycode: SharedString = inner
+                .key
+                .chars()
+                .flat_map(|character| {
+                    let mut escaped = alloc::vec![];
+                    if character.is_control() {
+                        escaped.extend(character.escape_unicode());
+                    } else {
+                        escaped.push(character);
+                    }
+                    escaped
+                })
+                .collect();
+            write!(f, "{meta}{ctrl}{alt}{shift}\"{keycode}\"")
         }
     }
 }
@@ -294,12 +1096,40 @@ pub enum KeyEventType {
     CommitComposition = 3,
 }
 
-impl KeyEvent {
+#[derive(Default, Debug, Clone, PartialEq)]
+/// This struct is used to pass key events to the runtime.
+pub struct InternalKeyEvent {
+    /// That's the public type with only public fields
+    pub key_event: KeyEvent,
+    /// Indicates whether the key was pressed or released
+    pub event_type: KeyEventType,
+    /// The key without any modifiers held
+    /// Important on Windows, to distinguish between key presses when Ctrl+Alt was pressed
+    /// vs. AltGr.
+    /// This is optional, and we will fall back to a heuristic for Ctrl+Alt on Windows if this
+    /// isn't provided.
+    #[cfg(target_os = "windows")]
+    pub text_without_modifiers: SharedString,
+    /// If the event type is KeyEventType::UpdateComposition or KeyEventType::CommitComposition,
+    /// then this field specifies what part of the current text to replace.
+    /// Relative to the offset of the pre-edit text within the text input element's text.
+    pub replacement_range: Option<core::ops::Range<i32>>,
+    /// If the event type is KeyEventType::UpdateComposition, this is the new pre-edit text
+    pub preedit_text: SharedString,
+    /// The selection within the preedit_text
+    pub preedit_selection: Option<core::ops::Range<i32>>,
+    /// The new cursor position, when None, the cursor is put after the text that was just inserted
+    pub cursor_position: Option<i32>,
+    /// The anchor position, when None, the cursor is put after the text that was just inserted
+    pub anchor_position: Option<i32>,
+}
+
+impl InternalKeyEvent {
     /// If a shortcut was pressed, this function returns `Some(StandardShortcut)`.
     /// Otherwise it returns None.
     pub fn shortcut(&self) -> Option<StandardShortcut> {
-        if self.modifiers.control && !self.modifiers.shift {
-            match self.text.as_str() {
+        if self.key_event.modifiers.control && !self.key_event.modifiers.shift {
+            match self.key_event.text.as_str() {
                 #[cfg(not(target_arch = "wasm32"))]
                 "c" => Some(StandardShortcut::Copy),
                 #[cfg(not(target_arch = "wasm32"))]
@@ -316,10 +1146,10 @@ impl KeyEvent {
                 "r" => Some(StandardShortcut::Refresh),
                 _ => None,
             }
-        } else if self.modifiers.control && self.modifiers.shift {
-            match self.text.as_str() {
+        } else if self.key_event.modifiers.control && self.key_event.modifiers.shift {
+            match self.key_event.text.as_str() {
                 #[cfg(not(target_os = "windows"))]
-                "z" => Some(StandardShortcut::Redo),
+                "z" | "Z" => Some(StandardShortcut::Redo),
                 _ => None,
             }
         } else {
@@ -330,27 +1160,30 @@ impl KeyEvent {
     /// If a shortcut concerning text editing was pressed, this function
     /// returns `Some(TextShortcut)`. Otherwise it returns None.
     pub fn text_shortcut(&self) -> Option<TextShortcut> {
-        let keycode = self.text.chars().next()?;
+        let ke = &self.key_event;
+        let keycode = ke.text.chars().next()?;
 
-        let move_mod = if cfg!(target_os = "macos") {
-            self.modifiers.alt && !self.modifiers.control && !self.modifiers.meta
+        let is_apple = crate::is_apple_platform();
+
+        let move_mod = if is_apple {
+            ke.modifiers.alt && !ke.modifiers.control && !ke.modifiers.meta
         } else {
-            self.modifiers.control && !self.modifiers.alt && !self.modifiers.meta
+            ke.modifiers.control && !ke.modifiers.alt && !ke.modifiers.meta
         };
 
         if move_mod {
             match keycode {
                 key_codes::LeftArrow => {
-                    return Some(TextShortcut::Move(TextCursorDirection::BackwardByWord))
+                    return Some(TextShortcut::Move(TextCursorDirection::BackwardByWord));
                 }
                 key_codes::RightArrow => {
-                    return Some(TextShortcut::Move(TextCursorDirection::ForwardByWord))
+                    return Some(TextShortcut::Move(TextCursorDirection::ForwardByWord));
                 }
                 key_codes::UpArrow => {
-                    return Some(TextShortcut::Move(TextCursorDirection::StartOfParagraph))
+                    return Some(TextShortcut::Move(TextCursorDirection::StartOfParagraph));
                 }
                 key_codes::DownArrow => {
-                    return Some(TextShortcut::Move(TextCursorDirection::EndOfParagraph))
+                    return Some(TextShortcut::Move(TextCursorDirection::EndOfParagraph));
                 }
                 key_codes::Backspace => {
                     return Some(TextShortcut::DeleteWordBackward);
@@ -364,38 +1197,38 @@ impl KeyEvent {
 
         #[cfg(not(target_os = "macos"))]
         {
-            if self.modifiers.control && !self.modifiers.alt && !self.modifiers.meta {
+            if ke.modifiers.control && !ke.modifiers.alt && !ke.modifiers.meta {
                 match keycode {
                     key_codes::Home => {
-                        return Some(TextShortcut::Move(TextCursorDirection::StartOfText))
+                        return Some(TextShortcut::Move(TextCursorDirection::StartOfText));
                     }
                     key_codes::End => {
-                        return Some(TextShortcut::Move(TextCursorDirection::EndOfText))
+                        return Some(TextShortcut::Move(TextCursorDirection::EndOfText));
                     }
                     _ => (),
                 };
             }
         }
 
-        #[cfg(target_os = "macos")]
-        {
-            if self.modifiers.control {
-                match keycode {
-                    key_codes::LeftArrow => {
-                        return Some(TextShortcut::Move(TextCursorDirection::StartOfLine))
-                    }
-                    key_codes::RightArrow => {
-                        return Some(TextShortcut::Move(TextCursorDirection::EndOfLine))
-                    }
-                    key_codes::UpArrow => {
-                        return Some(TextShortcut::Move(TextCursorDirection::StartOfText))
-                    }
-                    key_codes::DownArrow => {
-                        return Some(TextShortcut::Move(TextCursorDirection::EndOfText))
-                    }
-                    _ => (),
-                };
-            }
+        if is_apple && ke.modifiers.control {
+            match keycode {
+                key_codes::LeftArrow => {
+                    return Some(TextShortcut::Move(TextCursorDirection::StartOfLine));
+                }
+                key_codes::RightArrow => {
+                    return Some(TextShortcut::Move(TextCursorDirection::EndOfLine));
+                }
+                key_codes::UpArrow => {
+                    return Some(TextShortcut::Move(TextCursorDirection::StartOfText));
+                }
+                key_codes::DownArrow => {
+                    return Some(TextShortcut::Move(TextCursorDirection::EndOfText));
+                }
+                key_codes::Backspace => {
+                    return Some(TextShortcut::DeleteToStartOfLine);
+                }
+                _ => (),
+            };
         }
 
         if let Ok(direction) = TextCursorDirection::try_from(keycode) {
@@ -446,6 +1279,8 @@ pub enum TextShortcut {
     DeleteWordForward,
     /// Delete the word to the left of the cursor (aka Ctrl + Backspace).
     DeleteWordBackward,
+    /// Delete to the left of the cursor until the start of the line
+    DeleteToStartOfLine,
 }
 
 /// Represents how an item's key_event handler dealt with a key event.
@@ -494,9 +1329,14 @@ pub struct ClickState {
 
 impl ClickState {
     /// Resets the timer and count.
-    fn restart(&self, position: LogicalPoint, button: PointerEventButton) {
+    fn restart(
+        &self,
+        position: LogicalPoint,
+        button: PointerEventButton,
+        now: crate::animations::Instant,
+    ) {
         self.click_count.set(0);
-        self.click_count_time_stamp.set(Some(crate::animations::Instant::now()));
+        self.click_count_time_stamp.set(Some(now));
         self.click_position.set(position);
         self.click_button.set(button);
     }
@@ -508,10 +1348,13 @@ impl ClickState {
     }
 
     /// Check if the click is repeated.
-    pub fn check_repeat(&self, mouse_event: MouseEvent, click_interval: Duration) -> MouseEvent {
+    /// Takes the context rather than just the interval: the timestamps it compares have to
+    /// come from the same clock, which only the context can name.
+    pub fn check_repeat(&self, mouse_event: MouseEvent, ctx: &crate::SlintContext) -> MouseEvent {
+        let click_interval = ctx.platform().click_interval();
         match mouse_event {
-            MouseEvent::Pressed { position, button, .. } => {
-                let instant_now = crate::animations::Instant::now();
+            MouseEvent::Pressed { position, button, touch_finger_id, .. } => {
+                let instant_now = crate::animations::Instant::now(ctx);
 
                 if let Some(click_count_time_stamp) = self.click_count_time_stamp.get() {
                     if instant_now - click_count_time_stamp < click_interval
@@ -521,24 +1364,26 @@ impl ClickState {
                         self.click_count.set(self.click_count.get().wrapping_add(1));
                         self.click_count_time_stamp.set(Some(instant_now));
                     } else {
-                        self.restart(position, button);
+                        self.restart(position, button, instant_now);
                     }
                 } else {
-                    self.restart(position, button);
+                    self.restart(position, button, instant_now);
                 }
 
                 return MouseEvent::Pressed {
                     position,
                     button,
                     click_count: self.click_count.get(),
+                    touch_finger_id,
                 };
             }
-            MouseEvent::Released { position, button, .. } => {
+            MouseEvent::Released { position, button, touch_finger_id, .. } => {
                 return MouseEvent::Released {
                     position,
                     button,
                     click_count: self.click_count.get(),
-                }
+                    touch_finger_id,
+                };
             }
             _ => {}
         };
@@ -547,21 +1392,44 @@ impl ClickState {
     }
 }
 
+/// The data for an in-flight drag-and-drop operation, held while a drag is active.
+#[derive(Clone)]
+pub(crate) struct DragData {
+    /// The dragged payload together with its current position and proposed action.
+    /// The `position` is updated on every move.
+    pub(crate) event: DropEvent,
+    /// The actions the drag source permits, captured at drag start.
+    pub(crate) allowed: AllowedDragActions,
+}
+
 /// The state which a window should hold for the mouse input
 #[derive(Default)]
 pub struct MouseInputState {
     /// The stack of item which contain the mouse cursor (or grab),
     /// along with the last result from the input function
     item_stack: Vec<(ItemWeak, InputEventFilterResult)>,
+    /// Passive trackers that saw the last event without claiming it (see
+    /// [`InputEventResult::ObserveEvent`]). Held outside `item_stack` so the stack
+    /// stays a single root-to-leaf path; entries here receive a synthesized
+    /// [`MouseEvent::Exit`] when they no longer appear after a new event.
+    observers: Vec<ItemWeak>,
     /// Offset to apply to the first item of the stack (used if there is a popup)
     pub(crate) offset: LogicalPoint,
     /// true if the top item of the stack has the mouse grab
     grabbed: bool,
     /// When this is Some, it means we are in the middle of a drag-drop operation and it contains the dragged data.
     /// The `position` field has no signification
-    pub(crate) drag_data: Option<DropEvent>,
+    pub(crate) drag_data: Option<DragData>,
+    /// The `DragArea` that initiated the in-flight drag.
+    /// `None` for drags coming from outside (native cross-window/cross-process DnD).
+    pub(crate) drag_source: Option<ItemWeak>,
+    /// The DropArea that accepted the most recent DragMove, if any. On release we use
+    /// this to decide whether to deliver a Drop — matching OS DnD pipelines, where a
+    /// target that didn't previously accept never receives a drop.
+    pub(crate) drop_target: Option<ItemWeak>,
     delayed: Option<(crate::timers::Timer, MouseEvent)>,
     delayed_exit_items: Vec<ItemWeak>,
+    pub(crate) cursor: MouseCursorInner,
 }
 
 impl MouseInputState {
@@ -570,21 +1438,96 @@ impl MouseInputState {
         self.item_stack.last().and_then(|x| x.0.upgrade())
     }
 
+    /// Arm the in-window drag: seed `drag_data`/`drag_source` from `drag_area` at `seed_position`
+    /// and mark it dragging.
+    pub(crate) fn arm_in_window_drag(
+        &mut self,
+        drag_area: core::pin::Pin<&crate::items::DragArea>,
+        source: ItemWeak,
+        seed_position: crate::api::LogicalPosition,
+    ) {
+        let (mut drop_event, allowed) = drag_area.initial_drop_event();
+        drop_event.position = seed_position;
+        self.drag_data = Some(DragData { event: drop_event, allowed });
+        self.drag_source = Some(source);
+        drag_area.dragging.set(true);
+    }
+
     /// Returns the item in the top of the stack, if there is a delayed event, this would be the top of the delayed stack
     pub fn top_item_including_delayed(&self) -> Option<ItemRc> {
         self.delayed_exit_items.last().and_then(|x| x.upgrade()).or_else(|| self.top_item())
     }
+
+    /// Returns true if there is a pending delayed event (e.g. from a Flickable)
+    pub fn has_delayed_event(&self) -> bool {
+        self.delayed.is_some()
+    }
+
+    /// The action negotiated with the `DropArea` that accepted the most recent
+    /// `DragMove`/`Drop`, or `None` if none accepted.
+    pub fn drop_target_action(&self) -> Option<crate::items::DragAction> {
+        let action = self
+            .drop_target
+            .as_ref()
+            .and_then(|t| t.upgrade())
+            .and_then(|i| i.downcast::<crate::items::DropArea>())
+            .map(|d| d.as_pin_ref().current_action())?;
+        (action != crate::items::DragAction::None).then_some(action)
+    }
 }
 
-/// Try to handle the mouse grabber. Return None if the event has been handled, otherwise
-/// return the event that must be handled
+pub(crate) struct MouseGrabResult {
+    /// The event that still needs normal hit-test dispatch. `None` means the grabber
+    /// fully handled the original event.
+    pub event: Option<MouseEvent>,
+    /// Whether the grabber consumed the original event before any follow-up event was
+    /// synthesized for hover/grab refresh.
+    pub accepted: bool,
+}
+
+/// Start a drag from `drag_area`, preferring a native (OS-level) drag and falling back to the
+/// in-window drag (armed on `state`) when no backend takes over.
+fn offer_native_drag(
+    window_adapter: &Rc<dyn WindowAdapter>,
+    drag_area: core::pin::Pin<&crate::items::DragArea>,
+    source: ItemWeak,
+    seed_position: crate::api::LogicalPosition,
+    state: &mut MouseInputState,
+) {
+    let data = drag_area.data();
+    // A native drag only carries serializable data, so offer it only when there's some.
+    if data.has_plain_text() || data.has_image() {
+        let request = crate::window::DragRequest {
+            data: data.clone(),
+            allowed: drag_area.allowed_actions(),
+            drag_image: drag_area.drag_image(),
+            drag_image_offset: euclid::vec2(
+                drag_area.drag_image_offset_x(),
+                drag_area.drag_image_offset_y(),
+            ),
+        };
+        if window_adapter.internal(crate::InternalToken).is_some_and(|i| i.start_drag(&request)) {
+            // The backend took over (and defers the actual drag). Stash it so it can report
+            // completion or fall back, and so a drop back onto this window restores the data.
+            let drag = crate::window::NativePendingDrag { request, source, seed_position };
+            crate::window::WindowInner::from_pub(window_adapter.window())
+                .set_native_drag(Some(drag));
+            drag_area.dragging.set(true);
+            return;
+        }
+    }
+    // No backend took over: fall back to the in-window drag.
+    state.arm_in_window_drag(drag_area, source, seed_position);
+}
+
+/// Try to handle the mouse grabber.
 pub(crate) fn handle_mouse_grab(
     mouse_event: &MouseEvent,
     window_adapter: &Rc<dyn WindowAdapter>,
     mouse_input_state: &mut MouseInputState,
-) -> Option<MouseEvent> {
+) -> MouseGrabResult {
     if !mouse_input_state.grabbed || mouse_input_state.item_stack.is_empty() {
-        return Some(mouse_event.clone());
+        return MouseGrabResult { event: Some(mouse_event.clone()), accepted: false };
     };
 
     let mut event = mouse_event.clone();
@@ -604,11 +1547,21 @@ pub(crate) fn handle_mouse_grab(
             return false;
         };
         if intercept {
-            item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item);
+            item.borrow().as_ref().input_event(
+                &MouseEvent::Exit,
+                window_adapter,
+                &item,
+                &mut mouse_input_state.cursor,
+            );
             return false;
         }
         let g = item.geometry();
         event.translate(-g.origin.to_vector());
+        if window_adapter.renderer().supports_transformations()
+            && let Some(inverse_transform) = item.inverse_children_transform()
+        {
+            event.transform(inverse_transform);
+        }
 
         let interested = matches!(
             it.1,
@@ -621,6 +1574,7 @@ pub(crate) fn handle_mouse_grab(
                 &event,
                 window_adapter,
                 &item,
+                &mut mouse_input_state.cursor,
             ) == InputEventFilterResult::Intercept
         {
             intercept = true;
@@ -628,31 +1582,46 @@ pub(crate) fn handle_mouse_grab(
         true
     });
     if invalid {
-        return Some(mouse_event.clone());
+        return MouseGrabResult { event: Some(mouse_event.clone()), accepted: false };
     }
 
     let grabber = mouse_input_state.top_item().unwrap();
-    let input_result = grabber.borrow().as_ref().input_event(&event, window_adapter, &grabber);
+    let input_result = grabber.borrow().as_ref().input_event(
+        &event,
+        window_adapter,
+        &grabber,
+        &mut mouse_input_state.cursor,
+    );
     match input_result {
-        InputEventResult::GrabMouse => None,
+        InputEventResult::GrabMouse => MouseGrabResult { event: None, accepted: true },
         InputEventResult::StartDrag => {
             mouse_input_state.grabbed = false;
             let drag_area_item = grabber.downcast::<crate::items::DragArea>().unwrap();
-            mouse_input_state.drag_data = Some(DropEvent {
-                mime_type: drag_area_item.as_pin_ref().mime_type(),
-                data: drag_area_item.as_pin_ref().data(),
-                position: Default::default(),
-            });
-            None
+            let drag_area = drag_area_item.as_pin_ref();
+            // Seed the drag position from the event that crossed the drag threshold so
+            // the renderer can place the drag-image overlay before the first DragMove.
+            let seed_position = mouse_event
+                .position()
+                .map(crate::lengths::logical_position_to_api)
+                .unwrap_or_default();
+            offer_native_drag(
+                window_adapter,
+                drag_area,
+                grabber.downgrade(),
+                seed_position,
+                mouse_input_state,
+            );
+            MouseGrabResult { event: None, accepted: true }
         }
-        _ => {
+        InputEventResult::EventAccepted | InputEventResult::EventIgnored => {
             mouse_input_state.grabbed = false;
             // Return a move event so that the new position can be registered properly
-            Some(
-                mouse_event
-                    .position()
-                    .map_or(MouseEvent::Exit, |position| MouseEvent::Moved { position }),
-            )
+            MouseGrabResult {
+                event: Some(mouse_event.position().map_or(MouseEvent::Exit, |position| {
+                    MouseEvent::Moved { position, touch_finger_id: mouse_event.touch_finger_id() }
+                })),
+                accepted: input_result == InputEventResult::EventAccepted,
+            }
         }
     }
 }
@@ -663,9 +1632,12 @@ pub(crate) fn send_exit_events(
     mut pos: Option<LogicalPoint>,
     window_adapter: &Rc<dyn WindowAdapter>,
 ) {
+    // Note that exit events can't actually change the cursor from default so we'll ignore the result
+    let cursor = &mut MouseCursorInner::BuiltIn(BuiltInMouseCursor::Default);
+
     for it in core::mem::take(&mut new_input_state.delayed_exit_items) {
         let Some(item) = it.upgrade() else { continue };
-        item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item);
+        item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item, cursor);
     }
 
     let mut clipped = false;
@@ -675,34 +1647,73 @@ pub(crate) fn send_exit_events(
         let contains = pos.is_some_and(|p| g.contains(p));
         if let Some(p) = pos.as_mut() {
             *p -= g.origin.to_vector();
+            if window_adapter.renderer().supports_transformations()
+                && let Some(inverse_transform) = item.inverse_children_transform()
+            {
+                *p = inverse_transform.transform_point(p.cast()).cast();
+            }
         }
         if !contains || clipped {
             if item.borrow().as_ref().clips_children() {
                 clipped = true;
             }
-            item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item);
-        } else if new_input_state.item_stack.get(idx).map_or(true, |(x, _)| *x != it.0) {
+            item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item, cursor);
+        } else if new_input_state.item_stack.get(idx).is_none_or(|(x, _)| *x != it.0) {
             // The item is still under the mouse, but no longer in the item stack. We should also sent the exit event, unless we delay it
             if new_input_state.delayed.is_some() {
                 new_input_state.delayed_exit_items.push(it.0.clone());
             } else {
-                item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item);
+                item.borrow().as_ref().input_event(
+                    &MouseEvent::Exit,
+                    window_adapter,
+                    &item,
+                    cursor,
+                );
             }
         }
     }
+
+    // Observers live outside the path-stack and are tracked by identity. Exit fires
+    // only when the item is missing from BOTH the new observer set and the new path
+    // stack: an item whose ForwardAndObserve filter never ran (because a child aborted
+    // before reaching it) is still on the path stack with another filter result, and
+    // should not receive Exit.
+    for obs in &old_input_state.observers {
+        if new_input_state.observers.iter().any(|x| x == obs)
+            || new_input_state.item_stack.iter().any(|(x, _)| x == obs)
+        {
+            continue;
+        }
+        let Some(item) = obs.upgrade() else { continue };
+        item.borrow().as_ref().input_event(&MouseEvent::Exit, window_adapter, &item, cursor);
+    }
 }
 
-/// Process the `mouse_event` on the `component`, the `mouse_grabber_stack` is the previous stack
-/// of mouse grabber.
-/// Returns a new mouse grabber stack.
+/// Outcome of [`process_mouse_input`].
+pub struct MouseInputResult {
+    /// The new dispatch state to install in place of the one passed in.
+    pub state: MouseInputState,
+    /// `true` when an item consumed the event (`EventAccepted`, `GrabMouse`,
+    /// `StartDrag`, or a `DropArea` taking a `DragMove`/`Drop`).
+    pub accepted: bool,
+}
+
+/// Process the `mouse_event` on the `component`. The `mouse_input_state` is the previous
+/// dispatch state (grab stack, cursor, in-flight drag); the returned [`MouseInputResult`]
+/// carries the state that replaces it and whether the event was consumed.
 pub fn process_mouse_input(
     root: ItemRc,
     mouse_event: &MouseEvent,
     window_adapter: &Rc<dyn WindowAdapter>,
-    mouse_input_state: MouseInputState,
-) -> MouseInputState {
-    let mut result = MouseInputState::default();
-    result.drag_data = mouse_input_state.drag_data.clone();
+    mut mouse_input_state: MouseInputState,
+) -> MouseInputResult {
+    let mut result = MouseInputState {
+        drag_data: mouse_input_state.drag_data.clone(),
+        drag_source: mouse_input_state.drag_source.clone(),
+        drop_target: mouse_input_state.drop_target.clone(),
+        cursor: mouse_input_state.cursor.clone(),
+        ..Default::default()
+    };
     let r = send_mouse_event_to_item(
         mouse_event,
         root.clone(),
@@ -711,29 +1722,40 @@ pub fn process_mouse_input(
         mouse_input_state.top_item().as_ref(),
         false,
     );
+    let accepted = r.has_aborted();
+    if matches!(mouse_event, MouseEvent::DragMove { .. }) {
+        // Remember the accepting DropArea (or forget if none did) so the subsequent
+        // Release knows whether to deliver a Drop.
+        result.drop_target =
+            accepted.then(|| result.item_stack.last().map(|(w, _)| w.clone())).flatten();
+    }
     if mouse_input_state.delayed.is_some()
-        && (!r.has_aborted()
+        && (!accepted
             || Option::zip(result.item_stack.last(), mouse_input_state.item_stack.last())
-                .map_or(true, |(a, b)| a.0 != b.0))
+                .is_none_or(|(a, b)| a.0 != b.0))
     {
-        // Keep the delayed event
-        return mouse_input_state;
+        // Keep the delayed event but transfer the just-attempted dispatch's cursor.
+        mouse_input_state.cursor = result.cursor;
+        return MouseInputResult { state: mouse_input_state, accepted };
     }
     send_exit_events(&mouse_input_state, &mut result, mouse_event.position(), window_adapter);
 
-    if let MouseEvent::Wheel { position, .. } = mouse_event {
-        if r.has_aborted() {
-            // An accepted wheel event might have moved things. Send a move event at the position to reset the has-hover
-            return process_mouse_input(
-                root,
-                &MouseEvent::Moved { position: *position },
-                window_adapter,
-                result,
-            );
-        }
+    if let MouseEvent::Wheel { position, .. } = mouse_event
+        && accepted
+    {
+        // An accepted wheel event might have moved things. Send a synthetic Moved to refresh
+        // has-hover. The original wheel's `accepted` (always `true` in this branch) is the
+        // outcome the caller sees — the synthetic Moved is an internal implementation detail.
+        let moved = process_mouse_input(
+            root,
+            &MouseEvent::Moved { position: *position, touch_finger_id: 0 },
+            window_adapter,
+            result,
+        );
+        return MouseInputResult { state: moved.state, accepted: true };
     }
 
-    result
+    MouseInputResult { state: result, accepted }
 }
 
 pub(crate) fn process_delayed_event(
@@ -751,6 +1773,10 @@ pub(crate) fn process_delayed_event(
         None => return MouseInputState::default(),
     };
 
+    // Recover the real previous click target so click_count is preserved across delayed events
+    let prev_target = mouse_input_state.delayed_exit_items.last().and_then(|x| x.upgrade());
+    let last_top_item = prev_target.as_ref().unwrap_or(&top_item);
+
     let mut actual_visitor =
         |component: &ItemTreeRc, index: u32, _: Pin<ItemRef>| -> VisitChildrenResult {
             send_mouse_event_to_item(
@@ -758,7 +1784,7 @@ pub(crate) fn process_delayed_event(
                 ItemRc::new(component.clone(), index),
                 window_adapter,
                 &mut mouse_input_state,
-                Some(&top_item),
+                Some(last_top_item),
                 true,
             )
         };
@@ -783,7 +1809,14 @@ fn send_mouse_event_to_item(
     let geom = item_rc.geometry();
     // translated in our coordinate
     let mut event_for_children = mouse_event.clone();
+    // Unapply the translation to go from 'world' space to local space
     event_for_children.translate(-geom.origin.to_vector());
+    if window_adapter.renderer().supports_transformations() {
+        // Unapply other transforms.
+        if let Some(inverse_transform) = item_rc.inverse_children_transform() {
+            event_for_children.transform(inverse_transform);
+        }
+    }
 
     let filter_result = if mouse_event.position().is_some_and(|p| geom.contains(p))
         || item.as_ref().clips_children()
@@ -792,6 +1825,7 @@ fn send_mouse_event_to_item(
             &event_for_children,
             window_adapter,
             &item_rc,
+            &mut result.cursor,
         )
     } else {
         InputEventFilterResult::ForwardAndIgnore
@@ -804,7 +1838,7 @@ fn send_mouse_event_to_item(
         InputEventFilterResult::Intercept => (false, false),
         InputEventFilterResult::DelayForwarding(_) if ignore_delays => (true, false),
         InputEventFilterResult::DelayForwarding(duration) => {
-            let timer = Timer::default();
+            let timer = WindowInner::from_pub(window_adapter.window()).context().new_timer();
             let w = Rc::downgrade(window_adapter);
             timer.start(
                 crate::timers::TimerMode::SingleShot,
@@ -821,6 +1855,10 @@ fn send_mouse_event_to_item(
                 .push((item_rc.downgrade(), InputEventFilterResult::DelayForwarding(duration)));
             return VisitChildrenResult::abort(item_rc.index(), 0);
         }
+        // Like ForwardAndIgnore: forward to children, skip input_event. The
+        // EventIgnored arm below moves our entry from the path stack to the observers
+        // side list instead of dropping it.
+        InputEventFilterResult::ForwardAndObserve => (true, true),
     };
 
     result.item_stack.push((item_rc.downgrade(), filter_result));
@@ -852,19 +1890,27 @@ fn send_mouse_event_to_item(
     } else {
         let mut event = mouse_event.clone();
         event.translate(-geom.origin.to_vector());
-        if last_top_item.map_or(true, |x| *x != item_rc) {
+        if last_top_item.is_none_or(|x| *x != item_rc) {
             event.set_click_count(0);
         }
-        item.as_ref().input_event(&event, window_adapter, &item_rc)
+        item.as_ref().input_event(&event, window_adapter, &item_rc, &mut result.cursor)
     };
     match r {
         InputEventResult::EventAccepted => VisitChildrenResult::abort(item_rc.index(), 0),
         InputEventResult::EventIgnored => {
-            let _pop = result.item_stack.pop();
+            let popped = result.item_stack.pop();
             debug_assert_eq!(
-                _pop.map(|x| (x.0.upgrade().unwrap().index(), x.1)).unwrap(),
+                popped.as_ref().map(|x| (x.0.upgrade().unwrap().index(), x.1)).unwrap(),
                 (item_rc.index(), filter_result)
             );
+            // For ForwardAndObserve, migrate the entry to the observers side list (dedup)
+            // so a later Exit can still reach it.
+            if filter_result == InputEventFilterResult::ForwardAndObserve
+                && let Some((weak, _)) = popped
+                && !result.observers.contains(&weak)
+            {
+                result.observers.push(weak);
+            }
             VisitChildrenResult::CONTINUE
         }
         InputEventResult::GrabMouse => {
@@ -878,11 +1924,23 @@ fn send_mouse_event_to_item(
                 InputEventFilterResult::ForwardAndInterceptGrab;
             result.grabbed = false;
             let drag_area_item = item_rc.downcast::<crate::items::DragArea>().unwrap();
-            result.drag_data = Some(DropEvent {
-                mime_type: drag_area_item.as_pin_ref().mime_type(),
-                data: drag_area_item.as_pin_ref().data(),
-                position: Default::default(),
-            });
+            let drag_area = drag_area_item.as_pin_ref();
+            // `mouse_event` here is in the parent item's coords (this function is called
+            // recursively); translate into the DragArea's local coords, then map back to
+            // window coords so the drag-image overlay places at the right spot from the start.
+            let seed_position = mouse_event
+                .position()
+                .map(|p| p - geom.origin.to_vector())
+                .map(|p| item_rc.map_to_window(p))
+                .map(crate::lengths::logical_position_to_api)
+                .unwrap_or_default();
+            offer_native_drag(
+                window_adapter,
+                drag_area,
+                item_rc.downgrade(),
+                seed_position,
+                result,
+            );
             VisitChildrenResult::abort(item_rc.index(), 0)
         }
     }
@@ -914,18 +1972,23 @@ impl TextCursorBlinker {
 
     /// Sets a binding on the provided property that will ensure that the property value
     /// is true when the cursor should be shown and false if not.
-    pub fn set_binding(instance: Pin<Rc<TextCursorBlinker>>, prop: &Property<bool>) {
+    pub fn set_binding(
+        instance: Pin<Rc<TextCursorBlinker>>,
+        prop: &Property<bool>,
+        ctx: &crate::SlintContext,
+        cycle_duration: Duration,
+    ) {
         instance.as_ref().cursor_visible.set(true);
         // Re-start timer, in case.
-        Self::start(&instance);
+        Self::start(&instance, ctx, cycle_duration);
         prop.set_binding(move || {
-            TextCursorBlinker::FIELD_OFFSETS.cursor_visible.apply_pin(instance.as_ref()).get()
+            TextCursorBlinker::FIELD_OFFSETS.cursor_visible().apply_pin(instance.as_ref()).get()
         });
     }
 
     /// Starts the blinking cursor timer that will toggle the cursor and update all bindings that
     /// were installed on properties with set_binding call.
-    pub fn start(self: &Pin<Rc<Self>>) {
+    pub fn start(self: &Pin<Rc<Self>>, ctx: &crate::SlintContext, cycle_duration: Duration) {
         if self.cursor_blink_timer.running() {
             self.cursor_blink_timer.restart();
         } else {
@@ -934,18 +1997,21 @@ impl TextCursorBlinker {
                 move || {
                     if let Some(blinker) = weak_blinker.upgrade() {
                         let visible = TextCursorBlinker::FIELD_OFFSETS
-                            .cursor_visible
+                            .cursor_visible()
                             .apply_pin(blinker.as_ref())
                             .get();
                         blinker.cursor_visible.set(!visible);
                     }
                 }
             };
-            self.cursor_blink_timer.start(
-                crate::timers::TimerMode::Repeated,
-                Duration::from_millis(500),
-                toggle_cursor,
-            );
+            if !cycle_duration.is_zero() {
+                self.cursor_blink_timer.start_on(
+                    ctx,
+                    crate::timers::TimerMode::Repeated,
+                    cycle_duration / 2,
+                    toggle_cursor,
+                );
+            }
         }
     }
 
@@ -953,5 +2019,1383 @@ impl TextCursorBlinker {
     /// text editable elements looses the focus or is hidden.
     pub fn stop(&self) {
         self.cursor_blink_timer.stop()
+    }
+}
+
+/// A single active touch point.
+#[derive(Clone, Copy, Default)]
+struct TouchPoint {
+    id: i32,
+    position: LogicalPoint,
+}
+
+/// Fixed-capacity map of touch IDs to touch points.
+///
+/// Touchscreens rarely report more than 5 simultaneous contacts, and gesture
+/// recognition only uses the first two. A linear-scan array avoids the heap
+/// allocation and pointer-chasing overhead of `BTreeMap` for this tiny collection.
+const MAX_TRACKED_TOUCHES: usize = 5;
+
+#[derive(Clone)]
+struct TouchMap {
+    entries: [TouchPoint; MAX_TRACKED_TOUCHES],
+    len: usize,
+}
+
+impl Default for TouchMap {
+    fn default() -> Self {
+        Self { entries: [TouchPoint::default(); MAX_TRACKED_TOUCHES], len: 0 }
+    }
+}
+
+impl TouchMap {
+    fn get(&self, id: i32) -> Option<&TouchPoint> {
+        self.entries[..self.len].iter().find(|tp| tp.id == id)
+    }
+
+    fn get_mut(&mut self, id: i32) -> Option<&mut TouchPoint> {
+        self.entries[..self.len].iter_mut().find(|tp| tp.id == id)
+    }
+
+    fn insert(&mut self, point: TouchPoint) {
+        if let Some(existing) = self.entries[..self.len].iter_mut().find(|tp| tp.id == point.id) {
+            *existing = point;
+        } else if self.len < MAX_TRACKED_TOUCHES {
+            self.entries[self.len] = point;
+            self.len += 1;
+        }
+    }
+
+    fn remove(&mut self, id: i32) {
+        if let Some(idx) = self.entries[..self.len].iter().position(|tp| tp.id == id) {
+            self.len -= 1;
+            self.entries[idx] = self.entries[self.len];
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns the first two distinct IDs, or `None` if fewer than 2 entries.
+    fn first_two_ids(&self) -> Option<(i32, i32)> {
+        if self.len >= 2 { Some((self.entries[0].id, self.entries[1].id)) } else { None }
+    }
+
+    /// Returns the first entry, if any.
+    fn first(&self) -> Option<&TouchPoint> {
+        if self.len > 0 { Some(&self.entries[0]) } else { None }
+    }
+}
+
+/// Fixed-capacity buffer for [`MouseEvent`]s produced by the touch state machine.
+///
+/// No branch in [`TouchState::process`] emits more than 3 events (gesture end
+/// produces PinchEnded + RotationEnded + Pressed/Exit). Capacity 4 provides a
+/// margin without heap allocation.
+const MAX_TOUCH_EVENTS: usize = 4;
+
+#[derive(Clone)]
+pub(crate) struct TouchEventBuffer {
+    events: [Option<MouseEvent>; MAX_TOUCH_EVENTS],
+    len: usize,
+}
+
+impl TouchEventBuffer {
+    fn new() -> Self {
+        Self { events: [None, None, None, None], len: 0 }
+    }
+
+    fn push(&mut self, event: MouseEvent) {
+        debug_assert!(self.len < MAX_TOUCH_EVENTS, "TouchEventBuffer overflow");
+        if self.len < MAX_TOUCH_EVENTS {
+            self.events[self.len] = Some(event);
+            self.len += 1;
+        }
+    }
+
+    /// Returns an iterator over the buffered events.
+    pub(crate) fn into_iter(self) -> impl Iterator<Item = MouseEvent> {
+        let len = self.len;
+        self.events.into_iter().take(len).flatten()
+    }
+}
+
+/// State of the multi-touch gesture recognizer.
+#[derive(Default, Debug, Clone, Copy)]
+enum GestureRecognitionState {
+    /// 0-1 fingers; forwarding as mouse events.
+    #[default]
+    Idle,
+    /// 2 fingers down, waiting for movement to exceed threshold.
+    TwoFingersDown { finger_ids: (i32, i32), initial_distance: f32, last_angle: euclid::Angle<f32> },
+    /// Actively synthesizing PinchGesture/RotationGesture events.
+    Pinching {
+        finger_ids: (i32, i32),
+        initial_distance: f32,
+        last_scale: f32,
+        last_angle: euclid::Angle<f32>,
+    },
+}
+
+/// Tracks all active touch points and recognizes pinch/rotation gestures.
+///
+/// When only one finger is down, touch events are forwarded as mouse events.
+/// When two fingers are down and move beyond a threshold, synthesized
+/// `PinchGesture` and `RotationGesture` events are emitted — the same events
+/// that platform gesture recognition (e.g. macOS trackpad) produces.
+pub(crate) struct TouchState {
+    active_touches: TouchMap,
+    /// The finger forwarded as mouse events during single-touch.
+    primary_touch_id: Option<i32>,
+    gesture_state: GestureRecognitionState,
+}
+
+impl Default for TouchState {
+    fn default() -> Self {
+        Self {
+            active_touches: TouchMap::default(),
+            primary_touch_id: None,
+            gesture_state: GestureRecognitionState::Idle,
+        }
+    }
+}
+
+impl TouchState {
+    /// Minimum movement (in logical pixels) before two fingers are recognized as a pinch.
+    const PINCH_THRESHOLD: f32 = 8.0;
+
+    /// Minimum angular change (in degrees) before two fingers are recognized as a rotation.
+    const ROTATION_THRESHOLD: f32 = 5.0;
+
+    /// Returns the finger IDs from the current gesture state, if any.
+    fn gesture_finger_ids(&self) -> Option<(i32, i32)> {
+        match self.gesture_state {
+            GestureRecognitionState::TwoFingersDown { finger_ids, .. }
+            | GestureRecognitionState::Pinching { finger_ids, .. } => Some(finger_ids),
+            GestureRecognitionState::Idle => None,
+        }
+    }
+
+    /// Returns (distance, angle) between two specific touch points.
+    fn geometry_for(&self, (id_a, id_b): (i32, i32)) -> Option<(f32, euclid::Angle<f32>)> {
+        let a = self.active_touches.get(id_a)?;
+        let b = self.active_touches.get(id_b)?;
+        let delta = (b.position - a.position).cast::<f32>();
+        Some((delta.length(), delta.angle_from_x_axis()))
+    }
+
+    /// Returns the positions of the two gesture fingers, or `None` if not available.
+    fn gesture_finger_positions(&self) -> Option<(&TouchPoint, &TouchPoint)> {
+        let (id_a, id_b) = self.gesture_finger_ids()?;
+        let a = self.active_touches.get(id_a)?;
+        let b = self.active_touches.get(id_b)?;
+        Some((a, b))
+    }
+
+    /// Returns the midpoint between the two gesture fingers, or `None`.
+    fn gesture_midpoint(&self) -> Option<LogicalPoint> {
+        let (a, b) = self.gesture_finger_positions()?;
+        let mid = a.position.cast::<f32>().lerp(b.position.cast::<f32>(), 0.5);
+        Some(mid.cast())
+    }
+
+    /// Returns (distance, angle) between the two gesture fingers.
+    fn gesture_geometry(&self) -> Option<(f32, euclid::Angle<f32>)> {
+        let (a, b) = self.gesture_finger_positions()?;
+        let delta = (b.position - a.position).cast::<f32>();
+        Some((delta.length(), delta.angle_from_x_axis()))
+    }
+
+    /// Returns true if the given touch ID is one of the two gesture fingers.
+    fn is_gesture_finger(&self, id: i32) -> bool {
+        self.gesture_finger_ids().is_some_and(|(a, b)| id == a || id == b)
+    }
+
+    /// Run the touch state machine for a single event and return the
+    /// [`MouseEvent`]s to dispatch.
+    ///
+    /// This is intentionally separated from [`crate::window::WindowInner::process_touch_input`]
+    /// so that the `RefCell` borrow can be dropped *once* before dispatching,
+    /// rather than requiring a manual `drop` at every branch.
+    pub(crate) fn process(
+        &mut self,
+        id: i32,
+        position: LogicalPoint,
+        phase: TouchPhase,
+    ) -> TouchEventBuffer {
+        let mut events = TouchEventBuffer::new();
+        match phase {
+            TouchPhase::Started => self.process_started(id, position, &mut events),
+            TouchPhase::Moved => self.process_moved(id, position, &mut events),
+            TouchPhase::Ended => self.process_ended(id, position, false, &mut events),
+            TouchPhase::Cancelled => self.process_ended(id, position, true, &mut events),
+        }
+        events
+    }
+
+    fn process_started(&mut self, id: i32, position: LogicalPoint, events: &mut TouchEventBuffer) {
+        self.active_touches.insert(TouchPoint { id, position });
+
+        let total = self.active_touches.len();
+        if total == 1 {
+            // First finger: become primary, forward as mouse press.
+            self.primary_touch_id = Some(id);
+            self.gesture_state = GestureRecognitionState::Idle;
+            events.push(MouseEvent::Pressed {
+                position,
+                button: PointerEventButton::Left,
+                click_count: 0,
+                touch_finger_id: id + 1,
+            });
+        } else if total == 2 {
+            // Second finger: transition Idle → TwoFingersDown.
+            let finger_ids = self.active_touches.first_two_ids().unwrap_or((0, 0));
+
+            // Synthesize a Release for the primary finger to clear any
+            // Flickable grab / delay state.
+            let primary_pos = self
+                .primary_touch_id
+                .and_then(|pid| self.active_touches.get(pid))
+                .map(|tp| tp.position)
+                .unwrap_or(position);
+
+            // Compute initial geometry for threshold detection.
+            let (initial_distance, last_angle) =
+                self.geometry_for(finger_ids).unwrap_or((0.0, euclid::Angle::zero()));
+            self.gesture_state = GestureRecognitionState::TwoFingersDown {
+                finger_ids,
+                initial_distance,
+                last_angle,
+            };
+
+            events.push(MouseEvent::Released {
+                position: primary_pos,
+                button: PointerEventButton::Left,
+                click_count: 0,
+                touch_finger_id: id + 1,
+            });
+        }
+        // 3+ fingers: tracked in active_touches but ignored for gesture.
+    }
+
+    #[allow(clippy::collapsible_match)]
+    fn process_moved(&mut self, id: i32, position: LogicalPoint, events: &mut TouchEventBuffer) {
+        if let Some(tp) = self.active_touches.get_mut(id) {
+            tp.position = position;
+        }
+
+        let is_gesture_finger = self.is_gesture_finger(id);
+
+        match self.gesture_state {
+            GestureRecognitionState::Idle => {
+                if self.primary_touch_id == Some(id) {
+                    events.push(MouseEvent::Moved { position, touch_finger_id: id + 1 });
+                }
+            }
+            GestureRecognitionState::TwoFingersDown {
+                finger_ids,
+                initial_distance,
+                last_angle,
+            } if is_gesture_finger => {
+                if let Some((dist, angle)) = self.gesture_geometry() {
+                    let delta_dist = (dist - initial_distance).abs();
+                    let delta_angle = (angle - last_angle).signed().to_degrees().abs();
+                    if delta_dist > Self::PINCH_THRESHOLD || delta_angle > Self::ROTATION_THRESHOLD
+                    {
+                        // Re-snapshot so the first gesture event starts from
+                        // the current geometry rather than accumulating the
+                        // threshold movement.
+                        self.gesture_state = GestureRecognitionState::Pinching {
+                            finger_ids,
+                            initial_distance: dist,
+                            last_scale: 1.0,
+                            last_angle: angle,
+                        };
+
+                        let midpoint = self.gesture_midpoint().unwrap_or(position);
+
+                        events.push(MouseEvent::PinchGesture {
+                            position: midpoint,
+                            delta: 0.0,
+                            phase: TouchPhase::Started,
+                        });
+                        events.push(MouseEvent::RotationGesture {
+                            position: midpoint,
+                            delta: 0.0,
+                            phase: TouchPhase::Started,
+                        });
+                    }
+                }
+            }
+            GestureRecognitionState::Pinching {
+                initial_distance, last_scale, last_angle, ..
+            } if is_gesture_finger => {
+                if let Some((dist, angle)) = self.gesture_geometry() {
+                    let midpoint = self.gesture_midpoint().unwrap_or(position);
+
+                    let current_scale =
+                        if initial_distance > 0.0 { dist / initial_distance } else { 1.0 };
+                    let scale_delta = current_scale - last_scale;
+
+                    // `.signed()` wraps to [-pi, pi] so crossing the ±180°
+                    // atan2 boundary doesn't produce a full-revolution jump.
+                    let rotation_delta = (angle - last_angle).signed().to_degrees();
+
+                    // Update the mutable state for next frame.
+                    if let GestureRecognitionState::Pinching {
+                        last_scale: ref mut ls,
+                        last_angle: ref mut la,
+                        ..
+                    } = self.gesture_state
+                    {
+                        *ls = current_scale;
+                        *la = angle;
+                    }
+
+                    events.push(MouseEvent::PinchGesture {
+                        position: midpoint,
+                        delta: scale_delta,
+                        phase: TouchPhase::Moved,
+                    });
+                    events.push(MouseEvent::RotationGesture {
+                        position: midpoint,
+                        delta: rotation_delta,
+                        phase: TouchPhase::Moved,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::collapsible_match)]
+    fn process_ended(
+        &mut self,
+        id: i32,
+        position: LogicalPoint,
+        is_cancelled: bool,
+        events: &mut TouchEventBuffer,
+    ) {
+        // Check gesture membership *before* removing from the map.
+        let is_gesture_finger = self.is_gesture_finger(id);
+        let midpoint = self.gesture_midpoint().unwrap_or(position);
+        self.active_touches.remove(id);
+
+        match self.gesture_state {
+            GestureRecognitionState::Idle => {
+                if self.primary_touch_id == Some(id) {
+                    self.primary_touch_id = None;
+                    events.push(MouseEvent::Released {
+                        position,
+                        button: PointerEventButton::Left,
+                        click_count: 0,
+                        touch_finger_id: id + 1,
+                    });
+                    events.push(MouseEvent::Exit);
+                }
+            }
+            GestureRecognitionState::TwoFingersDown { .. } if is_gesture_finger => {
+                self.gesture_state = GestureRecognitionState::Idle;
+                if !is_cancelled {
+                    if let Some(remaining) = self.active_touches.first() {
+                        let remaining_pos = remaining.position;
+                        self.primary_touch_id = Some(remaining.id);
+                        events.push(MouseEvent::Pressed {
+                            position: remaining_pos,
+                            button: PointerEventButton::Left,
+                            click_count: 0,
+                            touch_finger_id: remaining.id + 1,
+                        });
+                    } else {
+                        self.primary_touch_id = None;
+                        events.push(MouseEvent::Exit);
+                    }
+                } else {
+                    self.primary_touch_id = None;
+                    events.push(MouseEvent::Exit);
+                }
+            }
+            GestureRecognitionState::Pinching { .. } if is_gesture_finger => {
+                self.gesture_state = GestureRecognitionState::Idle;
+
+                let gesture_phase =
+                    if is_cancelled { TouchPhase::Cancelled } else { TouchPhase::Ended };
+
+                let remaining = if !is_cancelled {
+                    self.active_touches.first().map(|tp| (tp.id, tp.position))
+                } else {
+                    None
+                };
+                if let Some((rid, _)) = remaining {
+                    self.primary_touch_id = Some(rid);
+                } else {
+                    self.primary_touch_id = None;
+                }
+
+                events.push(MouseEvent::PinchGesture {
+                    position: midpoint,
+                    delta: 0.0,
+                    phase: gesture_phase,
+                });
+                events.push(MouseEvent::RotationGesture {
+                    position: midpoint,
+                    delta: 0.0,
+                    phase: gesture_phase,
+                });
+
+                if let Some((rid, rpos)) = remaining {
+                    events.push(MouseEvent::Pressed {
+                        position: rpos,
+                        button: PointerEventButton::Left,
+                        click_count: 0,
+                        touch_finger_id: rid + 1,
+                    });
+                } else {
+                    events.push(MouseEvent::Exit);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod touch_tests {
+    extern crate alloc;
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::*;
+    use crate::lengths::LogicalPoint;
+
+    fn pt(x: f32, y: f32) -> LogicalPoint {
+        euclid::point2(x, y)
+    }
+
+    // -----------------------------------------------------------------------
+    // TouchMap tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn touch_map_insert_and_get() {
+        let mut map = TouchMap::default();
+        assert_eq!(map.len(), 0);
+        map.insert(TouchPoint { id: 1, position: pt(10.0, 20.0) });
+        assert_eq!(map.len(), 1);
+        assert!(map.get(1).is_some());
+        assert!((map.get(1).unwrap().position.x - 10.0).abs() < f32::EPSILON);
+        assert!(map.get(2).is_none());
+    }
+
+    #[test]
+    fn touch_map_update_existing() {
+        let mut map = TouchMap::default();
+        map.insert(TouchPoint { id: 1, position: pt(10.0, 20.0) });
+        map.insert(TouchPoint { id: 1, position: pt(30.0, 40.0) });
+        assert_eq!(map.len(), 1);
+        assert!((map.get(1).unwrap().position.x - 30.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn touch_map_remove() {
+        let mut map = TouchMap::default();
+        map.insert(TouchPoint { id: 1, position: pt(10.0, 20.0) });
+        map.insert(TouchPoint { id: 2, position: pt(30.0, 40.0) });
+        assert_eq!(map.len(), 2);
+        map.remove(1);
+        assert_eq!(map.len(), 1);
+        assert!(map.get(1).is_none());
+        assert!(map.get(2).is_some());
+    }
+
+    #[test]
+    fn touch_map_remove_nonexistent() {
+        let mut map = TouchMap::default();
+        map.insert(TouchPoint { id: 1, position: pt(10.0, 20.0) });
+        map.remove(99);
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn touch_map_capacity() {
+        let mut map = TouchMap::default();
+        for i in 0..MAX_TRACKED_TOUCHES {
+            map.insert(TouchPoint { id: i as i32, position: pt(i as f32, 0.0) });
+        }
+        assert_eq!(map.len(), MAX_TRACKED_TOUCHES);
+        // Inserting beyond capacity is silently ignored.
+        map.insert(TouchPoint { id: 99, position: pt(99.0, 0.0) });
+        assert_eq!(map.len(), MAX_TRACKED_TOUCHES);
+        assert!(map.get(99).is_none());
+    }
+
+    #[test]
+    fn touch_map_first_two_ids() {
+        let mut map = TouchMap::default();
+        assert!(map.first_two_ids().is_none());
+        map.insert(TouchPoint { id: 5, position: pt(0.0, 0.0) });
+        assert!(map.first_two_ids().is_none());
+        map.insert(TouchPoint { id: 10, position: pt(0.0, 0.0) });
+        assert_eq!(map.first_two_ids(), Some((5, 10)));
+    }
+
+    #[test]
+    fn touch_map_first() {
+        let mut map = TouchMap::default();
+        assert!(map.first().is_none());
+        map.insert(TouchPoint { id: 7, position: pt(1.0, 2.0) });
+        let tp = map.first().unwrap();
+        assert_eq!(tp.id, 7);
+        assert!((tp.position.x - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn touch_map_get_mut() {
+        let mut map = TouchMap::default();
+        map.insert(TouchPoint { id: 1, position: pt(0.0, 0.0) });
+        map.get_mut(1).unwrap().position = pt(5.0, 6.0);
+        assert!((map.get(1).unwrap().position.x - 5.0).abs() < f32::EPSILON);
+    }
+
+    // -----------------------------------------------------------------------
+    // Helper: extract event types for readable assertions
+    // -----------------------------------------------------------------------
+
+    #[derive(Debug, PartialEq)]
+    enum Ev {
+        Pressed(f32, f32),
+        Released(f32, f32),
+        Moved(f32, f32),
+        Exit,
+        PinchStarted,
+        PinchMoved(f32),
+        PinchEnded,
+        PinchCancelled,
+        RotationStarted,
+        RotationMoved(f32),
+        RotationEnded,
+        RotationCancelled,
+    }
+
+    fn classify(events: &TouchEventBuffer) -> Vec<Ev> {
+        events
+            .clone()
+            .into_iter()
+            .map(|e| match e {
+                MouseEvent::Pressed { position, .. } => Ev::Pressed(position.x, position.y),
+                MouseEvent::Released { position, .. } => Ev::Released(position.x, position.y),
+                MouseEvent::Moved { position, .. } => Ev::Moved(position.x, position.y),
+                MouseEvent::Exit => Ev::Exit,
+                MouseEvent::PinchGesture { delta, phase, .. } => match phase {
+                    TouchPhase::Started => Ev::PinchStarted,
+                    TouchPhase::Moved => Ev::PinchMoved(delta),
+                    TouchPhase::Ended => Ev::PinchEnded,
+                    TouchPhase::Cancelled => Ev::PinchCancelled,
+                },
+                MouseEvent::RotationGesture { delta, phase, .. } => match phase {
+                    TouchPhase::Started => Ev::RotationStarted,
+                    TouchPhase::Moved => Ev::RotationMoved(delta),
+                    TouchPhase::Ended => Ev::RotationEnded,
+                    TouchPhase::Cancelled => Ev::RotationCancelled,
+                },
+                _ => panic!("unexpected event: {:?}", e),
+            })
+            .collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // TouchState: single-finger forwarding
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn single_finger_press_move_release() {
+        let mut state = TouchState::default();
+
+        let evs = state.process(1, pt(100.0, 200.0), TouchPhase::Started);
+        assert_eq!(classify(&evs), vec![Ev::Pressed(100.0, 200.0)]);
+
+        let evs = state.process(1, pt(110.0, 200.0), TouchPhase::Moved);
+        assert_eq!(classify(&evs), vec![Ev::Moved(110.0, 200.0)]);
+
+        let evs = state.process(1, pt(110.0, 200.0), TouchPhase::Ended);
+        assert_eq!(classify(&evs), vec![Ev::Released(110.0, 200.0), Ev::Exit]);
+    }
+
+    #[test]
+    fn single_finger_cancel() {
+        let mut state = TouchState::default();
+
+        state.process(1, pt(100.0, 200.0), TouchPhase::Started);
+
+        let evs = state.process(1, pt(100.0, 200.0), TouchPhase::Cancelled);
+        assert_eq!(classify(&evs), vec![Ev::Released(100.0, 200.0), Ev::Exit]);
+    }
+
+    #[test]
+    fn non_primary_move_ignored() {
+        let mut state = TouchState::default();
+        // Touch 1 is primary.
+        state.process(1, pt(100.0, 200.0), TouchPhase::Started);
+
+        // Move for a different ID that was never started (edge case).
+        let evs = state.process(99, pt(50.0, 50.0), TouchPhase::Moved);
+        assert!(classify(&evs).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TouchState: two-finger → gesture transition
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn two_fingers_synthesize_release_then_gesture() {
+        let mut state = TouchState::default();
+
+        // Finger 1 down.
+        let evs = state.process(1, pt(100.0, 200.0), TouchPhase::Started);
+        assert_eq!(classify(&evs), vec![Ev::Pressed(100.0, 200.0)]);
+
+        // Finger 2 down → synthesized release for finger 1.
+        let evs = state.process(2, pt(200.0, 200.0), TouchPhase::Started);
+        assert_eq!(classify(&evs), vec![Ev::Released(100.0, 200.0)]);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::TwoFingersDown { .. }));
+
+        // Move finger 2 far enough to trigger pinch (> 8px threshold).
+        let evs = state.process(2, pt(220.0, 200.0), TouchPhase::Moved);
+        assert_eq!(classify(&evs), vec![Ev::PinchStarted, Ev::RotationStarted]);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::Pinching { .. }));
+    }
+
+    #[test]
+    fn two_fingers_below_threshold_no_gesture() {
+        let mut state = TouchState::default();
+
+        state.process(1, pt(100.0, 200.0), TouchPhase::Started);
+        state.process(2, pt(200.0, 200.0), TouchPhase::Started);
+
+        // Small movement within threshold.
+        let evs = state.process(2, pt(202.0, 200.0), TouchPhase::Moved);
+        assert!(classify(&evs).is_empty());
+        assert!(matches!(state.gesture_state, GestureRecognitionState::TwoFingersDown { .. }));
+    }
+
+    #[test]
+    fn pinch_produces_scale_deltas() {
+        let mut state = TouchState::default();
+
+        // Set up: finger 1 at (0, 0), finger 2 at (100, 0) → distance = 100.
+        state.process(1, pt(0.0, 0.0), TouchPhase::Started);
+        state.process(2, pt(100.0, 0.0), TouchPhase::Started);
+
+        // Move finger 2 to (120, 0) to exceed threshold and start pinching.
+        state.process(2, pt(120.0, 0.0), TouchPhase::Moved);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::Pinching { .. }));
+
+        // Now move finger 2 further to (180, 0).
+        // New distance = 180, initial distance (re-snapshotted) = 120.
+        // Scale = 180/120 = 1.5, delta = 1.5 - 1.0 = 0.5.
+        let evs = state.process(2, pt(180.0, 0.0), TouchPhase::Moved);
+        let classified = classify(&evs);
+        assert_eq!(classified.len(), 2);
+        if let Ev::PinchMoved(delta) = classified[0] {
+            assert!((delta - 0.5).abs() < 0.01, "expected ~0.5, got {}", delta);
+        } else {
+            panic!("expected PinchMoved, got {:?}", classified[0]);
+        }
+    }
+
+    #[test]
+    fn rotation_produces_correct_deltas() {
+        let mut state = TouchState::default();
+
+        // Finger 1 at origin, finger 2 on the X axis at (100, 0).
+        // Initial angle = atan2(0, 100) = 0°.
+        state.process(1, pt(0.0, 0.0), TouchPhase::Started);
+        state.process(2, pt(100.0, 0.0), TouchPhase::Started);
+
+        // Move finger 2 far enough to trigger gesture.
+        state.process(2, pt(120.0, 0.0), TouchPhase::Moved);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::Pinching { .. }));
+
+        // Rotate ~45° clockwise: move finger 2 from (120, 0) to roughly
+        // (70.7, 70.7) which is at 45° from origin.
+        // atan2(70.7, 70.7) ≈ 45°. Delta from re-snapshotted 0° = +45°.
+        // Slint convention: positive = clockwise → delta ≈ +45°.
+        let evs = state.process(2, pt(70.7, 70.7), TouchPhase::Moved);
+        let classified = classify(&evs);
+        assert_eq!(classified.len(), 2);
+        if let Ev::RotationMoved(delta) = classified[1] {
+            assert!((delta - 45.0).abs() < 1.0, "expected ~45.0 (clockwise), got {}", delta);
+        } else {
+            panic!("expected RotationMoved, got {:?}", classified[1]);
+        }
+    }
+
+    #[test]
+    fn rotation_across_180_degree_boundary() {
+        let mut state = TouchState::default();
+
+        // Finger 1 at origin, finger 2 at (-100, -10).
+        // angle = atan2(-10, -100) ≈ -174.3°.
+        state.process(1, pt(0.0, 0.0), TouchPhase::Started);
+        state.process(2, pt(-100.0, -10.0), TouchPhase::Started);
+
+        // Trigger gesture by moving far enough.
+        state.process(2, pt(-120.0, -10.0), TouchPhase::Moved);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::Pinching { .. }));
+
+        // Rotate across the ±180° boundary: move finger 2 to (-100, 10).
+        // New angle = atan2(10, -100) ≈ 174.3°.
+        // Raw angular change crosses ±180°, but per-frame delta should be
+        // small (~11.4° which is 2 * 5.7°), NOT a ~349° jump.
+        let evs = state.process(2, pt(-100.0, 10.0), TouchPhase::Moved);
+        let classified = classify(&evs);
+        if let Ev::RotationMoved(delta) = classified[1] {
+            assert!(
+                delta.abs() < 20.0,
+                "rotation should be a small delta (~11°), got {} (discontinuity!)",
+                delta
+            );
+        } else {
+            panic!("expected RotationMoved, got {:?}", classified[1]);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TouchState: gesture end transitions
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pinch_end_with_remaining_finger() {
+        let mut state = TouchState::default();
+
+        state.process(1, pt(0.0, 0.0), TouchPhase::Started);
+        state.process(2, pt(100.0, 0.0), TouchPhase::Started);
+        // Trigger pinch.
+        state.process(2, pt(120.0, 0.0), TouchPhase::Moved);
+
+        // Lift finger 2 → gesture ends, finger 1 gets re-pressed.
+        let evs = state.process(2, pt(120.0, 0.0), TouchPhase::Ended);
+        let classified = classify(&evs);
+        assert_eq!(classified, vec![Ev::PinchEnded, Ev::RotationEnded, Ev::Pressed(0.0, 0.0)]);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::Idle));
+        assert_eq!(state.primary_touch_id, Some(1));
+    }
+
+    #[test]
+    fn pinch_cancel_emits_cancelled_and_exit() {
+        let mut state = TouchState::default();
+
+        state.process(1, pt(0.0, 0.0), TouchPhase::Started);
+        state.process(2, pt(100.0, 0.0), TouchPhase::Started);
+        state.process(2, pt(120.0, 0.0), TouchPhase::Moved);
+
+        // Cancel finger 2.
+        let evs = state.process(2, pt(120.0, 0.0), TouchPhase::Cancelled);
+        let classified = classify(&evs);
+        assert_eq!(classified, vec![Ev::PinchCancelled, Ev::RotationCancelled, Ev::Exit]);
+        assert!(state.primary_touch_id.is_none());
+    }
+
+    #[test]
+    fn two_fingers_down_lift_before_threshold_returns_to_idle() {
+        let mut state = TouchState::default();
+
+        state.process(1, pt(100.0, 200.0), TouchPhase::Started);
+        state.process(2, pt(200.0, 200.0), TouchPhase::Started);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::TwoFingersDown { .. }));
+
+        // Lift finger 2 without exceeding movement threshold.
+        let evs = state.process(2, pt(200.0, 200.0), TouchPhase::Ended);
+        let classified = classify(&evs);
+        // Remaining finger 1 gets re-pressed.
+        assert_eq!(classified, vec![Ev::Pressed(100.0, 200.0)]);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::Idle));
+        assert_eq!(state.primary_touch_id, Some(1));
+    }
+
+    #[test]
+    fn two_fingers_down_cancel_both_emits_exit() {
+        let mut state = TouchState::default();
+
+        state.process(1, pt(100.0, 200.0), TouchPhase::Started);
+        state.process(2, pt(200.0, 200.0), TouchPhase::Started);
+
+        // Cancel finger 2 (gesture finger, no remaining → Exit).
+        let evs = state.process(2, pt(200.0, 200.0), TouchPhase::Cancelled);
+        assert_eq!(classify(&evs), vec![Ev::Exit]);
+
+        // Cancel finger 1 (now in Idle, but not primary since cancel cleared it).
+        let evs = state.process(1, pt(100.0, 200.0), TouchPhase::Cancelled);
+        assert!(classify(&evs).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // TouchState: 3+ fingers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn third_finger_ignored_for_gesture() {
+        let mut state = TouchState::default();
+
+        state.process(1, pt(0.0, 0.0), TouchPhase::Started);
+        state.process(2, pt(100.0, 0.0), TouchPhase::Started);
+
+        // Third finger: no additional events.
+        let evs = state.process(3, pt(50.0, 50.0), TouchPhase::Started);
+        assert!(classify(&evs).is_empty());
+        assert_eq!(state.active_touches.len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Angle wrapping via Euclid
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn euclid_angle_signed_wrapping() {
+        use euclid::Angle;
+        let wrap = |deg: f32| Angle::degrees(deg).signed().to_degrees();
+        assert!(wrap(0.0).abs() < f32::EPSILON);
+        assert!((wrap(180.0) - 180.0).abs() < 0.01);
+        assert!((wrap(181.0) - (-179.0)).abs() < 0.01);
+        assert!((wrap(-181.0) - 179.0).abs() < 0.01);
+        assert!(wrap(360.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn zero_distance_fingers_no_division_by_zero() {
+        let mut state = TouchState::default();
+
+        // Two fingers at the exact same position → distance = 0.
+        state.process(1, pt(100.0, 100.0), TouchPhase::Started);
+        state.process(2, pt(100.0, 100.0), TouchPhase::Started);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::TwoFingersDown { .. }));
+
+        // Move one finger far enough to trigger gesture.
+        let evs = state.process(2, pt(120.0, 100.0), TouchPhase::Moved);
+        assert!(matches!(state.gesture_state, GestureRecognitionState::Pinching { .. }));
+        let classified = classify(&evs);
+        assert_eq!(classified.len(), 2);
+        assert_eq!(classified[0], Ev::PinchStarted);
+
+        // Move further — scale should not be inf/NaN despite initial_distance
+        // having been 0 (re-snapshotted to 20.0 at threshold crossing).
+        let evs = state.process(2, pt(140.0, 100.0), TouchPhase::Moved);
+        let classified = classify(&evs);
+        if let Ev::PinchMoved(delta) = classified[0] {
+            assert!(delta.is_finite(), "scale delta should be finite, got {}", delta);
+        } else {
+            panic!("expected PinchMoved, got {:?}", classified[0]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    extern crate alloc;
+
+    #[test]
+    fn test_to_string() {
+        let test_cases = [
+            (
+                "a",
+                KeyboardModifiers { alt: false, control: true, shift: false, meta: false },
+                false,
+                false,
+                "⌘A",
+                "Ctrl+A",
+                "Ctrl+A",
+            ),
+            (
+                "a",
+                KeyboardModifiers { alt: true, control: true, shift: true, meta: true },
+                false,
+                false,
+                "⌃⌥⇧⌘A",
+                "Win+Ctrl+Alt+Shift+A",
+                "Super+Ctrl+Alt+Shift+A",
+            ),
+            (
+                "\u{001b}",
+                KeyboardModifiers { alt: false, control: true, shift: true, meta: false },
+                false,
+                false,
+                "⇧⌘Escape",
+                "Ctrl+Shift+Escape",
+                "Ctrl+Shift+Escape",
+            ),
+            (
+                "+",
+                KeyboardModifiers { alt: false, control: true, shift: false, meta: false },
+                true,
+                false,
+                "⌘+",
+                "Ctrl++",
+                "Ctrl++",
+            ),
+            (
+                "a",
+                KeyboardModifiers { alt: true, control: true, shift: false, meta: false },
+                false,
+                true,
+                "⌘A",
+                "Ctrl+A",
+                "Ctrl+A",
+            ),
+            (
+                "",
+                KeyboardModifiers { alt: false, control: true, shift: false, meta: false },
+                false,
+                false,
+                "",
+                "",
+                "",
+            ),
+            (
+                "\u{000a}",
+                KeyboardModifiers { alt: false, control: false, shift: false, meta: false },
+                false,
+                false,
+                "Return",
+                "Return",
+                "Return",
+            ),
+            (
+                "\u{0009}",
+                KeyboardModifiers { alt: false, control: false, shift: false, meta: false },
+                false,
+                false,
+                "Tab",
+                "Tab",
+                "Tab",
+            ),
+            (
+                "\u{0020}",
+                KeyboardModifiers { alt: false, control: false, shift: false, meta: false },
+                false,
+                false,
+                "Space",
+                "Space",
+                "Space",
+            ),
+            (
+                "\u{0008}",
+                KeyboardModifiers { alt: false, control: false, shift: false, meta: false },
+                false,
+                false,
+                "Backspace",
+                "Backspace",
+                "Backspace",
+            ),
+        ];
+
+        for (
+            key,
+            modifiers,
+            ignore_shift,
+            ignore_alt,
+            _expected_macos,
+            _expected_windows,
+            _expected_linux,
+        ) in test_cases
+        {
+            let shortcut = make_keys(key.into(), modifiers, ignore_shift, ignore_alt);
+
+            use crate::alloc::string::ToString;
+            let result = shortcut.to_string();
+
+            #[cfg(target_os = "macos")]
+            assert_eq!(result.as_str(), _expected_macos, "Failed for key: {:?}", key);
+
+            #[cfg(target_os = "windows")]
+            assert_eq!(result.as_str(), _expected_windows, "Failed for key: {:?}", key);
+
+            #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+            assert_eq!(result.as_str(), _expected_linux, "Failed for key: {:?}", key);
+        }
+    }
+
+    #[test]
+    fn test_from_parts_valid() {
+        let f5_key = alloc::string::String::from(char::from(key_codes::Key::F5));
+        let ret_key = alloc::string::String::from(char::from(key_codes::Key::Return));
+        let pause_key = alloc::string::String::from(char::from(key_codes::Key::Pause));
+
+        // (description, input parts, expected key, modifiers, ignore_shift, ignore_alt)
+        let cases: &[(&str, &[&str], &str, KeyboardModifiers, bool, bool)] = &[
+            (
+                "Control+A",
+                &["Control", "A"],
+                "a",
+                KeyboardModifiers { control: true, ..Default::default() },
+                false,
+                false,
+            ),
+            (
+                "Control+Shift+A",
+                &["Control", "Shift", "A"],
+                "a",
+                KeyboardModifiers { control: true, shift: true, ..Default::default() },
+                false,
+                false,
+            ),
+            (
+                "Control+Shift?+Z (explicit ignore_shift)",
+                &["Control", "Shift?", "Z"],
+                "z",
+                KeyboardModifiers { control: true, ..Default::default() },
+                true,
+                false,
+            ),
+            (
+                "Control+Alt?+A (ignore_alt)",
+                &["Control", "Alt?", "A"],
+                "a",
+                KeyboardModifiers { control: true, ..Default::default() },
+                false,
+                true,
+            ),
+            (
+                "F5 alone (special key)",
+                &["F5"],
+                &f5_key,
+                KeyboardModifiers::default(),
+                false,
+                false,
+            ),
+            ("Return key", &["Return"], &ret_key, KeyboardModifiers::default(), false, false),
+            (
+                "Control+Plus (LocalizedShiftable → auto ignore_shift)",
+                &["Control", "Plus"],
+                "+",
+                KeyboardModifiers { control: true, ..Default::default() },
+                true,
+                false,
+            ),
+            (
+                "Control+'+' (literal, no auto ignore_shift)",
+                &["Control", "+"],
+                "+",
+                KeyboardModifiers { control: true, ..Default::default() },
+                false,
+                false,
+            ),
+            (
+                "Control+Shift+Alt+A (all modifiers)",
+                &["Control", "Shift", "Alt", "A"],
+                "a",
+                KeyboardModifiers { control: true, shift: true, alt: true, ..Default::default() },
+                false,
+                false,
+            ),
+            ("empty input → Keys::default()", &[], "", KeyboardModifiers::default(), false, false),
+            (
+                "Control+€ (unicode literal)",
+                &["Control", "€"],
+                "€",
+                KeyboardModifiers { control: true, ..Default::default() },
+                false,
+                false,
+            ),
+            (
+                "Control+é (lowercase literal)",
+                &["Control", "é"],
+                "é",
+                KeyboardModifiers { control: true, ..Default::default() },
+                false,
+                false,
+            ),
+            ("A alone (named key)", &["A"], "a", KeyboardModifiers::default(), false, false),
+            // The special keys are represented by reserved unicode codepoints. Passing
+            // one of those characters as a literal must produce the same `Keys` as its
+            // name, so `to_parts` output stays acceptable to `from_parts`.
+            (
+                "F5 codepoint literal",
+                &[&f5_key],
+                &f5_key,
+                KeyboardModifiers::default(),
+                false,
+                false,
+            ),
+            (
+                "Pause codepoint literal",
+                &[&pause_key],
+                &pause_key,
+                KeyboardModifiers::default(),
+                false,
+                false,
+            ),
+            (
+                "Control + F5 codepoint literal",
+                &["Control", &f5_key],
+                &f5_key,
+                KeyboardModifiers { control: true, ..Default::default() },
+                false,
+                false,
+            ),
+            // Whitespace is significant: these literals name the Space/Tab/Return keys
+            // and must agree with their named spellings (parts are not trimmed).
+            ("\" \" literal → Space", &[" "], " ", KeyboardModifiers::default(), false, false),
+            ("Space named", &["Space"], " ", KeyboardModifiers::default(), false, false),
+            ("\"\\t\" literal → Tab", &["\t"], "\t", KeyboardModifiers::default(), false, false),
+            ("Tab named", &["Tab"], "\t", KeyboardModifiers::default(), false, false),
+            (
+                "\"\\n\" literal → Return",
+                &["\n"],
+                &ret_key,
+                KeyboardModifiers::default(),
+                false,
+                false,
+            ),
+            (
+                "Control+\" \" (literal space with a modifier)",
+                &["Control", " "],
+                " ",
+                KeyboardModifiers { control: true, ..Default::default() },
+                false,
+                false,
+            ),
+            (
+                "empty part is skipped → Keys::default()",
+                &[""],
+                "",
+                KeyboardModifiers::default(),
+                false,
+                false,
+            ),
+            (
+                "a alone (literal fallback, same result as named A)",
+                &["a"],
+                "a",
+                KeyboardModifiers::default(),
+                false,
+                false,
+            ),
+        ];
+
+        for (desc, parts, expected_key, mods, is, ia) in cases {
+            let result =
+                Keys::from_parts(parts.iter().copied()).unwrap_or_else(|e| panic!("{desc}: {e}"));
+            assert_eq!(result, make_keys((*expected_key).into(), *mods, *is, *ia), "{desc}");
+        }
+    }
+
+    #[test]
+    fn test_from_parts_invalid() {
+        use super::KeysParseErrorInner;
+        let cases: &[(&str, &[&str], KeysParseError)] = &[
+            // Case-sensitive modifiers: unrecognized modifier parses as a second key
+            ("lowercase 'control'", &["control", "A"], KeysParseError(KeysParseErrorInner::MultipleKeys)),
+            ("uppercase 'CONTROL'", &["CONTROL", "A"], KeysParseError(KeysParseErrorInner::MultipleKeys)),
+            ("'Ctrl' alias", &["Ctrl", "A"], KeysParseError(KeysParseErrorInner::MultipleKeys)),
+            ("'ctrl' alias", &["ctrl", "A"], KeysParseError(KeysParseErrorInner::MultipleKeys)),
+            // Meta aliases not accepted
+            ("'Win' alias", &["Win", "A"], KeysParseError(KeysParseErrorInner::MultipleKeys)),
+            ("'Super' alias", &["Super", "A"], KeysParseError(KeysParseErrorInner::MultipleKeys)),
+            // No key
+            ("modifiers only", &["Control", "Shift"], KeysParseError(KeysParseErrorInner::NoKey)),
+            // Multiple keys
+            ("two keys", &["A", "B"], KeysParseError(KeysParseErrorInner::MultipleKeys)),
+            // Multi-grapheme cluster
+            (
+                "multi-char unknown",
+                &["Control", "Foobar"],
+                KeysParseError(KeysParseErrorInner::MultipleGraphemeClusters("Foobar".into())),
+            ),
+            (
+                "two-char literal",
+                &["Control", "ab"],
+                KeysParseError(KeysParseErrorInner::MultipleGraphemeClusters("ab".into())),
+            ),
+            // Parts are not trimmed, so a padded modifier is no longer a modifier: it
+            // falls through to the key branch and fails as a multi-grapheme literal.
+            (
+                "padded modifier ' Control ' alone",
+                &[" Control "],
+                KeysParseError(KeysParseErrorInner::MultipleGraphemeClusters(" Control ".into())),
+            ),
+            (
+                "padded modifier ' Control ' is a key, so 'A' is a second key",
+                &[" Control ", "A"],
+                KeysParseError(KeysParseErrorInner::MultipleKeys),
+            ),
+            (
+                "padded key ' A '",
+                &["Control", " A "],
+                KeysParseError(KeysParseErrorInner::MultipleGraphemeClusters(" A ".into())),
+            ),
+            // Two whitespace literals are two keys, not one trimmed-away key.
+            ("two space literals", &[" ", " "], KeysParseError(KeysParseErrorInner::MultipleKeys)),
+            (
+                "lowercase 'return' (not a named key)",
+                &["return"],
+                KeysParseError(KeysParseErrorInner::MultipleGraphemeClusters("return".into())),
+            ),
+            // Not lowercase
+            (
+                "uppercase literal É",
+                &["Control", "É"],
+                KeysParseError(KeysParseErrorInner::NotLowercase("É".into())),
+            ),
+            // Incompatible modifiers
+            (
+                "Shift + Shift?",
+                &["Shift", "Shift?", "A"],
+                KeysParseError(KeysParseErrorInner::IncompatibleModifiers("Shift and Shift? cannot be combined".into())),
+            ),
+            (
+                "Alt + Alt?",
+                &["Alt", "Alt?", "A"],
+                KeysParseError(KeysParseErrorInner::IncompatibleModifiers("Alt and Alt? cannot be combined".into())),
+            ),
+            (
+                "Shift + LocalizedShiftable key (Plus)",
+                &["Control", "Shift", "Plus"],
+                KeysParseError(KeysParseErrorInner::IncompatibleModifiers(
+                    "Key bindings involving Plus ignore Shift to support different keyboard layouts; remove Shift".into(),
+                )),
+            ),
+        ];
+
+        for (desc, parts, expected_err) in cases {
+            let result = Keys::from_parts(parts.iter().copied());
+            assert!(result.is_err(), "{desc}: expected error, got {result:?}");
+            assert_eq!(&result.unwrap_err(), expected_err, "{desc}");
+        }
+    }
+
+    #[test]
+    fn test_to_parts_roundtrip() {
+        // Inputs that should round-trip identically through from_parts → to_parts.
+        let inputs: &[&[&str]] = &[
+            &[],
+            &["A"],
+            &["Control", "A"],
+            &["Control", "Shift", "A"],
+            &["Control", "Shift?", "Z"],
+            &["Control", "Alt?", "A"],
+            &["Control", "Alt", "Shift", "Meta", "A"],
+            &["Meta", "Control", "Alt", "Shift", "A"],
+            &["F5"],
+            &["Return"],
+            &["Space"],
+            &[" "],  // literal space: to_parts emits the "Space" name
+            &["\t"], // literal tab: to_parts emits the "Tab" name
+            &["\n"], // literal newline: to_parts emits the "Return" name
+            &["Control", " "],
+            &["Control", "Plus"], // LocalizedShiftable: desugars to ["Control", "Shift?", "+"]
+            &["Control", "+"],    // literal '+': stays ["Control", "+"] (no auto ignore_shift)
+            &["Control", "Digit0"],
+            &["Control", "€"],
+            &["Control", "é"],
+        ];
+        for parts in inputs {
+            let k = Keys::from_parts(parts.iter().copied()).unwrap();
+            let out_strs: alloc::vec::Vec<&str> = k.to_parts().collect();
+            let k2 = Keys::from_parts(out_strs.iter().copied()).unwrap();
+            assert_eq!(k, k2, "round-trip mismatch for {parts:?} → {out_strs:?}");
+        }
+    }
+
+    #[test]
+    fn test_to_parts_canonical_form() {
+        // Spot-check the exact strings to lock in the canonical output. Modifiers keep
+        // their names; the key is always the stored character, never a key name.
+        let f5 = alloc::string::String::from(char::from(key_codes::Key::F5));
+        let ret = alloc::string::String::from(char::from(key_codes::Key::Return));
+        let pause = alloc::string::String::from(char::from(key_codes::Key::Pause));
+        let cases: &[(&[&str], &[&str])] = &[
+            (&[], &[]),
+            (&["A"], &["a"]), // named key → its stored character
+            (&["a"], &["a"]),
+            (&["Control", "S"], &["Control", "s"]),
+            (&["Control", "Shift?", "Z"], &["Control", "Shift?", "z"]),
+            (&["Control", "Alt?", "A"], &["Control", "Alt?", "a"]),
+            (&["F5"], &[&f5]),
+            (&[&f5], &[&f5]), // reserved codepoint as a literal
+            (&["Pause"], &[&pause]),
+            (&[&pause], &[&pause]),
+            // Whitespace and control characters are emitted raw, which is why a text
+            // format storing these has to escape them (see the runtime_key_bindings
+            // example). They still round-trip, because from_parts does not trim.
+            (&[" "], &[" "]),
+            (&["Space"], &[" "]),
+            (&["\t"], &["\t"]),
+            (&["Tab"], &["\t"]),
+            (&["\n"], &[&ret]),
+            (&["Return"], &[&ret]),
+            (&["Control", " "], &["Control", " "]),
+            // LocalizedShiftable: the auto ignore_shift is surfaced as Shift? and the
+            // raw character is emitted, so the "Plus" name is not reproduced.
+            (&["Control", "Plus"], &["Control", "Shift?", "+"]),
+            (&["Control", "+"], &["Control", "+"]), // literal '+': no auto ignore_shift
+            (&["Control", "€"], &["Control", "€"]),
+            (&["Meta", "Control", "Alt", "Shift", "A"], &["Meta", "Control", "Alt", "Shift", "a"]),
+        ];
+        for (input, expected) in cases {
+            let k = Keys::from_parts(input.iter().copied()).unwrap();
+            let out_strs: alloc::vec::Vec<&str> = k.to_parts().collect();
+            assert_eq!(&out_strs.as_slice(), expected, "for input {input:?}");
+        }
+    }
+
+    #[test]
+    fn test_from_parts_matching() {
+        // (description, input parts, event text, event modifiers, should_match)
+        let cases: &[(&str, &[&str], &str, KeyboardModifiers, bool)] = &[
+            (
+                "Control+A matches",
+                &["Control", "A"],
+                "a",
+                KeyboardModifiers { control: true, ..Default::default() },
+                true,
+            ),
+            (
+                "Control+A wrong key",
+                &["Control", "A"],
+                "b",
+                KeyboardModifiers { control: true, ..Default::default() },
+                false,
+            ),
+            (
+                "Control+A wrong modifier",
+                &["Control", "A"],
+                "a",
+                KeyboardModifiers { alt: true, ..Default::default() },
+                false,
+            ),
+            (
+                "Shift? matches with shift",
+                &["Control", "Shift?", "Z"],
+                "z",
+                KeyboardModifiers { control: true, shift: true, ..Default::default() },
+                true,
+            ),
+            (
+                "Shift? matches without shift",
+                &["Control", "Shift?", "Z"],
+                "z",
+                KeyboardModifiers { control: true, ..Default::default() },
+                true,
+            ),
+        ];
+
+        for (desc, parts, text, mods, expected) in cases {
+            let k =
+                Keys::from_parts(parts.iter().copied()).unwrap_or_else(|e| panic!("{desc}: {e}"));
+            let event = KeyEvent { text: (*text).into(), modifiers: *mods, ..Default::default() };
+            assert_eq!(k.matches(&event), *expected, "{desc}");
+        }
+
+        // Special key matching: Return
+        let return_char: char = key_codes::Key::Return.into();
+        let k = Keys::from_parts(["Return"]).unwrap();
+        let event = KeyEvent {
+            text: SharedString::from(alloc::string::String::from(return_char)),
+            modifiers: KeyboardModifiers::default(),
+            ..Default::default()
+        };
+        assert!(k.matches(&event), "Return key should match Return event");
     }
 }

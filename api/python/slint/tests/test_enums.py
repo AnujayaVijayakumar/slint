@@ -1,12 +1,15 @@
 # Copyright © SixtyFPS GmbH <info@slint.dev>
 # SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-import pytest
-from slint import load_file, ListModel
 from pathlib import Path
+
+import pytest
+
+from slint import ListModel, load_file
 
 
 def base_dir() -> Path:
+    assert __spec__
     origin = __spec__.origin
     assert origin is not None
     base_dir = Path(origin).parent
@@ -26,13 +29,16 @@ def test_enums() -> None:
     with pytest.raises(
         AttributeError, match="type object 'TestEnum' has no attribute 'Variant3'"
     ):
-        TestEnum.Variant3
+        _ = TestEnum.Variant3
 
     instance = module.App()
     assert instance.enum_property == TestEnum.Variant2
     assert instance.enum_property.__class__ is TestEnum
     instance.enum_property = TestEnum.Variant1
     assert instance.enum_property == TestEnum.Variant1
+    assert instance.enum_property.__class__ is TestEnum
+    instance.enum_property = TestEnum.Variant_three
+    assert instance.enum_property == TestEnum.Variant_three
     assert instance.enum_property.__class__ is TestEnum
 
     model_with_enums = instance.model_with_enums

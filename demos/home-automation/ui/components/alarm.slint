@@ -47,30 +47,26 @@ export component Alarm inherits Control {
     content := Rectangle {
         ta := TouchArea {
             clicked => {
-                AppState.showFullScreen(root.index);
-                if root.full-screen {
-                    root.full-screen = false;
-                }
+                AppState.showFullScreen(root.full-screen ? -1 : root.index);
             }
         }
 
         tile := Rectangle {
-
+            x: 0;
             VerticalLayout {
                 visible: !root.full-screen;
                 alignment: center;
+                cross-axis-alignment: center;
                 spacing: 60px;
                 HaText {
                     text: "Home Alarm \nOff";
                     horizontal-alignment: center;
                     font-size: Style.H2-font-size;
                     color: Palette.hvac-knob-foreground;
-                    font-weight: 300;
-                    x: parent.width / 2 - self.width / 2;
+                    font-weight: FontWeight.light;
                 }
 
                 Rectangle {
-                    x: (parent.width - self.width) / 2;
                     width: root.width * 0.7;
                     height: 50px;
                     Image {
@@ -198,28 +194,9 @@ export component Alarm inherits Control {
             horizontal-alignment: center;
             font-size: Style.H2-font-size;
             color: Palette.hvac-knob-foreground;
-            font-weight: 300;
+            font-weight: FontWeight.light;
             x: parent.width / 2 - self.width / 2;
             y: 50px;
-        }
-
-        x: 0;
-        VerticalLayout {
-            alignment: end;
-            spacing: 2px;
-            padding: 2px;
-
-            controls := Rectangle {
-                border-radius: 10px;
-                width: 95%;
-                height: self.preferred-height;
-                background: Palette.music-gradient.transparentize(0.2);
-                HorizontalLayout {
-                    alignment: space-around;
-                    padding-top: 8px;
-                    padding-bottom: 8px;
-                }
-            }
         }
     }
 
@@ -238,7 +215,6 @@ export component Alarm inherits Control {
         TouchArea {
             enabled: closeButton.opacity > 0.1;
             clicked => {
-                root.full-screen = false;
                 AppState.showFullScreen(-1);
             }
         }

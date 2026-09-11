@@ -1,8 +1,8 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-use i_slint_core::{graphics::GradientStop, Brush, Color};
-use napi::{bindgen_prelude::External, Error, Result};
+use i_slint_core::{Brush, Color, graphics::GradientStop};
+use napi::{Error, Result, bindgen_prelude::External};
 
 /// RgbaColor represents a color in the Slint run-time, represented using 8-bit channels for red, green, blue and the alpha (opacity).
 #[napi(object)]
@@ -159,7 +159,12 @@ impl SlintRgbaColor {
     /// Returns the color as string in hex representation e.g. `#000000` for black.
     #[napi]
     pub fn to_string(&self) -> String {
-        format!("#{:02x}{:02x}{:02x}{:02x}", self.red(), self.green(), self.blue(), self.alpha())
+        let alpha = self.alpha();
+        if alpha == 255 {
+            format!("#{:02x}{:02x}{:02x}", self.red(), self.green(), self.blue())
+        } else {
+            format!("#{:02x}{:02x}{:02x}{:02x}", self.red(), self.green(), self.blue(), alpha)
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-import { ChildIndicator, NameLabel, ResettingLineEdit } from "./basics.slint";
+import { ChildIndicator, ResettingLineEdit } from "./basics.slint";
 
 import { PropertyValue, PropertyValueKind } from "../../api.slint";
 import { EditorSizeSettings, EditorSpaceSettings } from "../../components/styling.slint";
@@ -10,7 +10,6 @@ import { ComboBox } from "std-widgets.slint";
 
 export component FloatWidget inherits GridLayout {
     in property <bool> enabled;
-    in property <string> property-name;
     in property <PropertyValue> property-value;
 
     callback update-display-string(value: string);
@@ -57,17 +56,6 @@ export component FloatWidget inherits GridLayout {
         apply-value();
     }
 
-    spacing-vertical: EditorSpaceSettings.default-spacing;
-
-    Row {
-        NameLabel {
-            col: 1;
-
-            property-name: root.property-name;
-            property-value: root.property-value;
-        }
-    }
-
     Row {
         childIndicator := ChildIndicator {
             horizontal-stretch: 0;
@@ -89,11 +77,9 @@ export component FloatWidget inherits GridLayout {
                 edited(text) => {
                     self.can-compile = root.test-binding();
                 }
-
                 accepted(text) => {
                     root.set-binding();
                 }
-
                 changed has-focus => {
                     if !self.has-focus {
                         root.apply-value();
